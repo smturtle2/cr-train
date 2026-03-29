@@ -15,6 +15,12 @@ Model-agnostic SEN12MS-CR training utilities for deterministic streaming experim
 uv sync
 ```
 
+Colab-style onboarding notebook:
+
+- [`examples/colab_quickstart.ipynb`](/home/smturtle2/projects/cr-train/examples/colab_quickstart.ipynb)
+
+The notebook still uses `uv` for fast environment setup; Colab or Jupyter remains the notebook runtime.
+
 Optional but recommended for higher Hugging Face rate limits:
 
 ```bash
