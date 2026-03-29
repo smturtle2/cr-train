@@ -11,6 +11,7 @@ from cr_train import (
     DataModuleConfig,
     LoaderConfig,
     SEN12MSCRDataModule,
+    ShuffleConfig,
     StepResult,
     Trainer,
 )
@@ -57,6 +58,7 @@ def main() -> None:
             split_strategy=args.split_strategy,
             seed=args.seed,
             loader=LoaderConfig(batch_size=args.batch_size),
+            shuffle=ShuffleConfig(buffer_size=16, reshard_num_shards=16),
         )
     )
     trainer = Trainer(

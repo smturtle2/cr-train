@@ -95,7 +95,7 @@ class SplitRatios:
 @dataclass(frozen=True)
 class ShuffleConfig:
     enabled: bool = True
-    buffer_size: int = 10_000
+    buffer_size: int = 16
     reshard_num_shards: int = 1024
 
     def __post_init__(self) -> None:

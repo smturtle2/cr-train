@@ -54,6 +54,7 @@ from cr_train import (
     DataModuleConfig,
     LoaderConfig,
     SEN12MSCRDataModule,
+    ShuffleConfig,
     StepResult,
     Trainer,
 )
@@ -84,6 +85,7 @@ datamodule = SEN12MSCRDataModule(
         split_strategy="seeded_scene",
         seed=7,
         loader=LoaderConfig(batch_size=4),
+        shuffle=ShuffleConfig(buffer_size=16, reshard_num_shards=16),
     )
 )
 
@@ -169,6 +171,14 @@ Default ratio:
 ```python
 SplitRatios(train=0.8, val=0.1, test=0.1)
 ```
+
+Default shuffle config is intentionally conservative for this dataset:
+
+```python
+ShuffleConfig(buffer_size=16, reshard_num_shards=1024)
+```
+
+SEN12MS-CR samples are large enough that aggressive streaming buffers can consume a lot of host memory very quickly.
 
 ## API Surface
 
