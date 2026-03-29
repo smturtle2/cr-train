@@ -1,0 +1,27 @@
+[project]
+name = "cr-train"
+version = "0.1.0"
+description = "Streaming SEN12MS-CR training module with deterministic scene splits."
+readme = "README.md"
+authors = [
+    { name = "dongju", email = "smturtle2@kakao.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=3.2.0",
+    "numpy>=1.26",
+    "torch>=2.4",
+    "typing-extensions>=4.12",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.1,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
