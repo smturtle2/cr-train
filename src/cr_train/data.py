@@ -396,7 +396,7 @@ def _resolve_stage_persistent_workers(num_workers: int, options: _LoaderOptions)
         return None
     if options.persistent_workers is not None:
         return options.persistent_workers
-    return False
+    return True
 
 
 def _default_dataset_loader(

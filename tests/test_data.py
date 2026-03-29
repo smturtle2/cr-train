@@ -285,7 +285,7 @@ def test_loader_builder_auto_tunes_worker_defaults(monkeypatch: pytest.MonkeyPat
         assert isinstance(kwargs["generator"], torch.Generator)
         if kwargs["num_workers"] > 0:
             assert kwargs["prefetch_factor"] == 2
-            assert kwargs["persistent_workers"] is False
+            assert kwargs["persistent_workers"] is True
         else:
             assert "prefetch_factor" not in kwargs
             assert "persistent_workers" not in kwargs

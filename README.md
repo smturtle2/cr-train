@@ -156,7 +156,7 @@ Returns `(train_loader, val_loader, test_loader)`.
 | `num_workers` | `int \| None` | `None` | Auto: train gets `min(2, cpu_count//6)` workers, val/test get 0 |
 | `pin_memory` | `bool` | `False` | Pin tensors for faster GPU transfer |
 | `prefetch_factor` | `int \| None` | `None` | Auto `2` when workers > 0 |
-| `persistent_workers` | `bool \| None` | `None` | Auto `False`; set `True` to keep workers alive between epochs |
+| `persistent_workers` | `bool \| None` | `None` | Auto `True`; keeps workers alive between epochs to avoid reconnection overhead |
 | `io_profile` | `str` | `"smooth"` | `"smooth"` (light readahead) or `"conservative"` (fully synchronous) |
 
 ### `TrainerConfig`
