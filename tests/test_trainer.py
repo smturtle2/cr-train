@@ -372,3 +372,39 @@ def test_trainer_requires_test_loader_for_test_call() -> None:
 
     with pytest.raises(ValueError):
         trainer.test()
+
+
+def test_trainer_rejects_invalid_runtime_step_overrides() -> None:
+    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=1, show_progress=False),
+        train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
+        val_loader=DataLoader(_ToyDataset(_make_rows([1.0])), batch_size=1, shuffle=False),
+    )
+
+    with pytest.raises(ValueError, match="max_epochs must be positive"):
+        list(trainer.step(max_epochs=0))
+    with pytest.raises(ValueError, match="train_max_batches must be positive when provided"):
+        list(trainer.step(train_max_batches=0))
+    with pytest.raises(ValueError, match="val_max_batches must be positive when provided"):
+        list(trainer.step(val_max_batches=0))
+
+
+def test_trainer_rejects_invalid_runtime_test_override() -> None:
+    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=1, show_progress=False),
+        train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
+        test_loader=DataLoader(_ToyDataset(_make_rows([1.0])), batch_size=1, shuffle=False),
+    )
+
+    with pytest.raises(ValueError, match="max_batches must be positive when provided"):
+        trainer.test(max_batches=0)

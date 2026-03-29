@@ -34,15 +34,13 @@ class TrainerConfig:
     show_progress: bool | None = None
 
     def __post_init__(self) -> None:
-        if self.max_epochs <= 0:
-            raise ValueError("max_epochs must be positive")
+        _validate_positive("max_epochs", self.max_epochs)
         for name, value in (
             ("train_max_batches", self.train_max_batches),
             ("val_max_batches", self.val_max_batches),
             ("test_max_batches", self.test_max_batches),
         ):
-            if value is not None and value <= 0:
-                raise ValueError(f"{name} must be positive when provided")
+            _validate_optional_positive(name, value)
 
 
 @dataclass
@@ -60,6 +58,18 @@ class MAE(nn.Module):
 
     def forward(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return F.l1_loss(outputs, target)
+
+
+def _validate_positive(name: str, value: int) -> int:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _validate_optional_positive(name: str, value: int | None) -> int | None:
+    if value is not None and value <= 0:
+        raise ValueError(f"{name} must be positive when provided")
+    return value
 
 
 def _move_to_device(value: Any, device: torch.device) -> Any:
@@ -350,12 +360,20 @@ class Trainer:
     ) -> Iterator[dict[str, Any]]:
         """Run epochs and yield one history record per completed epoch."""
 
-        target_epochs = self.config.max_epochs if max_epochs is None else max_epochs
+        target_epochs = (
+            self.config.max_epochs
+            if max_epochs is None
+            else _validate_positive("max_epochs", max_epochs)
+        )
         active_train_max_batches = (
-            self.config.train_max_batches if train_max_batches is None else train_max_batches
+            self.config.train_max_batches
+            if train_max_batches is None
+            else _validate_optional_positive("train_max_batches", train_max_batches)
         )
         active_val_max_batches = (
-            self.config.val_max_batches if val_max_batches is None else val_max_batches
+            self.config.val_max_batches
+            if val_max_batches is None
+            else _validate_optional_positive("val_max_batches", val_max_batches)
         )
 
         while self.state.epoch < target_epochs:
@@ -398,7 +416,11 @@ class Trainer:
 
         if self.test_loader is None:
             raise ValueError("test_loader is required to run test()")
-        active_max_batches = self.config.test_max_batches if max_batches is None else max_batches
+        active_max_batches = (
+            self.config.test_max_batches
+            if max_batches is None
+            else _validate_optional_positive("max_batches", max_batches)
+        )
         return self._run_stage(
             "test",
             self.test_loader,

@@ -114,6 +114,7 @@ Each decoded sample and collated batch uses the same schema:
 ## Data Defaults
 
 - Default split is `official`.
+- Scene membership stays fixed across epochs; only train iteration order changes deterministically with the current epoch.
 - Optical preprocessing defaults to `clip(0, 10000)` and then `/ 10000.0` to `float32` for both `cloudy` and `target`.
 - SAR preprocessing defaults to `clip(-25, 0)` and then `(x + 25) / 25` to map values into `[0, 1]`.
 - The train pipeline keeps the invariant `reshard() -> shuffle(seed, buffer_size)` before batching.

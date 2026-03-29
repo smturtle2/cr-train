@@ -16,6 +16,7 @@ import cr_train.data as data_mod
 from cr_train import build_sen12mscr_loaders
 from cr_train.data import (
     DEFAULT_DATASET_REVISION,
+    SEN12MSCRStreamingDataset,
     SceneShard,
     decode_sample,
     official_scene_splits,
@@ -136,6 +137,17 @@ class _FakeIterable:
         return iter(self.rows)
 
 
+class _EpochAwareSource:
+    def __init__(self) -> None:
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        yield _sample_row(scene=str(self.epoch), patch=f"p{self.epoch}")
+
+
 def test_build_loaders_defaults_to_official_and_reshards_before_shuffle() -> None:
     resolver_calls: list[tuple[str, int]] = []
     datasets = {
@@ -215,6 +227,8 @@ def test_loader_builder_rejects_invalid_settings() -> None:
     with pytest.raises(ValueError):
         build_sen12mscr_loaders(0)
     with pytest.raises(ValueError):
+        build_sen12mscr_loaders(1, split="bogus")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
         build_sen12mscr_loaders(1, num_workers=-1)
     with pytest.raises(ValueError):
         build_sen12mscr_loaders(1, num_workers=2, prefetch_factor=0)
@@ -276,6 +290,29 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
         assert isinstance(kwargs["generator"], torch.Generator)
         assert kwargs["prefetch_factor"] == 4
         assert kwargs["persistent_workers"] is True
+
+
+@pytest.mark.filterwarnings("ignore:This process .* multi-threaded, use of fork")
+def test_streaming_dataset_shares_epoch_updates_with_persistent_workers() -> None:
+    dataset = SEN12MSCRStreamingDataset(_EpochAwareSource())
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=1,
+        persistent_workers=True,
+    )
+
+    try:
+        observed_scenes: list[str] = []
+        for epoch in range(3):
+            dataset.set_epoch(epoch)
+            sample = next(iter(loader))
+            observed_scenes.append(sample["metadata"]["scene"])
+        assert observed_scenes == ["0", "1", "2"]
+    finally:
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is not None:
+            iterator._shutdown_workers()
 
 
 def test_seed_worker_keeps_numpy_seed_in_uint32_range(monkeypatch: pytest.MonkeyPatch) -> None:

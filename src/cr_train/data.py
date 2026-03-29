@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import multiprocessing as mp
 import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ OPTICAL_CHANNELS = {13}
 DEFAULT_DATASET_NAME = "Hermanni/sen12mscr"
 DEFAULT_DATASET_REVISION = "e2facda8700dd26cb4cbd5c5d9c82d15f10c38c6"
 DEFAULT_SPLIT = "official"
+VALID_SPLIT_STRATEGIES: frozenset[SplitStrategy] = frozenset(("official", "seeded_scene"))
 DEFAULT_SHUFFLE_BUFFER_SIZE = 16
 DEFAULT_SEEDED_SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 OPTICAL_MIN = 0.0
@@ -101,6 +103,10 @@ class _LoaderOptions:
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if self.split not in VALID_SPLIT_STRATEGIES:
+            raise ValueError(
+                f"split must be one of {sorted(VALID_SPLIT_STRATEGIES)!r}"
+            )
         if self.shuffle_buffer_size <= 0:
             raise ValueError("shuffle_buffer_size must be positive")
         if self.num_workers < 0:
@@ -224,11 +230,15 @@ def _resolve_scene_splits(
     seed: int,
     scene_split_resolver: SceneSplitResolver | None,
 ) -> dict[Stage, tuple[SceneShard, ...]]:
+    if split not in VALID_SPLIT_STRATEGIES:
+        raise ValueError(f"split must be one of {sorted(VALID_SPLIT_STRATEGIES)!r}")
     if scene_split_resolver is not None:
         return dict(_normalize_scene_splits(scene_split_resolver(split, seed)))
     if split == "official":
         return official_scene_splits()
-    return seeded_scene_splits(seed=seed)
+    if split == "seeded_scene":
+        return seeded_scene_splits(seed=seed)
+    raise AssertionError(f"unreachable split strategy: {split}")
 
 
 def _coerce_bytes(blob: bytes | bytearray | memoryview | str) -> bytes:
@@ -378,17 +388,25 @@ class SEN12MSCRStreamingDataset(IterableDataset[SEN12MSCRSample]):
     def __init__(self, source: HFIterableDataset, *, epoch: int = 0) -> None:
         super().__init__()
         self.source = source
-        self.epoch = epoch
+        # persistent worker에서도 최신 epoch가 보이도록 shared value로 유지한다.
+        self._shared_epoch = mp.Value("q", epoch)
+
+    @property
+    def epoch(self) -> int:
+        with self._shared_epoch.get_lock():
+            return int(self._shared_epoch.value)
 
     def set_epoch(self, epoch: int) -> None:
         """Forward the current epoch to the underlying streaming source."""
 
-        self.epoch = epoch
+        with self._shared_epoch.get_lock():
+            self._shared_epoch.value = epoch
 
     def __iter__(self) -> Iterator[SEN12MSCRSample]:
+        current_epoch = self.epoch
         if hasattr(self.source, "set_epoch"):
             # HF iterable dataset은 iteration 시작 시점의 epoch 값으로 shard/example 순서를 결정한다.
-            self.source.set_epoch(self.epoch)
+            self.source.set_epoch(current_epoch)
         for row in self.source:
             yield decode_sample(row)
 
