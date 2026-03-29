@@ -25,15 +25,15 @@ from cr_train.data import (
 
 
 def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30") -> dict[str, object]:
+    # HWC: 실제 데이터셋과 동일한 형태
     sar = np.array(
         [
-            [[-30.0, -12.5], [-25.0, 0.0]],
-            [[-5.0, 1.0], [-7.5, -20.0]],
+            [[-30.0, -5.0], [-12.5, 1.0]],
+            [[-25.0, -7.5], [0.0, -20.0]],
         ],
         dtype=np.float32,
-    )
-    # CHW: 13 channels, 1x2 spatial
-    optical = np.arange(13 * 1 * 2, dtype=np.int16).reshape(13, 1, 2) * 800 - 10
+    )  # (2, 2, 2) = (H, W, C=2)
+    optical = np.arange(13 * 2 * 1, dtype=np.int16).reshape(2, 1, 13) * 800 - 10  # (H=2, W=1, C=13)
     return {
         "sar": sar.tobytes(),
         "cloudy": optical.tobytes(),
@@ -51,9 +51,9 @@ def test_decode_sample_applies_official_preprocessing_and_standard_schema() -> N
     decoded = decode_sample(_sample_row())
 
     sar, cloudy = decoded["inputs"]
-    assert sar.shape == (2, 2, 2)
-    assert cloudy.shape == (13, 1, 2)
-    assert decoded["target"].shape == (13, 1, 2)
+    assert sar.shape == (2, 2, 2)       # HWC (2,2,2) -> CHW (2,2,2)
+    assert cloudy.shape == (13, 2, 1)   # HWC (2,1,13) -> CHW (13,2,1)
+    assert decoded["target"].shape == (13, 2, 1)
     assert decoded["metadata"]["source_shard"] == "spring/scene_1.parquet"
     assert decoded["metadata"]["patch"] == "p30"
     assert sar.dtype == torch.float32
@@ -179,7 +179,7 @@ def test_build_loaders_defaults_to_official_and_reshards_before_shuffle() -> Non
     assert resolver_calls == [("official", 13)]
     sar, cloudy = batch["inputs"]
     assert tuple(sar.shape) == (1, 2, 2, 2)
-    assert tuple(batch["target"].shape) == (1, 13, 1, 2)
+    assert tuple(batch["target"].shape) == (1, 13, 2, 1)
     assert datasets["train"].calls[:3] == [
         ("reshard",),
         ("shuffle", 13, 16),

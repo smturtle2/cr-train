@@ -115,10 +115,10 @@ Every batch is a dictionary with this structure:
 
 ```python
 {
-    "inputs": (
+    "inputs": [
         Tensor,  # [B, 2, 256, 256]   SAR backscatter, float32 [0, 1]
         Tensor,  # [B, 13, 256, 256]  cloudy Sentinel-2, float32 [0, 1]
-    ),
+    ],
     "target": Tensor,      # [B, 13, 256, 256]  cloud-free Sentinel-2, float32 [0, 1]
     "metadata": {
         "season": list[str],        # "spring" | "summer" | "fall" | "winter"
@@ -129,7 +129,7 @@ Every batch is a dictionary with this structure:
 }
 ```
 
-`inputs` is a tuple of `(sar, cloudy)`. The trainer unpacks it as `model(sar, cloudy)` -- parameter names in your `forward()` can be anything.
+`inputs` is a list of `[sar, cloudy]`. The trainer unpacks it as `model(sar, cloudy)` -- parameter names in your `forward()` can be anything.
 
 **Preprocessing:**
 

@@ -246,7 +246,9 @@ def _resolve_scene_splits(
 
 def _decode_tensor(blob: bytes, *, dtype: np.dtype[Any], shape: tuple[int, ...]) -> torch.Tensor:
     array = np.frombuffer(blob, dtype=dtype).reshape(shape)
-    # parquet/buffer 메모리와 분리된 torch tensor를 만들어 이후 변형이 안전하게 되게 한다.
+    # 데이터셋은 HWC(256, 256, C) 형태로 저장되어 있으므로 CHW로 변환한다.
+    if array.ndim == 3:
+        array = np.moveaxis(array, -1, 0)
     return torch.from_numpy(np.array(array, copy=True))
 
 
