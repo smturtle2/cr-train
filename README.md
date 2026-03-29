@@ -9,7 +9,32 @@ English | [한국어](./README.ko.md)
 
 Model-agnostic SEN12MS-CR training utilities for deterministic streaming experiments.
 
-## Clone And Setup
+## Features
+
+- **Deterministic streaming** -- scene-level splits with reproducible batch ordering across epochs
+- **Model-agnostic** -- works with any PyTorch `nn.Module`; just implement `forward(sar, cloudy)`
+- **Auto-tuned I/O** -- worker count, prefetch, and parquet readahead configured automatically
+- **Checkpoint management** -- full RNG state capture for exact resumption
+- **Built-in progress** -- `tqdm.rich` stage bars with live loss/metric updates
+
+## Project Structure
+
+```
+cr-train/
+├── src/cr_train/           # Core package
+│   ├── __init__.py         #   public API exports
+│   ├── trainer.py          #   Trainer, TrainerConfig, MAE
+│   ├── data.py             #   dataset loading & preprocessing
+│   └── runtime.py          #   parquet I/O tuning
+├── examples/
+│   ├── minimal_train.py    # Reference training script
+│   └── colab_quickstart.ipynb
+├── tests/
+├── scripts/
+└── pyproject.toml
+```
+
+## Quick Start
 
 ```bash
 git clone https://github.com/smturtle2/cr-train.git
@@ -17,122 +42,163 @@ cd cr-train
 uv sync
 ```
 
-Colab-style onboarding notebook:
-
-- [`examples/colab_quickstart.ipynb`](/home/smturtle2/projects/cr-train/examples/colab_quickstart.ipynb)
-
-The notebook still uses `uv` for fast environment setup; Colab or Jupyter remains the notebook runtime.
-
 Optional but recommended for higher Hugging Face rate limits:
 
 ```bash
 export HF_TOKEN=your_token
 ```
 
-## Recommended Usage
-
-This repository is meant to be cloned and used as a local training module. The typical workflow is:
-
-1. Clone the repository and install the environment with `uv sync`.
-2. Stay at the repository root when running scripts so the local `cr_train` package is available through the project environment.
-3. Start from the example entrypoint if you want a working baseline:
+Run the reference example:
 
 ```bash
 uv run python examples/minimal_train.py --epochs 1 --train-max-batches 10 --val-max-batches 2
 ```
 
-4. For your own experiment script, import from `cr_train`, not `src.cr_train`.
-   Typical imports are `build_sen12mscr_loaders`, `Trainer`, `TrainerConfig`, and optional metrics such as `MAE`.
-5. Build `(train_loader, val_loader, test_loader)`, construct your model/optimizer/loss, and pass them into `Trainer`.
-6. Run training with `for history in trainer.step(): ...` and evaluation with `trainer.test()`.
+Or try the Colab notebook: [`examples/colab_quickstart.ipynb`](./examples/colab_quickstart.ipynb)
 
-If you want to keep your own training file inside this repository, a common layout is:
+## Usage
 
-- `examples/` for runnable reference scripts
-- `scripts/` for one-off experiments
-- repository root or a subdirectory script executed with `uv run python ...`
+This repository is meant to be cloned and used as a local training module.
 
-The reference implementation is [`minimal_train.py`](/home/smturtle2/projects/cr-train/examples/minimal_train.py).
+1. Clone and install: `git clone ... && uv sync`
+2. Run scripts from the repository root so the local `cr_train` package is importable.
+3. Import from `cr_train` (not `src.cr_train`):
+
+```python
+from cr_train import Trainer, TrainerConfig, MAE, build_sen12mscr_loaders
+
+train_loader, val_loader, test_loader = build_sen12mscr_loaders(batch_size=4)
+
+trainer = Trainer(
+    model=model,
+    optimizer=optimizer,
+    criterion=nn.MSELoss(),
+    metrics=[MAE()],
+    config=TrainerConfig(max_epochs=5),
+    train_loader=train_loader,
+    val_loader=val_loader,
+    test_loader=test_loader,
+)
+
+for history in trainer.step():
+    print(history["train"], history["val"])
+
+test_metrics = trainer.test()
+```
+
+For your own scripts, a common layout is:
+
+- `examples/` -- runnable reference scripts
+- `scripts/` -- one-off experiments
+- Repository root -- quick experiments via `uv run python your_script.py`
+
+The reference implementation is [`examples/minimal_train.py`](./examples/minimal_train.py).
 
 ## Public API
+
+### `build_sen12mscr_loaders`
 
 ```python
 build_sen12mscr_loaders(
     batch_size,
     *,
     seed=0,
-    split="official",
+    split="official",              # "official" | "seeded_scene"
     shuffle_buffer_size=16,
-    num_workers=None,
+    num_workers=None,              # None = auto-tune
     pin_memory=False,
     prefetch_factor=None,
     persistent_workers=None,
-    io_profile="smooth",
-)
+    io_profile="smooth",           # "smooth" | "conservative"
+) -> tuple[DataLoader, DataLoader, DataLoader]
 ```
 
 Returns `(train_loader, val_loader, test_loader)`.
 
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `num_workers` | `None` | Auto-tunes based on CPU count |
+| `io_profile` | `"smooth"` | Moderate parquet readahead/threading; use `"conservative"` for synchronous I/O |
+| `persistent_workers` | `None` | Keeps workers alive when enabled |
+
+### `Trainer`
+
 ```python
 Trainer(
-    model,
-    optimizer,
-    criterion,
-    metrics,
-    config,
+    model,                         # nn.Module
+    optimizer,                     # torch.optim.Optimizer
+    criterion,                     # loss function
+    metrics,                       # e.g. [MAE()]
+    config,                        # TrainerConfig
     train_loader,
     val_loader=None,
     test_loader=None,
 )
 ```
 
-- `metrics` is a sequence of metric objects, for example `metrics=[MAE()]`.
-- Built-in metric object: `MAE`.
-- Training runs through `for history in trainer.step(): ...`.
-- Evaluation runs through `trainer.test()`.
-- `train`, `val`, and `test` progress bars use `tqdm.rich` by default; set `show_progress=False` to disable them.
-- Each epoch prints a heading first, then stage bars render underneath it and stay visible after completion.
-- Stage bars show `loading first batch...` before the first batch arrives, then update running `loss` and metrics on every batch. Sized loaders now complete the last visible batch update before advancing to the next stage.
-- `max_batches` caps now stop without fetching one extra batch, so stage bars do not stall at the boundary waiting on unused data.
-- The default loader path is tuned for smoother streaming: `num_workers=None` auto-tunes worker count, `persistent_workers=None` keeps workers alive when enabled, and `io_profile="smooth"` turns on moderate parquet readahead/threading. Use `num_workers=0` with `io_profile="conservative"` to opt back into the old synchronous behavior.
+**Methods:**
+
+| Method | Description |
+|--------|-------------|
+| `trainer.step()` | Iterator yielding per-epoch history dicts |
+| `trainer.test()` | Evaluate on test loader, returns metrics dict |
+| `trainer.save_checkpoint(path)` | Save model + optimizer + RNG state |
+| `trainer.load_checkpoint(path)` | Restore from checkpoint |
+
+**Progress bars:**
+
+- Uses `tqdm.rich` by default; disable with `show_progress=False`.
+- Each epoch prints a heading, then stage bars render underneath.
+- Bars show `loading first batch...` initially, then update running `loss` and metrics per batch.
+- `max_batches` stops cleanly without prefetching unused data.
+
+**Built-in metric:** `MAE` (Mean Absolute Error).
 
 ## Batch Contract
 
-Each decoded sample and collated batch uses the same schema:
+Each sample and collated batch follows this schema:
 
 ```python
 {
     "inputs": {
-        "sar": ...,
-        "cloudy": ...,
+        "sar":    Tensor,    # [B, 2, H, W]   SAR backscatter
+        "cloudy": Tensor,    # [B, 13, H, W]  cloudy optical
     },
-    "target": ...,
-    "metadata": ...,
+    "target":     Tensor,    # [B, 13, H, W]  cloud-free optical
+    "metadata": {
+        "season": list[str],
+        "scene":  list[str],
+        "patch":  list[str],
+        ...
+    },
 }
 ```
 
-`Trainer` forwards `inputs` to the model and applies `criterion(outputs, target)` plus each metric object to `(outputs, target)`.
+`Trainer` forwards `inputs` to the model and applies `criterion(output, target)` plus each metric to `(output, target)`.
 
 ## Data Defaults
 
-- Default split is `official`.
-- Scene membership stays fixed across epochs; only train iteration order changes deterministically with the current epoch.
-- Loader defaults favor smoother epochs by auto-selecting workers and enabling the `smooth` parquet I/O profile.
-- Optical preprocessing defaults to `clip(0, 10000)` and then `/ 10000.0` to `float32` for both `cloudy` and `target`.
-- SAR preprocessing defaults to `clip(-25, 0)` and then `(x + 25) / 25` to map values into `[0, 1]`.
-- The train pipeline keeps the invariant `reshard() -> shuffle(seed, buffer_size)` before batching.
-- The dataset revision is pinned for reproducibility.
+| Setting | Value |
+|---------|-------|
+| Split | `official` (175 scenes: 155 train / 10 val / 10 test) |
+| Optical preprocessing | `clip(0, 10000) / 10000.0` -> float32 |
+| SAR preprocessing | `clip(-25, 0)`, then `(x + 25) / 25` -> [0, 1] |
+| Train pipeline | `reshard() -> shuffle(seed, buffer_size)` -> batch |
+| Scene membership | Fixed across epochs; only train order changes deterministically |
+| Dataset revision | Pinned for reproducibility |
 
 ## Reproducibility
 
-- Scene-level splitting keeps train, validation, and test scene-isolated.
+- Scene-level splitting keeps train, validation, and test sets scene-isolated.
 - The official split is bundled from the authors' supplementary metadata.
-- With the same seed and loader settings, batch order is reproducible.
+- With the same seed and loader settings, batch order is fully reproducible.
 
 ## Official Split Source
 
-- Official project page: <https://patricktum.github.io/cloud_removal/sen12mscr/>
-- Supplementary folder: <https://u.pcloud.link/publink/show?code=kZ46bk0Z5JKM8r2bzfyjYl3dW85U60XaBmPV>
-- Direct `splits.csv`: <https://api.pcloud.com/getpubtextfile?code=kZ46bk0Z5JKM8r2bzfyjYl3dW85U60XaBmPV&fileid=57823192235>
-- Bundled normalized manifest: [`official_scene_splits.csv`](/home/smturtle2/projects/cr-train/src/cr_train/resources/official_scene_splits.csv)
-- Refresh script: [`refresh_official_scene_splits.py`](/home/smturtle2/projects/cr-train/scripts/refresh_official_scene_splits.py)
+| Resource | Link |
+|----------|------|
+| Project page | <https://patricktum.github.io/cloud_removal/sen12mscr/> |
+| Supplementary folder | <https://u.pcloud.link/publink/show?code=kZ46bk0Z5JKM8r2bzfyjYl3dW85U60XaBmPV> |
+| Direct `splits.csv` | <https://api.pcloud.com/getpubtextfile?code=kZ46bk0Z5JKM8r2bzfyjYl3dW85U60XaBmPV&fileid=57823192235> |
+| Bundled manifest | [`official_scene_splits.csv`](./src/cr_train/resources/official_scene_splits.csv) |
+| Refresh script | [`refresh_official_scene_splits.py`](./scripts/refresh_official_scene_splits.py) |
