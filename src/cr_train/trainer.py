@@ -308,7 +308,8 @@ class Trainer:
         metric_totals: dict[str, float] = {}
         batch_count = 0
 
-        _set_loader_epoch(dataloader, epoch)
+        if training:
+            _set_loader_epoch(dataloader, epoch)
         self.model.train(training)
         if not training:
             self.model.eval()

@@ -104,8 +104,8 @@ def test_trainer_step_yields_epoch_history_and_test_metrics(tmp_path: Path) -> N
     assert trainer.state.epoch == 2
     assert trainer.state.global_step == 2
     assert train_loader.dataset.epochs == [0, 1]
-    assert val_loader.dataset.epochs == [0, 1]
-    assert test_loader.dataset.epochs == [2]
+    assert val_loader.dataset.epochs == []
+    assert test_loader.dataset.epochs == []
     assert (tmp_path / "last.pt").exists()
     assert (tmp_path / "epoch-0002.pt").exists()
 
@@ -137,8 +137,8 @@ def test_trainer_progress_defaults_on_and_supports_unsized_loaders() -> None:
     assert "loss" in history[0]["val"]
     assert "loss" in metrics
     assert train_dataset.epochs == [0]
-    assert val_dataset.epochs == [0]
-    assert test_dataset.epochs == [1]
+    assert val_dataset.epochs == []
+    assert test_dataset.epochs == []
 
 
 def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch: pytest.MonkeyPatch) -> None:
