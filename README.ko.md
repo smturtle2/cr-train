@@ -9,9 +9,11 @@
 
 deterministic streaming 실험을 위한 모델-불가지론적 SEN12MS-CR 학습 유틸리티입니다.
 
-## 설치
+## 클론 및 설치
 
 ```bash
+git clone https://github.com/smturtle2/cr-train.git
+cd cr-train
 uv sync
 ```
 
@@ -27,101 +29,30 @@ Hugging Face rate limit을 줄이려면 토큰 설정을 권장합니다.
 export HF_TOKEN=your_token
 ```
 
-## 빠른 시작
+## 권장 사용 흐름
 
-```python
-from collections.abc import Mapping, Sequence
+이 저장소는 클론해서 로컬 학습 모듈처럼 쓰는 형태를 전제로 합니다. 보통은 다음 순서로 사용합니다.
 
-import torch
-from rich.console import Console
-from rich.table import Table
-from torch import nn
+1. 저장소를 클론하고 `uv sync`로 환경을 맞춥니다.
+2. 스크립트 실행은 저장소 루트에서 유지합니다. 그러면 프로젝트 환경 안에서 로컬 `cr_train` 패키지를 바로 import할 수 있습니다.
+3. 먼저 동작하는 기준점이 필요하면 예제 엔트리포인트부터 실행합니다.
 
-from cr_train import MAE, Trainer, TrainerConfig, build_sen12mscr_loaders
-
-
-class TinyCloudRemovalNet(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(15, 64, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 13, kernel_size=1),
-        )
-
-    def forward(self, sar: torch.Tensor, cloudy: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([sar, cloudy], dim=1))
-
-
-def metric_columns(rows: Sequence[tuple[str, Mapping[str, float]]]) -> list[str]:
-    columns: list[str] = []
-    seen: set[str] = set()
-    for _, metrics in rows:
-        for name in metrics:
-            if name not in seen:
-                seen.add(name)
-                columns.append(name)
-    return columns
-
-
-def print_summary(
-    console: Console,
-    rows: Sequence[tuple[str, Mapping[str, float]]],
-) -> None:
-    visible_rows = [(stage, metrics) for stage, metrics in rows if metrics]
-    if not visible_rows:
-        return
-
-    columns = metric_columns(visible_rows)
-    table = Table(header_style="bold cyan")
-    table.add_column("stage")
-    for name in columns:
-        table.add_column(name, justify="right")
-    for stage, metrics in visible_rows:
-        table.add_row(stage, *(f"{metrics[name]:.4f}" if name in metrics else "-" for name in columns))
-    console.print(table)
-
-
-train_loader, val_loader, test_loader = build_sen12mscr_loaders(
-    batch_size=4,
-)
-
-console = Console()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = TinyCloudRemovalNet().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-criterion = nn.MSELoss()
-
-trainer = Trainer(
-    model=model,
-    optimizer=optimizer,
-    criterion=criterion,
-    metrics=[MAE()],
-    config=TrainerConfig(
-        max_epochs=2,
-        train_max_batches=10,
-        val_max_batches=2,
-        test_max_batches=2,
-        checkpoint_dir="artifacts/checkpoints",
-    ),
-    train_loader=train_loader,
-    val_loader=val_loader,
-    test_loader=test_loader,
-)
-
-for history in trainer.step():
-    print_summary(
-        console,
-        (
-            ("train", history["train"]),
-            ("val", history["val"]),
-        ),
-    )
-
-print_summary(console, (("test", trainer.test()),))
+```bash
+uv run python examples/minimal_train.py --epochs 1 --train-max-batches 10 --val-max-batches 2
 ```
+
+4. 직접 학습 스크립트를 만들 때는 `src.cr_train`이 아니라 `cr_train`에서 import합니다.
+   보통 `build_sen12mscr_loaders`, `Trainer`, `TrainerConfig`, 필요하면 `MAE` 같은 metric을 가져오면 됩니다.
+5. `(train_loader, val_loader, test_loader)`를 만들고, 모델/optimizer/loss를 준비한 뒤 `Trainer`에 넘깁니다.
+6. 학습은 `for history in trainer.step(): ...`, 평가는 `trainer.test()`로 붙입니다.
+
+자체 스크립트를 이 저장소 안에 둘 때는 보통 이런 식으로 나눕니다.
+
+- `examples/`: 재현 가능한 기준 예제
+- `scripts/`: 일회성 실험 스크립트
+- 저장소 루트 또는 하위 디렉터리 스크립트를 `uv run python ...`으로 실행
+
+기준 예제는 [`minimal_train.py`](/home/smturtle2/projects/cr-train/examples/minimal_train.py)입니다.
 
 ## 공개 API
 

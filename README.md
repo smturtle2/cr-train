@@ -9,9 +9,11 @@ English | [한국어](./README.ko.md)
 
 Model-agnostic SEN12MS-CR training utilities for deterministic streaming experiments.
 
-## Installation
+## Clone And Setup
 
 ```bash
+git clone https://github.com/smturtle2/cr-train.git
+cd cr-train
 uv sync
 ```
 
@@ -27,101 +29,30 @@ Optional but recommended for higher Hugging Face rate limits:
 export HF_TOKEN=your_token
 ```
 
-## Quick Start
+## Recommended Usage
 
-```python
-from collections.abc import Mapping, Sequence
+This repository is meant to be cloned and used as a local training module. The typical workflow is:
 
-import torch
-from rich.console import Console
-from rich.table import Table
-from torch import nn
+1. Clone the repository and install the environment with `uv sync`.
+2. Stay at the repository root when running scripts so the local `cr_train` package is available through the project environment.
+3. Start from the example entrypoint if you want a working baseline:
 
-from cr_train import MAE, Trainer, TrainerConfig, build_sen12mscr_loaders
-
-
-class TinyCloudRemovalNet(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(15, 64, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 13, kernel_size=1),
-        )
-
-    def forward(self, sar: torch.Tensor, cloudy: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([sar, cloudy], dim=1))
-
-
-def metric_columns(rows: Sequence[tuple[str, Mapping[str, float]]]) -> list[str]:
-    columns: list[str] = []
-    seen: set[str] = set()
-    for _, metrics in rows:
-        for name in metrics:
-            if name not in seen:
-                seen.add(name)
-                columns.append(name)
-    return columns
-
-
-def print_summary(
-    console: Console,
-    rows: Sequence[tuple[str, Mapping[str, float]]],
-) -> None:
-    visible_rows = [(stage, metrics) for stage, metrics in rows if metrics]
-    if not visible_rows:
-        return
-
-    columns = metric_columns(visible_rows)
-    table = Table(header_style="bold cyan")
-    table.add_column("stage")
-    for name in columns:
-        table.add_column(name, justify="right")
-    for stage, metrics in visible_rows:
-        table.add_row(stage, *(f"{metrics[name]:.4f}" if name in metrics else "-" for name in columns))
-    console.print(table)
-
-
-train_loader, val_loader, test_loader = build_sen12mscr_loaders(
-    batch_size=4,
-)
-
-console = Console()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = TinyCloudRemovalNet().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-criterion = nn.MSELoss()
-
-trainer = Trainer(
-    model=model,
-    optimizer=optimizer,
-    criterion=criterion,
-    metrics=[MAE()],
-    config=TrainerConfig(
-        max_epochs=2,
-        train_max_batches=10,
-        val_max_batches=2,
-        test_max_batches=2,
-        checkpoint_dir="artifacts/checkpoints",
-    ),
-    train_loader=train_loader,
-    val_loader=val_loader,
-    test_loader=test_loader,
-)
-
-for history in trainer.step():
-    print_summary(
-        console,
-        (
-            ("train", history["train"]),
-            ("val", history["val"]),
-        ),
-    )
-
-print_summary(console, (("test", trainer.test()),))
+```bash
+uv run python examples/minimal_train.py --epochs 1 --train-max-batches 10 --val-max-batches 2
 ```
+
+4. For your own experiment script, import from `cr_train`, not `src.cr_train`.
+   Typical imports are `build_sen12mscr_loaders`, `Trainer`, `TrainerConfig`, and optional metrics such as `MAE`.
+5. Build `(train_loader, val_loader, test_loader)`, construct your model/optimizer/loss, and pass them into `Trainer`.
+6. Run training with `for history in trainer.step(): ...` and evaluation with `trainer.test()`.
+
+If you want to keep your own training file inside this repository, a common layout is:
+
+- `examples/` for runnable reference scripts
+- `scripts/` for one-off experiments
+- repository root or a subdirectory script executed with `uv run python ...`
+
+The reference implementation is [`minimal_train.py`](/home/smturtle2/projects/cr-train/examples/minimal_train.py).
 
 ## Public API
 
