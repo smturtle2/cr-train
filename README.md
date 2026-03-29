@@ -29,12 +29,12 @@ SEN12MS-CR on Hugging Face is convenient, but the mirror exposes a single stream
 - Shuffle discipline. If training shuffle is enabled, the pipeline always does `reshard()` before `shuffle(seed, buffer_size)`.
 - Strict reproducibility mode. Same seed + same split + same loader topology gives the same batches.
 - Partial-epoch training. Train, validation, and test loops accept `max_batches`.
-- Trainer neutrality. Model, `step_fn`, optimizer factory, and optional scheduler factory are injected.
+- Trainer neutrality. Model, optimizer, `step_fn`, and optional scheduler objects are injected.
 
 ## Installation
 
 ```bash
-uv sync --dev
+uv sync
 ```
 
 Optional but recommended for higher Hugging Face rate limits:
@@ -89,11 +89,14 @@ datamodule = SEN12MSCRDataModule(
     )
 )
 
+model = TinyCloudRemovalNet()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
 trainer = Trainer(
-    model=TinyCloudRemovalNet(),
+    model=model,
+    optimizer=optimizer,
     datamodule=datamodule,
     step_fn=step_fn,
-    optimizer_factory=lambda model: torch.optim.AdamW(model.parameters(), lr=1e-4),
     checkpoint_dir="artifacts/checkpoints",
 )
 
@@ -216,6 +219,12 @@ tests/                                  # reproducibility and trainer tests
 ```
 
 ## Development
+
+Install test dependencies:
+
+```bash
+uv sync --dev
+```
 
 Run the test suite:
 

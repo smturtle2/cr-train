@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -42,11 +43,12 @@ def _step_fn(model: nn.Module, batch: dict[str, torch.Tensor], stage: str) -> St
 
 def test_trainer_runs_fit_and_test(tmp_path: Path) -> None:
     model = nn.Linear(1, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
     trainer = Trainer(
         model=model,
+        optimizer=optimizer,
         datamodule=_ToyDataModule(),
         step_fn=_step_fn,
-        optimizer_factory=lambda module: torch.optim.SGD(module.parameters(), lr=0.1),
         checkpoint_dir=tmp_path,
     )
 
@@ -56,6 +58,7 @@ def test_trainer_runs_fit_and_test(tmp_path: Path) -> None:
     assert len(history) == 2
     assert trainer.state.epoch == 2
     assert trainer.state.global_step == 2
+    assert trainer.optimizer is optimizer
     assert "loss" in history[0]["train"]
     assert "loss" in metrics
     assert (tmp_path / "last.pt").exists()
@@ -63,23 +66,38 @@ def test_trainer_runs_fit_and_test(tmp_path: Path) -> None:
 
 
 def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
+    first_model = nn.Linear(1, 1)
     first = Trainer(
-        model=nn.Linear(1, 1),
+        model=first_model,
+        optimizer=torch.optim.SGD(first_model.parameters(), lr=0.1),
         datamodule=_ToyDataModule(),
         step_fn=_step_fn,
-        optimizer_factory=lambda module: torch.optim.SGD(module.parameters(), lr=0.1),
         checkpoint_dir=tmp_path,
     )
     first.fit(max_epochs=1, train_max_batches=1, val_max_batches=1)
 
+    restored_model = nn.Linear(1, 1)
     restored = Trainer(
-        model=nn.Linear(1, 1),
+        model=restored_model,
+        optimizer=torch.optim.SGD(restored_model.parameters(), lr=0.1),
         datamodule=_ToyDataModule(),
         step_fn=_step_fn,
-        optimizer_factory=lambda module: torch.optim.SGD(module.parameters(), lr=0.1),
         checkpoint_dir=tmp_path,
     )
     restored.load_checkpoint(tmp_path / "last.pt")
 
     assert restored.state.epoch == 1
     assert restored.state.global_step == 1
+
+
+def test_trainer_rejects_optimizer_from_other_model() -> None:
+    model = nn.Linear(1, 1)
+    other_model = nn.Linear(1, 1)
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model=model,
+            optimizer=torch.optim.SGD(other_model.parameters(), lr=0.1),
+            datamodule=_ToyDataModule(),
+            step_fn=_step_fn,
+        )

@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from tqdm import TqdmExperimentalWarning
 from torch import nn
+from torch.nn import Parameter
 from tqdm.rich import tqdm
 
 from .data import Stage
@@ -31,8 +32,6 @@ class StepFn(Protocol):
     def __call__(self, model: nn.Module, batch: Mapping[str, Any], stage: Stage) -> StepResult: ...
 
 
-OptimizerFactory = Callable[[nn.Module], torch.optim.Optimizer]
-SchedulerFactory = Callable[[torch.optim.Optimizer], Any]
 SchedulerStepFn = Callable[[Any, Mapping[str, float]], None]
 
 
@@ -92,15 +91,62 @@ def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: to
                 state[key] = value.to(device)
 
 
+def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> list[Parameter]:
+    params: list[Parameter] = []
+    for group in optimizer.param_groups:
+        params.extend(group["params"])
+    return params
+
+
+def _remap_optimizer_parameters(
+    optimizer: torch.optim.Optimizer,
+    parameter_map: Mapping[Parameter, Parameter],
+) -> None:
+    for group in optimizer.param_groups:
+        group["params"] = [parameter_map.get(param, param) for param in group["params"]]
+
+    default_factory = getattr(optimizer.state, "default_factory", None)
+    remapped_state = type(optimizer.state)(default_factory) if default_factory is not None else type(optimizer.state)()
+    for param, state in optimizer.state.items():
+        remapped_state[parameter_map.get(param, param)] = state
+    optimizer.state = remapped_state
+
+
+def _align_model_and_optimizer_to_device(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> nn.Module:
+    current_parameters = list(model.parameters())
+    optimizer_parameters = _optimizer_parameters(optimizer)
+    current_parameter_ids = {id(parameter) for parameter in current_parameters}
+
+    if any(id(parameter) not in current_parameter_ids for parameter in optimizer_parameters):
+        raise ValueError("optimizer must be constructed from the parameters of the supplied model")
+
+    moved_model = model.to(device)
+    moved_parameters = list(moved_model.parameters())
+    if len(current_parameters) != len(moved_parameters):
+        raise RuntimeError("model parameter count changed while moving to device")
+
+    parameter_map = {
+        current_parameter: moved_parameter
+        for current_parameter, moved_parameter in zip(current_parameters, moved_parameters, strict=True)
+    }
+    _remap_optimizer_parameters(optimizer, parameter_map)
+    _move_optimizer_state_to_device(optimizer, device)
+    return moved_model
+
+
 class Trainer:
     def __init__(
         self,
         *,
         model: nn.Module,
+        optimizer: torch.optim.Optimizer,
         datamodule: Any,
         step_fn: StepFn,
-        optimizer_factory: OptimizerFactory,
-        scheduler_factory: SchedulerFactory | None = None,
+        scheduler: Any | None = None,
         scheduler_step_fn: SchedulerStepFn | None = None,
         device: torch.device | str | None = None,
         checkpoint_dir: str | Path | None = None,
@@ -109,11 +155,11 @@ class Trainer:
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        self.model = model.to(self.device)
+        self.model = _align_model_and_optimizer_to_device(model, optimizer, self.device)
         self.datamodule = datamodule
         self.step_fn = step_fn
-        self.optimizer = optimizer_factory(self.model)
-        self.scheduler = scheduler_factory(self.optimizer) if scheduler_factory is not None else None
+        self.optimizer = optimizer
+        self.scheduler = scheduler
         self.scheduler_step_fn = scheduler_step_fn
         self.state = TrainerState()
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None

@@ -61,11 +61,13 @@ def main() -> None:
             shuffle=ShuffleConfig(buffer_size=16, reshard_num_shards=16),
         )
     )
+    model = TinyCloudRemovalNet()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     trainer = Trainer(
-        model=TinyCloudRemovalNet(),
+        model=model,
+        optimizer=optimizer,
         datamodule=datamodule,
         step_fn=step_fn,
-        optimizer_factory=lambda model: torch.optim.AdamW(model.parameters(), lr=1e-4),
         checkpoint_dir=args.checkpoint_dir,
     )
     history = trainer.fit(

@@ -15,7 +15,6 @@ from .data import (
 )
 from .runtime import configure_runtime
 from .trainer import (
-    SchedulerFactory,
     SchedulerStepFn,
     StepFn,
     StepResult,
@@ -30,7 +29,6 @@ __all__ = [
     "SEN12MSCRDataModule",
     "SEN12MSCRStreamingDataset",
     "SceneShard",
-    "SchedulerFactory",
     "SchedulerStepFn",
     "ShuffleConfig",
     "SplitRatios",
