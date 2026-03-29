@@ -50,6 +50,18 @@ class DuplicateMAE:
         return torch.mean(torch.abs(outputs - target))
 
 
+class GradStateMetric:
+    name = "grad_state"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[bool, bool]] = []
+
+    def __call__(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        _ = target
+        self.calls.append((torch.is_grad_enabled(), outputs.requires_grad))
+        return torch.mean(torch.abs(outputs))
+
+
 def _make_rows(values: list[float]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for value in values:
@@ -108,6 +120,25 @@ def test_trainer_step_yields_epoch_history_and_test_metrics(tmp_path: Path) -> N
     assert test_loader.dataset.epochs == []
     assert (tmp_path / "last.pt").exists()
     assert (tmp_path / "epoch-0002.pt").exists()
+
+
+def test_trainer_disables_autograd_during_metric_evaluation() -> None:
+    metric = GradStateMetric()
+    train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0])), batch_size=2, shuffle=False)
+    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        criterion=nn.MSELoss(),
+        metrics=[metric],
+        config=TrainerConfig(max_epochs=1, train_max_batches=1, show_progress=False),
+        train_loader=train_loader,
+    )
+
+    history = list(trainer.step())
+
+    assert len(history) == 1
+    assert metric.calls == [(False, True)]
 
 
 def test_trainer_progress_defaults_on_and_supports_unsized_loaders() -> None:

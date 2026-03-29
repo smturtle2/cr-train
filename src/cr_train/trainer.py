@@ -18,8 +18,6 @@ from torch import nn
 from tqdm import TqdmExperimentalWarning
 from tqdm.rich import tqdm
 
-warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
-
 Scalar = float | int | torch.Tensor
 MetricLike = Callable[[Any, Any], Scalar]
 
@@ -83,30 +81,10 @@ def _to_float(value: Scalar) -> float:
     return float(value)
 
 
-def _progress_desc(stage: str, epoch: int) -> str:
-    _ = epoch
-    return stage
-
-
-def _loading_progress_desc(stage: str, epoch: int) -> str:
-    return f"{_progress_desc(stage, epoch)} | loading first batch..."
-
-
-def _format_metric_summary(metrics: Mapping[str, float]) -> str:
-    return " ".join(f"{name}={value:.4f}" for name, value in metrics.items())
-
-
-def _live_progress_desc(
-    stage: str,
-    epoch: int,
-    *,
-    batch_count: int,
-    metrics: Mapping[str, float],
-) -> str:
-    _ = batch_count
+def _progress_metrics_desc(stage: str, metrics: Mapping[str, float]) -> str:
     # tqdm.rich는 postfix를 제대로 그리지 않아서 description에 metric을 직접 싣는다.
-    summary = _format_metric_summary(metrics)
-    return f"{_progress_desc(stage, epoch)} | {summary}"
+    summary = " ".join(f"{name}={value:.4f}" for name, value in metrics.items())
+    return f"{stage} | {summary}"
 
 
 def _epoch_header(epoch: int, total_epochs: int) -> str:
@@ -316,17 +294,15 @@ class Trainer:
             # val/test는 고정 순서를 유지해야 하므로 epoch 전달은 train에만 한다.
             _set_loader_epoch(dataloader, epoch)
         self.model.train(training)
-        if not training:
-            self.model.eval()
 
         progress = _create_progress(
             total=_resolve_progress_total(dataloader, max_batches),
-            desc=_progress_desc(stage, epoch),
+            desc=stage,
             disable=not self.show_progress,
             leave=True,
         )
         try:
-            progress.set_description_str(_loading_progress_desc(stage, epoch))
+            progress.set_description_str(f"{stage} | loading first batch...")
             for batch_index, batch in enumerate(dataloader):
                 if max_batches is not None and batch_index >= max_batches:
                     break
@@ -346,19 +322,15 @@ class Trainer:
                         self.state.global_step += 1
 
                 metric_totals["loss"] = metric_totals.get("loss", 0.0) + _to_float(loss)
-                for name, metric in self.metrics:
-                    metric_value = metric(outputs, target)
-                    metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value)
+                with torch.no_grad():
+                    for name, metric in self.metrics:
+                        metric_value = metric(outputs, target)
+                        metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value)
 
                 batch_count += 1
                 averages = {name: total / batch_count for name, total in metric_totals.items()}
                 progress.set_description_str(
-                    _live_progress_desc(
-                        stage,
-                        epoch,
-                        batch_count=batch_count,
-                        metrics=averages,
-                    ),
+                    _progress_metrics_desc(stage, averages),
                     refresh=False,
                 )
                 progress.update(1)

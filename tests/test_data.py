@@ -86,6 +86,15 @@ def test_official_scene_splits_are_scene_isolated() -> None:
     assert val_ids.isdisjoint(test_ids)
 
 
+def test_official_scene_splits_return_a_fresh_mapping() -> None:
+    splits = official_scene_splits()
+    splits["train"] = ()
+
+    fresh = official_scene_splits()
+
+    assert len(fresh["train"]) == 155
+
+
 def test_seeded_scene_splits_are_deterministic_and_disjoint() -> None:
     catalog = tuple(
         SceneShard(season=season, scene=str(index))
@@ -172,6 +181,36 @@ def test_build_loaders_defaults_to_official_and_reshards_before_shuffle() -> Non
     assert datasets["test"].calls == [("set_epoch", 0)]
 
 
+def test_build_loaders_supports_seeded_scene_split_without_custom_resolver() -> None:
+    created: list[tuple[str, int]] = []
+    datasets = {
+        "train": _FakeIterable([_sample_row()]),
+        "val": _FakeIterable([_sample_row(scene="2")]),
+        "test": _FakeIterable([_sample_row(scene="3")]),
+    }
+    expected_splits = seeded_scene_splits(seed=7)
+
+    def fake_dataset_loader(urls: list[str], stage: str) -> _FakeIterable:
+        created.append((stage, len(urls)))
+        return datasets[stage]
+
+    train_loader, val_loader, test_loader = build_sen12mscr_loaders(
+        1,
+        seed=7,
+        split="seeded_scene",
+        _dataset_loader=fake_dataset_loader,
+    )
+
+    _ = next(iter(train_loader))
+    _ = next(iter(val_loader))
+    _ = next(iter(test_loader))
+
+    assert created == [(stage, len(expected_splits[stage])) for stage in ("train", "val", "test")]
+    assert datasets["train"].calls[:2] == [("reshard", 1024), ("shuffle", 7, 16)]
+    assert datasets["val"].calls == [("set_epoch", 0)]
+    assert datasets["test"].calls == [("set_epoch", 0)]
+
+
 def test_loader_builder_rejects_invalid_settings() -> None:
     with pytest.raises(ValueError):
         build_sen12mscr_loaders(0)
@@ -237,6 +276,18 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
         assert isinstance(kwargs["generator"], torch.Generator)
         assert kwargs["prefetch_factor"] == 4
         assert kwargs["persistent_workers"] is True
+
+
+def test_seed_worker_keeps_numpy_seed_in_uint32_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(data_mod.torch, "initial_seed", lambda: (2**32) - 1)
+    monkeypatch.setattr(data_mod.random, "seed", lambda value: calls.append(("python", value)))
+    monkeypatch.setattr(data_mod.np.random, "seed", lambda value: calls.append(("numpy", value)))
+
+    data_mod._seed_worker(1)
+
+    assert calls == [("python", (2**32) - 1), ("numpy", (2**32) - 1)]
 
 
 def test_runtime_is_not_configured_on_import() -> None:

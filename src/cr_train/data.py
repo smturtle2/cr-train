@@ -137,19 +137,32 @@ def _official_scene_rows() -> tuple[tuple[Stage, SceneShard], ...]:
     return tuple(rows)
 
 
-@lru_cache(maxsize=1)
-def official_scene_splits() -> dict[Stage, tuple[SceneShard, ...]]:
-    """Return the bundled official scene-level train/val/test split."""
+def _normalize_scene_splits(
+    splits: Mapping[Stage, Sequence[SceneShard]],
+) -> tuple[tuple[Stage, tuple[SceneShard, ...]], ...]:
+    return tuple(
+        (stage, tuple(_sort_scene_shards(splits.get(stage, ()))))
+        for stage in STAGE_ORDER
+    )
 
+
+@lru_cache(maxsize=1)
+def _official_scene_split_items() -> tuple[tuple[Stage, tuple[SceneShard, ...]], ...]:
     splits: dict[Stage, list[SceneShard]] = {stage: [] for stage in STAGE_ORDER}
     for stage, shard in _official_scene_rows():
         splits[stage].append(shard)
-    return {stage: tuple(_sort_scene_shards(shards)) for stage, shards in splits.items()}
+    return _normalize_scene_splits(splits)
+
+
+def official_scene_splits() -> dict[Stage, tuple[SceneShard, ...]]:
+    """Return the bundled official scene-level train/val/test split."""
+
+    return dict(_official_scene_split_items())
 
 
 @lru_cache(maxsize=1)
 def _all_scene_shards() -> tuple[SceneShard, ...]:
-    unique = {shard for _, shard in _official_scene_rows()}
+    unique = {shard for _, shards in _official_scene_split_items() for shard in shards}
     return tuple(_sort_scene_shards(list(unique)))
 
 
@@ -203,7 +216,7 @@ def seeded_scene_splits(
             assigned[stage].extend(shards[cursor:next_cursor])
             cursor = next_cursor
 
-    return {stage: tuple(_sort_scene_shards(shards)) for stage, shards in assigned.items()}
+    return dict(_normalize_scene_splits(assigned))
 
 
 def _resolve_scene_splits(
@@ -212,11 +225,7 @@ def _resolve_scene_splits(
     scene_split_resolver: SceneSplitResolver | None,
 ) -> dict[Stage, tuple[SceneShard, ...]]:
     if scene_split_resolver is not None:
-        resolved = {
-            stage: tuple(_sort_scene_shards(list(shards)))
-            for stage, shards in scene_split_resolver(split, seed).items()
-        }
-        return {stage: tuple(resolved.get(stage, ())) for stage in STAGE_ORDER}
+        return dict(_normalize_scene_splits(scene_split_resolver(split, seed)))
     if split == "official":
         return official_scene_splits()
     return seeded_scene_splits(seed=seed)
@@ -265,6 +274,23 @@ def _preprocess_sar(tensor: torch.Tensor) -> torch.Tensor:
     return (clipped - SAR_DB_MIN) / (SAR_DB_MAX - SAR_DB_MIN)
 
 
+def _decode_optical_sample(
+    sample: Mapping[str, Any],
+    field: str,
+    *,
+    dtype: np.dtype[Any],
+    shape: Sequence[int],
+) -> torch.Tensor:
+    return _preprocess_optical(
+        _decode_tensor(
+            sample[field],
+            dtype=dtype,
+            shape=shape,
+            channel_counts=OPTICAL_CHANNELS,
+        )
+    )
+
+
 def decode_sample(sample: Mapping[str, Any]) -> SEN12MSCRSample:
     """Decode one raw Hugging Face row into preprocessed CHW tensors and metadata."""
 
@@ -282,22 +308,8 @@ def decode_sample(sample: Mapping[str, Any]) -> SEN12MSCRSample:
             channel_counts=SAR_CHANNELS,
         )
     )
-    cloudy = _preprocess_optical(
-        _decode_tensor(
-            sample["cloudy"],
-            dtype=optical_dtype,
-            shape=opt_shape,
-            channel_counts=OPTICAL_CHANNELS,
-        )
-    )
-    target = _preprocess_optical(
-        _decode_tensor(
-            sample["target"],
-            dtype=optical_dtype,
-            shape=opt_shape,
-            channel_counts=OPTICAL_CHANNELS,
-        )
-    )
+    cloudy = _decode_optical_sample(sample, "cloudy", dtype=optical_dtype, shape=opt_shape)
+    target = _decode_optical_sample(sample, "target", dtype=optical_dtype, shape=opt_shape)
 
     scene = str(sample["scene"])
     metadata: SampleMetadata = {
@@ -318,9 +330,10 @@ def decode_sample(sample: Mapping[str, Any]) -> SEN12MSCRSample:
 
 
 def _seed_worker(worker_id: int) -> None:
+    _ = worker_id
     worker_seed = torch.initial_seed() % (2**32)
-    random.seed(worker_seed + worker_id)
-    np.random.seed(worker_seed + worker_id)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def _apply_reshard(dataset: Any, target_num_shards: int) -> Any:
