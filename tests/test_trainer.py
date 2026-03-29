@@ -4,11 +4,10 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from cr_train import Trainer, TrainerConfig
+from cr_train import MAE, Trainer, TrainerConfig
 
 
 class _ToyDataset(Dataset[dict[str, object]]):
@@ -24,6 +23,18 @@ class _ToyDataset(Dataset[dict[str, object]]):
 
     def set_epoch(self, epoch: int) -> None:
         self.epochs.append(epoch)
+
+
+class SquaredError:
+    def __call__(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return torch.mean((outputs - target) ** 2)
+
+
+class DuplicateMAE:
+    name = "mae"
+
+    def __call__(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return torch.mean(torch.abs(outputs - target))
 
 
 def _make_rows(values: list[float]) -> list[dict[str, object]]:
@@ -50,7 +61,7 @@ def test_trainer_step_yields_epoch_history_and_test_metrics(tmp_path: Path) -> N
         model=model,
         optimizer=optimizer,
         criterion=nn.MSELoss(),
-        metrics={"mae": lambda outputs, target: F.l1_loss(outputs, target)},
+        metrics=[MAE(), SquaredError()],
         config=TrainerConfig(
             max_epochs=2,
             train_max_batches=1,
@@ -72,9 +83,11 @@ def test_trainer_step_yields_epoch_history_and_test_metrics(tmp_path: Path) -> N
     assert history[1]["epoch"] == 2
     assert "loss" in history[0]["train"]
     assert "mae" in history[0]["train"]
+    assert "squared_error" in history[0]["train"]
     assert "loss" in history[0]["val"]
     assert "loss" in metrics
     assert "mae" in metrics
+    assert "squared_error" in metrics
     assert trainer.state.epoch == 2
     assert trainer.state.global_step == 2
     assert train_loader.dataset.epochs == [0, 1]
@@ -93,8 +106,14 @@ def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
         model=first_model,
         optimizer=torch.optim.SGD(first_model.parameters(), lr=0.1),
         criterion=nn.MSELoss(),
-        metrics={"mae": lambda outputs, target: F.l1_loss(outputs, target)},
-        config=TrainerConfig(max_epochs=1, train_max_batches=1, val_max_batches=1, checkpoint_dir=tmp_path, show_progress=False),
+        metrics=[MAE()],
+        config=TrainerConfig(
+            max_epochs=1,
+            train_max_batches=1,
+            val_max_batches=1,
+            checkpoint_dir=tmp_path,
+            show_progress=False,
+        ),
         train_loader=train_loader,
         val_loader=val_loader,
     )
@@ -105,7 +124,7 @@ def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
         model=restored_model,
         optimizer=torch.optim.SGD(restored_model.parameters(), lr=0.1),
         criterion=nn.MSELoss(),
-        metrics={"mae": lambda outputs, target: F.l1_loss(outputs, target)},
+        metrics=[MAE()],
         config=TrainerConfig(max_epochs=2, checkpoint_dir=tmp_path, show_progress=False),
         train_loader=train_loader,
         val_loader=val_loader,
@@ -125,7 +144,46 @@ def test_trainer_rejects_optimizer_from_other_model() -> None:
             model=model,
             optimizer=torch.optim.SGD(other_model.parameters(), lr=0.1),
             criterion=nn.MSELoss(),
-            metrics={},
+            metrics=[],
+            config=TrainerConfig(max_epochs=1, show_progress=False),
+            train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
+        )
+
+
+def test_trainer_rejects_duplicate_metric_names() -> None:
+    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    with pytest.raises(ValueError):
+        Trainer(
+            model=model,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+            criterion=nn.MSELoss(),
+            metrics=[MAE(), DuplicateMAE()],
+            config=TrainerConfig(max_epochs=1, show_progress=False),
+            train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
+        )
+
+
+def test_trainer_rejects_legacy_metric_mapping() -> None:
+    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    with pytest.raises(TypeError):
+        Trainer(
+            model=model,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+            criterion=nn.MSELoss(),
+            metrics={"mae": MAE()},
+            config=TrainerConfig(max_epochs=1, show_progress=False),
+            train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
+        )
+
+
+def test_trainer_rejects_lambda_metrics() -> None:
+    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    with pytest.raises(ValueError):
+        Trainer(
+            model=model,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+            criterion=nn.MSELoss(),
+            metrics=[lambda outputs, target: torch.mean(torch.abs(outputs - target))],
             config=TrainerConfig(max_epochs=1, show_progress=False),
             train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
         )
@@ -137,7 +195,7 @@ def test_trainer_requires_test_loader_for_test_call() -> None:
         model=model,
         optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
         criterion=nn.MSELoss(),
-        metrics={},
+        metrics=[],
         config=TrainerConfig(max_epochs=1, show_progress=False),
         train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
     )

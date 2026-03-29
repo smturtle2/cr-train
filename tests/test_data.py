@@ -13,13 +13,10 @@ import pytest
 import torch
 
 import cr_train.data as data_mod
+from cr_train import build_sen12mscr_loaders
 from cr_train.data import (
-    LoaderConfig,
-    SEN12MSCRDataConfig,
+    DEFAULT_DATASET_REVISION,
     SceneShard,
-    ShuffleConfig,
-    SplitRatios,
-    build_sen12mscr_dataloader,
     decode_sample,
     official_scene_splits,
     seeded_scene_splits,
@@ -27,12 +24,26 @@ from cr_train.data import (
 
 
 def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30") -> dict[str, object]:
-    sar = np.arange(12, dtype=np.float32).reshape(3, 2, 2)
-    optical = np.arange(78, dtype=np.int16).reshape(3, 2, 13)
+    sar = np.array(
+        [
+            [[-30.0, -12.5], [-25.0, 0.0]],
+            [[-5.0, 1.0], [-7.5, -20.0]],
+        ],
+        dtype=np.float32,
+    )
+    optical = np.array(
+        [
+            [
+                [-10, 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 12000],
+                [12000, 10000, 9000, 8000, 7000, 6000, 5000, 4000, 3000, 2000, 1000, 0, -10],
+            ]
+        ],
+        dtype=np.int16,
+    )
     return {
         "sar": sar.tobytes(),
         "cloudy": optical.tobytes(),
-        "target": (optical + 1).tobytes(),
+        "target": (optical + 100).tobytes(),
         "sar_shape": list(sar.shape),
         "opt_shape": list(optical.shape),
         "dtype": "float32",
@@ -42,16 +53,22 @@ def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30")
     }
 
 
-def test_decode_sample_transforms_bytes_into_standard_batch_schema() -> None:
-    decoded = decode_sample(_sample_row(), tensor_layout="channels_first")
+def test_decode_sample_applies_official_preprocessing_and_standard_schema() -> None:
+    decoded = decode_sample(_sample_row())
 
-    assert decoded["inputs"]["sar"].shape == (2, 3, 2)
-    assert decoded["inputs"]["cloudy"].shape == (13, 3, 2)
-    assert decoded["target"].shape == (13, 3, 2)
+    assert decoded["inputs"]["sar"].shape == (2, 2, 2)
+    assert decoded["inputs"]["cloudy"].shape == (13, 1, 2)
+    assert decoded["target"].shape == (13, 1, 2)
     assert decoded["metadata"]["source_shard"] == "spring/scene_1.parquet"
     assert decoded["metadata"]["patch"] == "p30"
     assert decoded["inputs"]["sar"].dtype == torch.float32
-    assert decoded["inputs"]["cloudy"].dtype == torch.int16
+    assert decoded["inputs"]["cloudy"].dtype == torch.float32
+    assert decoded["target"].dtype == torch.float32
+    assert torch.isclose(decoded["inputs"]["sar"].min(), torch.tensor(0.0))
+    assert torch.isclose(decoded["inputs"]["sar"].max(), torch.tensor(1.0))
+    assert torch.isclose(decoded["inputs"]["cloudy"].min(), torch.tensor(0.0))
+    assert torch.isclose(decoded["inputs"]["cloudy"].max(), torch.tensor(1.0))
+    assert torch.isclose(decoded["target"].max(), torch.tensor(1.0))
 
 
 def test_official_scene_splits_are_scene_isolated() -> None:
@@ -75,14 +92,19 @@ def test_seeded_scene_splits_are_deterministic_and_disjoint() -> None:
         for season in ("spring", "summer")
         for index in range(1, 7)
     )
-    first = seeded_scene_splits(seed=7, split_ratios=SplitRatios(0.5, 0.25, 0.25), scene_catalog=catalog)
-    second = seeded_scene_splits(seed=7, split_ratios=SplitRatios(0.5, 0.25, 0.25), scene_catalog=catalog)
+    first = seeded_scene_splits(seed=7, scene_catalog=catalog)
+    second = seeded_scene_splits(seed=7, scene_catalog=catalog)
 
     assert first == second
     assert sum(len(shards) for shards in first.values()) == len(catalog)
     assert {scene.source_id for scene in first["train"]}.isdisjoint(
         {scene.source_id for scene in first["val"]}
     )
+
+
+def test_scene_shard_urls_are_pinned_to_a_dataset_revision() -> None:
+    url = SceneShard("spring", "1").resolve_url()
+    assert f"@{DEFAULT_DATASET_REVISION}/" in url
 
 
 class _FakeIterable:
@@ -105,38 +127,56 @@ class _FakeIterable:
         return iter(self.rows)
 
 
-def test_train_pipeline_reshards_before_shuffle_and_uses_standard_batch_shape() -> None:
-    fake_iterable = _FakeIterable([_sample_row()])
-    loader = build_sen12mscr_dataloader(
-        "train",
-        SEN12MSCRDataConfig(
-            seed=13,
-            loader=LoaderConfig(batch_size=1),
-            shuffle=ShuffleConfig(enabled=True, buffer_size=16, reshard_num_shards=8),
-        ),
-        dataset_loader=lambda urls, stage: fake_iterable,
-        scene_split_resolver=lambda _: {
+def test_build_loaders_defaults_to_official_and_reshards_before_shuffle() -> None:
+    resolver_calls: list[tuple[str, int]] = []
+    datasets = {
+        "train": _FakeIterable([_sample_row()]),
+        "val": _FakeIterable([_sample_row(scene="2")]),
+        "test": _FakeIterable([_sample_row(scene="3")]),
+    }
+
+    def fake_dataset_loader(urls: list[str], stage: str) -> _FakeIterable:
+        _ = urls
+        return datasets[stage]
+
+    def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
+        resolver_calls.append((split, seed))
+        return {
             "train": (SceneShard("spring", "1"),),
-            "val": (),
-            "test": (),
-        },
+            "val": (SceneShard("spring", "2"),),
+            "test": (SceneShard("spring", "3"),),
+        }
+
+    train_loader, val_loader, test_loader = build_sen12mscr_loaders(
+        1,
+        seed=13,
+        shuffle_buffer_size=16,
+        _dataset_loader=fake_dataset_loader,
+        _scene_split_resolver=fake_scene_split_resolver,
     )
 
-    loader.dataset.set_epoch(3)
-    batch = next(iter(loader))
+    train_loader.dataset.set_epoch(3)
+    batch = next(iter(train_loader))
+    _ = next(iter(val_loader))
+    _ = next(iter(test_loader))
 
-    assert tuple(batch["inputs"]["sar"].shape) == (1, 2, 3, 2)
-    assert tuple(batch["target"].shape) == (1, 13, 3, 2)
-    assert fake_iterable.calls[:3] == [
-        ("reshard", 8),
+    assert resolver_calls == [("official", 13)]
+    assert tuple(batch["inputs"]["sar"].shape) == (1, 2, 2, 2)
+    assert tuple(batch["target"].shape) == (1, 13, 1, 2)
+    assert datasets["train"].calls[:3] == [
+        ("reshard", 1024),
         ("shuffle", 13, 16),
         ("set_epoch", 3),
     ]
+    assert datasets["val"].calls == [("set_epoch", 0)]
+    assert datasets["test"].calls == [("set_epoch", 0)]
 
 
-def test_loader_config_rejects_invalid_worker_settings() -> None:
+def test_loader_builder_rejects_invalid_settings() -> None:
     with pytest.raises(ValueError):
-        LoaderConfig(persistent_workers=True, num_workers=0)
+        build_sen12mscr_loaders(0)
+    with pytest.raises(ValueError):
+        build_sen12mscr_loaders(1, num_workers=-1)
 
 
 def test_runtime_is_not_configured_on_import() -> None:

@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import random
+import re
 import sys
 import warnings
-from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from tqdm import TqdmExperimentalWarning
 from tqdm.rich import tqdm
@@ -19,7 +21,7 @@ from tqdm.rich import tqdm
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
 Scalar = float | int | torch.Tensor
-MetricFn = Callable[[Any, Any], Scalar]
+MetricLike = Callable[[Any, Any], Scalar]
 
 
 @dataclass(frozen=True)
@@ -47,10 +49,19 @@ class TrainerConfig:
 
 @dataclass
 class TrainerState:
-    """Mutable training progress tracked across checkpoint save/restore."""
+    """Mutable training progress tracked across checkpoint save and restore."""
 
     epoch: int = 0
     global_step: int = 0
+
+
+class MAE(nn.Module):
+    """Mean absolute error metric for regression outputs."""
+
+    name = "mae"
+
+    def forward(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.l1_loss(outputs, target)
 
 
 def _move_to_device(value: Any, device: torch.device) -> Any:
@@ -151,6 +162,41 @@ def _extract_inputs_target(batch: Mapping[str, Any]) -> tuple[Any, Any]:
     return batch["inputs"], batch["target"]
 
 
+def _snake_case(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
+
+
+def _metric_name(metric: MetricLike) -> str:
+    explicit_name = getattr(metric, "name", None)
+    if isinstance(explicit_name, str) and explicit_name:
+        return explicit_name
+    function_name = getattr(metric, "__name__", None)
+    if isinstance(function_name, str) and function_name:
+        if function_name == "<lambda>":
+            raise ValueError("lambda metrics are not supported; pass metric objects such as MAE()")
+        return _snake_case(function_name)
+    return _snake_case(metric.__class__.__name__)
+
+
+def _prepare_metrics(metrics: Sequence[MetricLike] | None) -> list[tuple[str, MetricLike]]:
+    if metrics is None:
+        return []
+    if isinstance(metrics, Mapping):
+        raise TypeError("metrics must be a sequence of metric objects, not a mapping")
+
+    prepared: list[tuple[str, MetricLike]] = []
+    seen_names: set[str] = set()
+    for metric in metrics:
+        if not callable(metric):
+            raise TypeError("each metric must be callable")
+        name = _metric_name(metric)
+        if name in seen_names:
+            raise ValueError(f"duplicate metric name: {name}")
+        seen_names.add(name)
+        prepared.append((name, metric))
+    return prepared
+
+
 class Trainer:
     """Supervised trainer that owns the common train/val/test loop."""
 
@@ -160,20 +206,20 @@ class Trainer:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         criterion: Callable[[Any, Any], torch.Tensor],
-        metrics: Mapping[str, MetricFn] | None,
+        metrics: Sequence[MetricLike] | None,
         config: TrainerConfig,
         train_loader: Any,
         val_loader: Any | None = None,
         test_loader: Any | None = None,
     ) -> None:
-        """Bind the model, optimization objects, and direct dataloaders to the trainer."""
+        """Bind the model, optimization objects, direct dataloaders, and metric objects."""
 
         _validate_optimizer_model_pair(model, optimizer)
         self.model = model
         self.device = _infer_model_device(model)
         self.optimizer = optimizer
         self.criterion = criterion
-        self.metrics = dict(metrics or {})
+        self.metrics = _prepare_metrics(metrics)
         self.config = config
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -232,7 +278,7 @@ class Trainer:
                         self.state.global_step += 1
 
                 metric_totals["loss"] = metric_totals.get("loss", 0.0) + _to_float(loss)
-                for name, metric in self.metrics.items():
+                for name, metric in self.metrics:
                     metric_value = metric(outputs, target)
                     metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value)
 
@@ -246,7 +292,6 @@ class Trainer:
 
         if batch_count == 0:
             return {}
-
         return {name: total / batch_count for name, total in metric_totals.items()}
 
     def step(
@@ -275,7 +320,6 @@ class Trainer:
                 training=True,
                 epoch=epoch,
             )
-
             val_metrics = (
                 self._run_stage(
                     "val",
