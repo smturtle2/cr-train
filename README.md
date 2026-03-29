@@ -117,9 +117,9 @@ Returns `(train_loader, val_loader, test_loader)`.
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `num_workers` | `None` | Auto-tunes based on CPU count |
-| `io_profile` | `"smooth"` | Moderate parquet readahead/threading; use `"conservative"` for synchronous I/O |
-| `persistent_workers` | `None` | Keeps workers alive when enabled |
+| `num_workers` | `None` | Notebook-safe auto mode: a small train-only worker pool |
+| `io_profile` | `"smooth"` | Light parquet readahead without extra thread fan-out; use `"conservative"` for fully synchronous I/O |
+| `persistent_workers` | `None` | Defaults to `False`; opt in explicitly if you want long-lived workers |
 
 ### `Trainer`
 
@@ -151,6 +151,7 @@ Trainer(
 - Each epoch prints a heading, then stage bars render underneath.
 - Bars show `loading first batch...` initially, then update running `loss` and metrics per batch.
 - `max_batches` stops cleanly without prefetching unused data.
+- Auto loader defaults favor notebook safety: train gets a small background worker pool, val/test stay synchronous, and stage workers are not kept alive unless you opt in.
 
 **Built-in metric:** `MAE` (Mean Absolute Error).
 

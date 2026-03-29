@@ -23,7 +23,8 @@ _PARQUET_IO_PROFILE: IOProfile | None = None
 
 def _scan_behavior(io_profile: IOProfile) -> tuple[int, int, bool]:
     if io_profile == "smooth":
-        return (2, 1, True)
+        # readahead만 완만하게 켜고, thread fan-out은 끄며 worker 병렬성과 충돌하지 않게 한다.
+        return (1, 1, False)
     if io_profile == "conservative":
         return (0, 0, False)
     raise ValueError(f"io_profile must be one of {sorted(VALID_IO_PROFILES)!r}")

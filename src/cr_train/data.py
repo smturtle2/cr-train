@@ -37,8 +37,8 @@ VALID_SPLIT_STRATEGIES: frozenset[SplitStrategy] = frozenset(("official", "seede
 DEFAULT_SHUFFLE_BUFFER_SIZE = 16
 DEFAULT_SEEDED_SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 DEFAULT_AUTO_PREFETCH_FACTOR = 2
-MAX_AUTO_WORKERS = 8
-MIN_AUTO_WORKERS = 2
+MAX_AUTO_TRAIN_WORKERS = 2
+MIN_AUTO_TRAIN_WORKERS = 1
 TRAIN_SHARD_CAP = 1024
 OPTICAL_MIN = 0.0
 OPTICAL_MAX = 10000.0
@@ -362,9 +362,9 @@ def _apply_reshard(dataset: Any, target_num_shards: int) -> Any:
         return dataset.reshard()
 
 
-def _auto_worker_budget() -> int:
-    cpu_count = os.cpu_count() or MIN_AUTO_WORKERS
-    return min(MAX_AUTO_WORKERS, max(MIN_AUTO_WORKERS, cpu_count // 2))
+def _auto_train_worker_budget() -> int:
+    cpu_count = os.cpu_count() or (MIN_AUTO_TRAIN_WORKERS * 6)
+    return min(MAX_AUTO_TRAIN_WORKERS, max(MIN_AUTO_TRAIN_WORKERS, cpu_count // 6))
 
 
 def _stage_shard_cap(stage: Stage, shard_count: int) -> int:
@@ -378,7 +378,9 @@ def _stage_shard_cap(stage: Stage, shard_count: int) -> int:
 def _resolve_stage_num_workers(stage: Stage, shard_count: int, options: _LoaderOptions) -> int:
     if options.num_workers is not None:
         return options.num_workers
-    return min(_auto_worker_budget(), _stage_shard_cap(stage, shard_count))
+    if stage != "train":
+        return 0
+    return min(_auto_train_worker_budget(), _stage_shard_cap(stage, shard_count))
 
 
 def _resolve_stage_prefetch_factor(num_workers: int, options: _LoaderOptions) -> int | None:
@@ -394,7 +396,7 @@ def _resolve_stage_persistent_workers(num_workers: int, options: _LoaderOptions)
         return None
     if options.persistent_workers is not None:
         return options.persistent_workers
-    return True
+    return False
 
 
 def _default_dataset_loader(

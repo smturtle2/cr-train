@@ -278,14 +278,17 @@ def test_loader_builder_auto_tunes_worker_defaults(monkeypatch: pytest.MonkeyPat
         _scene_split_resolver=fake_scene_split_resolver,
     )
 
-    assert [kwargs["num_workers"] for kwargs in created] == [6, 1, 2]
-    for kwargs in created:
+    assert [kwargs["num_workers"] for kwargs in created] == [2, 0, 0]
+    for index, kwargs in enumerate(created):
         assert kwargs["batch_size"] == 2
         assert kwargs["worker_init_fn"] is data_mod._seed_worker
         assert isinstance(kwargs["generator"], torch.Generator)
         if kwargs["num_workers"] > 0:
             assert kwargs["prefetch_factor"] == 2
-            assert kwargs["persistent_workers"] is True
+            assert kwargs["persistent_workers"] is False
+        else:
+            assert "prefetch_factor" not in kwargs
+            assert "persistent_workers" not in kwargs
 
 
 def test_loader_builder_passes_prefetch_and_persistent_worker_options(
@@ -404,6 +407,14 @@ def test_runtime_configuration_rejects_conflicting_io_profiles(
         runtime_mod.configure_runtime("conservative")
 
     assert patched_profiles == ["smooth"]
+
+
+def test_runtime_smooth_profile_uses_notebook_safe_scan_behavior() -> None:
+    runtime_mod = importlib.import_module("cr_train.runtime")
+    runtime_mod = importlib.reload(runtime_mod)
+
+    assert runtime_mod._scan_behavior("smooth") == (1, 1, False)
+    assert runtime_mod._scan_behavior("conservative") == (0, 0, False)
 
 
 def test_default_dataset_loader_bootstraps_runtime(monkeypatch: pytest.MonkeyPatch) -> None:

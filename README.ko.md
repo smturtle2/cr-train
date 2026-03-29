@@ -117,9 +117,9 @@ build_sen12mscr_loaders(
 
 | 파라미터 | 기본값 | 설명 |
 |---------|--------|------|
-| `num_workers` | `None` | CPU 코어 수 기반 자동 조정 |
-| `io_profile` | `"smooth"` | parquet readahead/threading 완만 적용; 동기식 I/O는 `"conservative"` 사용 |
-| `persistent_workers` | `None` | worker가 켜진 경우 재사용 |
+| `num_workers` | `None` | 노트북 안전형 자동 모드: train에만 작은 worker pool 적용 |
+| `io_profile` | `"smooth"` | 추가 thread fan-out 없이 가벼운 parquet readahead 적용; 완전 동기식 I/O는 `"conservative"` 사용 |
+| `persistent_workers` | `None` | 기본값은 `False`; 오래 살아 있는 worker가 필요할 때만 명시적으로 켬 |
 
 ### `Trainer`
 
@@ -151,6 +151,7 @@ Trainer(
 - 각 epoch는 먼저 헤더를 출력하고, 그 아래에 stage bar가 렌더링됨.
 - 첫 배치 전 `loading first batch...`를 표시하고, 이후 배치마다 `loss`와 metric을 갱신.
 - `max_batches`는 불필요한 데이터를 미리 가져오지 않고 깔끔하게 중단.
+- auto loader 기본값은 노트북 안전성을 우선합니다. train만 작은 background worker pool을 쓰고, val/test는 동기식으로 두며, 명시적으로 요청하지 않으면 stage worker를 오래 유지하지 않습니다.
 
 **내장 metric:** `MAE` (Mean Absolute Error).
 
