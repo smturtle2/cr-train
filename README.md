@@ -32,7 +32,7 @@ from torch import nn
 from cr_train import MAE, Trainer, TrainerConfig, build_sen12mscr_loaders
 
 
-# 1. Define your model -- just implement forward(sar, cloudy)
+# 1. Define your model -- receives (sar, cloudy) as positional args
 class MyModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -99,13 +99,13 @@ build_sen12mscr_loaders()          ← scene-level split, streaming decode, prep
     Trainer.test()                 ← final evaluation
 ```
 
-**Data pipeline.** Parquet shards are streamed directly from Hugging Face -- no local download required.  Each sample is decoded to CHW tensors and normalized on the fly.
+**Data pipeline.** Parquet shards are streamed directly from Hugging Face -- no local download required. Each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical) and normalized on the fly.
 
-**Scene isolation.** Scenes are assigned to train/val/test before any shuffling.  No scene appears in multiple splits.
+**Scene isolation.** Scenes are assigned to train/val/test before any shuffling. No scene appears in multiple splits.
 
-**Deterministic ordering.** Given the same `seed`, batch order is fully reproducible.  The trainer calls `set_epoch()` on each epoch so shuffle order changes deterministically.
+**Deterministic ordering.** Given the same `seed`, batch order is fully reproducible. The trainer calls `set_epoch()` on each epoch so shuffle order changes deterministically.
 
-**Checkpointing.** When `checkpoint_dir` is set, `last.pt` and `epoch-NNNN.pt` are saved automatically after each epoch. Checkpoints include the full RNG state (Python, NumPy, Torch, CUDA) for exact resumption.
+**Checkpointing.** When `checkpoint_dir` is set, `last.pt` and `epoch-NNNN.pt` are saved automatically after each epoch. Checkpoints include model, optimizer, scheduler (if provided), and full RNG state for exact resumption.
 
 ---
 
@@ -116,21 +116,20 @@ Every batch is a dictionary with this structure:
 ```python
 {
     "inputs": {
-        "sar":    Tensor,  # [B, 2, H, W]   SAR backscatter, float32 [0, 1]
-        "cloudy": Tensor,  # [B, 13, H, W]  cloudy Sentinel-2, float32 [0, 1]
+        "sar":    Tensor,  # [B, 2, 256, 256]   SAR backscatter, float32 [0, 1]
+        "cloudy": Tensor,  # [B, 13, 256, 256]  cloudy Sentinel-2, float32 [0, 1]
     },
-    "target": Tensor,      # [B, 13, H, W]  cloud-free Sentinel-2, float32 [0, 1]
+    "target": Tensor,      # [B, 13, 256, 256]  cloud-free Sentinel-2, float32 [0, 1]
     "metadata": {
         "season": list[str],        # "spring" | "summer" | "fall" | "winter"
         "scene":  list[str],        # scene ID
         "patch":  list[str],        # patch ID within scene
         "source_shard": list[str],  # e.g. "spring/scene_1.parquet"
-        ...
     },
 }
 ```
 
-The trainer unpacks `inputs` values as positional arguments: `model(sar, cloudy)`. The order is always SAR first, cloudy second.
+The trainer unpacks `inputs` values as positional arguments: `model(sar, cloudy)`. The order is always SAR first, cloudy second -- parameter names in your `forward()` can be anything.
 
 **Preprocessing:**
 
@@ -145,7 +144,7 @@ The trainer unpacks `inputs` values as positional arguments: `model(sar, cloudy)
 
 ### `build_sen12mscr_loaders(batch_size, **kwargs)`
 
-Returns `(train_loader, val_loader, test_loader)`.
+Returns `(train_loader, val_loader, test_loader)`. Only train is shuffled; val/test maintain fixed order.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -185,10 +184,11 @@ Trainer(
     train_loader,
     val_loader=None,
     test_loader=None,
+    scheduler=None,            # e.g. torch.optim.lr_scheduler.*
 )
 ```
 
-Device is inferred from model parameters. All batch data is moved to that device automatically.
+Device is inferred from model parameters. All batch data is moved to that device automatically. Metrics are averaged per-sample (not per-batch), so the last smaller batch does not skew results.
 
 #### `trainer.step(**overrides) -> Iterator[dict]`
 
@@ -203,24 +203,19 @@ Runs train/val epochs. Yields one record per epoch:
 }
 ```
 
-Optional overrides: `max_epochs`, `train_max_batches`, `val_max_batches`.
+If a `scheduler` is provided, `scheduler.step()` is called after each epoch. Optional overrides: `max_epochs`, `train_max_batches`, `val_max_batches`.
 
 #### `trainer.test(**overrides) -> dict[str, float]`
 
-Returns `{"loss": ..., "mae": ...}`.  Optional override: `max_batches`.
+Returns `{"loss": ..., "mae": ...}`. Optional override: `max_batches`.
 
 #### `trainer.save_checkpoint(filename) -> Path | None`
 
-Saves to `checkpoint_dir/filename`. Returns `None` if checkpointing is disabled. Includes:
-model state, optimizer state, `TrainerState` (epoch, global_step), and full RNG state.
+Saves to `checkpoint_dir/filename`. Returns `None` if checkpointing is disabled.
 
 #### `trainer.load_checkpoint(path)`
 
 Restores all state from a checkpoint file for exact training resumption.
-
-### `TrainerState`
-
-Accessible via `trainer.state`. Tracks `epoch` (0-indexed internally) and `global_step` (cumulative optimizer steps). Persisted in checkpoints.
 
 ### `MAE`
 
@@ -234,8 +229,8 @@ Built-in L1 loss metric. Usage: `metrics=[MAE()]`.
 |-----------|-----------|
 | No scene leakage | Scene-level split before any shuffling |
 | Deterministic batches | Same `seed` + same settings = identical order |
-| Per-epoch shuffle | `set_epoch()` propagated automatically |
-| Exact resumption | Checkpoint captures Python, NumPy, Torch, and CUDA RNG state |
+| Per-epoch shuffle | `set_epoch()` propagated automatically (train only) |
+| Exact resumption | Checkpoint captures model, optimizer, scheduler, and full RNG state |
 | Pinned dataset version | Dataset revision is hardcoded |
 
 The **official split** comes from the [authors' supplementary material](https://patricktum.github.io/cloud_removal/sen12mscr/) and is bundled in [`official_scene_splits.csv`](./src/cr_train/resources/official_scene_splits.csv).
@@ -247,7 +242,7 @@ The **official split** comes from the [authors' supplementary material](https://
 ```
 cr-train/
 ├── src/cr_train/
-│   ├── __init__.py         # public API: Trainer, TrainerConfig, MAE, build_sen12mscr_loaders
+│   ├── __init__.py         # public API
 │   ├── trainer.py          # training loop, checkpointing, progress
 │   ├── data.py             # streaming dataset, scene splits, preprocessing
 │   └── runtime.py          # parquet I/O tuning
