@@ -12,7 +12,6 @@ import numpy as np
 import torch
 from tqdm import TqdmExperimentalWarning
 from torch import nn
-from torch.nn import Parameter
 from tqdm.rich import tqdm
 
 from .data import Stage
@@ -86,56 +85,42 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
 
 def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
     for state in optimizer.state.values():
-        for key, value in state.items():
-            if isinstance(value, torch.Tensor):
-                state[key] = value.to(device)
+        for key, value in list(state.items()):
+            state[key] = _move_to_device(value, device)
 
 
-def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> list[Parameter]:
-    params: list[Parameter] = []
+def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> list[nn.Parameter]:
+    params: list[nn.Parameter] = []
     for group in optimizer.param_groups:
         params.extend(group["params"])
     return params
 
 
-def _remap_optimizer_parameters(
-    optimizer: torch.optim.Optimizer,
-    parameter_map: Mapping[Parameter, Parameter],
-) -> None:
-    for group in optimizer.param_groups:
-        group["params"] = [parameter_map.get(param, param) for param in group["params"]]
-
-    default_factory = getattr(optimizer.state, "default_factory", None)
-    remapped_state = type(optimizer.state)(default_factory) if default_factory is not None else type(optimizer.state)()
-    for param, state in optimizer.state.items():
-        remapped_state[parameter_map.get(param, param)] = state
-    optimizer.state = remapped_state
-
-
-def _align_model_and_optimizer_to_device(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> nn.Module:
-    current_parameters = list(model.parameters())
-    optimizer_parameters = _optimizer_parameters(optimizer)
-    current_parameter_ids = {id(parameter) for parameter in current_parameters}
-
-    if any(id(parameter) not in current_parameter_ids for parameter in optimizer_parameters):
+def _validate_optimizer_model_pair(model: nn.Module, optimizer: torch.optim.Optimizer) -> None:
+    model_parameter_ids = {id(parameter) for parameter in model.parameters()}
+    if any(id(parameter) not in model_parameter_ids for parameter in _optimizer_parameters(optimizer)):
         raise ValueError("optimizer must be constructed from the parameters of the supplied model")
 
-    moved_model = model.to(device)
-    moved_parameters = list(moved_model.parameters())
-    if len(current_parameters) != len(moved_parameters):
-        raise RuntimeError("model parameter count changed while moving to device")
 
-    parameter_map = {
-        current_parameter: moved_parameter
-        for current_parameter, moved_parameter in zip(current_parameters, moved_parameters, strict=True)
-    }
-    _remap_optimizer_parameters(optimizer, parameter_map)
-    _move_optimizer_state_to_device(optimizer, device)
-    return moved_model
+def _infer_model_device(model: nn.Module) -> torch.device:
+    devices = {tensor.device for tensor in list(model.parameters()) + list(model.buffers())}
+    if not devices:
+        return torch.device("cpu")
+    if len(devices) != 1:
+        raise ValueError("model parameters and buffers must live on a single device")
+    device = next(iter(devices))
+    if device.type == "meta":
+        raise ValueError("model must be materialized on a real device before passing it to Trainer")
+    return device
+
+
+def _scheduler_metrics(
+    train_metrics: Mapping[str, float],
+    val_metrics: Mapping[str, float],
+) -> dict[str, float]:
+    metrics = {f"train/{name}": value for name, value in train_metrics.items()}
+    metrics.update({f"val/{name}": value for name, value in val_metrics.items()})
+    return metrics
 
 
 class Trainer:
@@ -148,14 +133,15 @@ class Trainer:
         step_fn: StepFn,
         scheduler: Any | None = None,
         scheduler_step_fn: SchedulerStepFn | None = None,
-        device: torch.device | str | None = None,
         checkpoint_dir: str | Path | None = None,
         show_progress: bool | None = None,
     ) -> None:
-        self.device = torch.device(
-            device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        self.model = _align_model_and_optimizer_to_device(model, optimizer, self.device)
+        if (scheduler is None) != (scheduler_step_fn is None):
+            raise ValueError("scheduler and scheduler_step_fn must be provided together")
+
+        _validate_optimizer_model_pair(model, optimizer)
+        self.model = model
+        self.device = _infer_model_device(model)
         self.datamodule = datamodule
         self.step_fn = step_fn
         self.optimizer = optimizer
@@ -164,6 +150,7 @@ class Trainer:
         self.state = TrainerState()
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
         self.show_progress = sys.stderr.isatty() if show_progress is None else show_progress
+        _move_optimizer_state_to_device(self.optimizer, self.device)
         if self.checkpoint_dir is not None:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -261,7 +248,7 @@ class Trainer:
             history.append(epoch_metrics)
 
             if self.scheduler is not None and self.scheduler_step_fn is not None:
-                self.scheduler_step_fn(self.scheduler, {**train_metrics, **{f"val/{k}": v for k, v in val_metrics.items()}})
+                self.scheduler_step_fn(self.scheduler, _scheduler_metrics(train_metrics, val_metrics))
 
             self.state.epoch += 1
             self.save_checkpoint("last.pt")

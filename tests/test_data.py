@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import importlib
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
+import cr_train.data as data_mod
 from cr_train.data import (
     DataModuleConfig,
     LoaderConfig,
@@ -15,7 +24,6 @@ from cr_train.data import (
     official_scene_splits,
     seeded_scene_splits,
 )
-from cr_train.runtime import configure_runtime
 
 
 def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30") -> dict[str, object]:
@@ -82,15 +90,6 @@ class _FakeIterable:
         self.rows = rows
         self.calls: list[tuple[object, ...]] = []
 
-    def rehard(self, *_: object) -> "_FakeIterable":
-        raise AssertionError("unexpected typo call")
-
-    def reharded(self) -> "_FakeIterable":
-        return self
-
-    def reShard(self) -> "_FakeIterable":
-        return self
-
     def reshard(self, num_shards: int) -> "_FakeIterable":
         self.calls.append(("reshard", num_shards))
         return self
@@ -132,14 +131,62 @@ def test_train_pipeline_reshards_before_shuffle() -> None:
     ]
 
 
-def test_strict_repro_rejects_multi_worker_loader() -> None:
+def test_loader_config_rejects_invalid_worker_settings() -> None:
     with pytest.raises(ValueError):
-        LoaderConfig(profile="strict_repro", num_workers=1)
+        LoaderConfig(persistent_workers=True, num_workers=0)
 
 
-def test_runtime_patch_is_installed() -> None:
-    configure_runtime()
-    import importlib
+def test_runtime_is_not_configured_on_import() -> None:
+    runtime_mod = importlib.import_module("cr_train.runtime")
+    runtime_mod = importlib.reload(runtime_mod)
 
-    parquet_mod = importlib.import_module("datasets.packaged_modules.parquet.parquet")
-    assert getattr(parquet_mod.Parquet, "_cr_train_use_threads_patch", False) is True
+    assert runtime_mod._CONFIGURED is False
+
+
+def test_default_dataset_loader_bootstraps_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+    dummy_iterable = _FakeIterable([])
+
+    def fake_configure_runtime() -> None:
+        calls.append("configure")
+
+    def fake_load_dataset(*args: object, **kwargs: object) -> _FakeIterable:
+        calls.append(("load_dataset", kwargs["data_files"], kwargs["split"], kwargs["streaming"]))
+        return dummy_iterable
+
+    monkeypatch.setattr(data_mod, "configure_runtime", fake_configure_runtime)
+    monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
+
+    dataset = data_mod._default_dataset_loader(["/tmp/sample.parquet"], "train")
+
+    assert dataset is dummy_iterable
+    assert calls == [
+        "configure",
+        ("load_dataset", {"train": ["/tmp/sample.parquet"]}, "train", True),
+    ]
+
+
+def test_runtime_patch_allows_clean_subprocess_exit(tmp_path: Path) -> None:
+    parquet_path = tmp_path / "sample.parquet"
+    table = pa.table({"value": [1]})
+    pq.write_table(table, parquet_path)
+
+    script = textwrap.dedent(
+        """
+        from cr_train.data import _default_dataset_loader
+        import sys
+
+        dataset = _default_dataset_loader([sys.argv[1]], "train")
+        row = next(iter(dataset))
+        print(row["value"])
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(parquet_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1"

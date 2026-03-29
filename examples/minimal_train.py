@@ -61,7 +61,8 @@ def main() -> None:
             shuffle=ShuffleConfig(buffer_size=16, reshard_num_shards=16),
         )
     )
-    model = TinyCloudRemovalNet()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TinyCloudRemovalNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     trainer = Trainer(
         model=model,

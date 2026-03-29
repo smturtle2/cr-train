@@ -8,8 +8,6 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import tqdm
 
-tqdm.tqdm.monitor_interval = 0
-
 from datasets import disable_progress_bars as disable_datasets_progress_bars
 from huggingface_hub.utils import disable_progress_bars as disable_hf_progress_bars
 
@@ -89,10 +87,8 @@ def configure_runtime() -> None:
     if _CONFIGURED:
         return
 
+    tqdm.tqdm.monitor_interval = 0
     disable_datasets_progress_bars()
     disable_hf_progress_bars()
     _patch_datasets_parquet_reader()
     _CONFIGURED = True
-
-
-configure_runtime()

@@ -1,5 +1,7 @@
 # cr-train
 
+English | [한국어](./README.ko.md)
+
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](./pyproject.toml)
 [![PyTorch](https://img.shields.io/badge/pytorch-streaming%20trainer-ee4c2c.svg)](https://pytorch.org/)
 [![Datasets](https://img.shields.io/badge/huggingface-datasets-yellow.svg)](https://huggingface.co/datasets/Hermanni/sen12mscr)
@@ -27,9 +29,10 @@ SEN12MS-CR on Hugging Face is convenient, but the mirror exposes a single stream
 - Official split support. A vendored scene-level manifest is derived from the authors’ official supplementary `splits.csv`.
 - Internal bytes decode. `sar`, `cloudy`, and `target` are decoded inside the custom dataset with shape-aware tensor restoration.
 - Shuffle discipline. If training shuffle is enabled, the pipeline always does `reshard()` before `shuffle(seed, buffer_size)`.
-- Strict reproducibility mode. Same seed + same split + same loader topology gives the same batches.
+- Reproducibility-first defaults. Same seed + same split + same loader topology gives the same batches.
 - Partial-epoch training. Train, validation, and test loops accept `max_batches`.
 - Trainer neutrality. Model, optimizer, `step_fn`, and optional scheduler objects are injected.
+- Explicit device ownership. Move the model to its final device before creating the optimizer and trainer.
 
 ## Installation
 
@@ -89,7 +92,8 @@ datamodule = SEN12MSCRDataModule(
     )
 )
 
-model = TinyCloudRemovalNet()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = TinyCloudRemovalNet().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
 trainer = Trainer(
@@ -111,6 +115,12 @@ Run the bundled example:
 ```bash
 uv run python examples/minimal_train.py --epochs 1 --train-max-batches 8 --val-max-batches 2
 ```
+
+The example follows the trainer contract directly:
+
+- move the model to its final device first
+- create the optimizer from that moved model
+- pass both objects into `Trainer`
 
 ## Data Guarantees
 
@@ -144,14 +154,14 @@ This is intentional. The split boundary stays scene-safe, while row-group reshuf
 
 ### 5. Reproducibility contract
 
-The default loader profile is `strict_repro`:
+Default loader settings are intentionally conservative:
 
 - `num_workers=0`
 - `in_order=True`
 - `persistent_workers=False`
 
 With the same seed, split strategy, batch size, and loader topology, you get the same batches.  
-If you need higher throughput, switch the loader profile and worker count explicitly, but treat that as a performance mode rather than the strongest determinism path.
+If you raise worker count or prefetching, treat that as a throughput-oriented mode rather than the strongest determinism path.
 
 ## Split Strategies
 
@@ -204,8 +214,15 @@ Key knobs:
 - `ShuffleConfig.buffer_size`: streaming shuffle buffer size
 - `ShuffleConfig.reshard_num_shards`: reshard target before shuffle
 - `LoaderConfig.batch_size`: batch size
+- `Trainer`: expects the model to already live on its final device before optimizer construction
+- `Trainer(..., scheduler=..., scheduler_step_fn=...)`: optional epoch-level scheduler hook with `train/...` and `val/...` metric keys
 - `Trainer.fit(train_max_batches=..., val_max_batches=...)`: partial epochs
 - `Trainer.test(test_max_batches=...)`: capped evaluation
+
+Runtime note:
+
+- Hugging Face parquet streaming is bootstrapped internally when the dataset loader is created.
+- The shutdown-crash workaround stays internal; there is no public runtime setup step.
 
 ## Project Layout
 

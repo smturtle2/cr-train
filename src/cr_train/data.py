@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
-import inspect
 import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -19,12 +18,9 @@ from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.utils.data import DataLoader, IterableDataset
 
-configure_runtime()
-
 Stage = Literal["train", "val", "test"]
 SplitStrategy = Literal["official", "seeded_scene"]
 TensorLayout = Literal["channels_first", "channels_last"]
-LoaderProfile = Literal["strict_repro", "throughput"]
 
 SEASON_ORDER = ("spring", "summer", "fall", "winter")
 STAGE_ORDER: tuple[Stage, Stage, Stage] = ("train", "val", "test")
@@ -116,7 +112,6 @@ class LoaderConfig:
     drop_last: bool = False
     prefetch_factor: int | None = None
     persistent_workers: bool = False
-    profile: LoaderProfile = "strict_repro"
     in_order: bool = True
 
     def __post_init__(self) -> None:
@@ -124,8 +119,6 @@ class LoaderConfig:
             raise ValueError("batch_size must be positive")
         if self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
-        if self.profile == "strict_repro" and self.num_workers != 0:
-            raise ValueError("strict_repro profile requires num_workers=0")
         if self.prefetch_factor is not None and self.prefetch_factor <= 0:
             raise ValueError("prefetch_factor must be positive")
         if self.persistent_workers and self.num_workers == 0:
@@ -320,15 +313,16 @@ def _seed_worker(worker_id: int) -> None:
 
 
 def _apply_reshard(dataset: Any, target_num_shards: int) -> Any:
-    parameters = inspect.signature(dataset.reshard).parameters
-    if "num_shards" in parameters:
+    try:
         return dataset.reshard(num_shards=target_num_shards)
-    return dataset.reshard()
+    except TypeError:
+        return dataset.reshard()
 
 
 def _default_dataset_loader(urls: Sequence[str], _: Stage) -> HFIterableDataset:
     if not urls:
         return cast(HFIterableDataset, _EmptyIterable())
+    configure_runtime()
     return load_dataset(
         "parquet",
         data_files={"train": list(urls)},
