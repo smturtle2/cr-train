@@ -50,18 +50,19 @@ def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30")
 def test_decode_sample_applies_official_preprocessing_and_standard_schema() -> None:
     decoded = decode_sample(_sample_row())
 
-    assert decoded["inputs"]["sar"].shape == (2, 2, 2)
-    assert decoded["inputs"]["cloudy"].shape == (13, 1, 2)
+    sar, cloudy = decoded["inputs"]
+    assert sar.shape == (2, 2, 2)
+    assert cloudy.shape == (13, 1, 2)
     assert decoded["target"].shape == (13, 1, 2)
     assert decoded["metadata"]["source_shard"] == "spring/scene_1.parquet"
     assert decoded["metadata"]["patch"] == "p30"
-    assert decoded["inputs"]["sar"].dtype == torch.float32
-    assert decoded["inputs"]["cloudy"].dtype == torch.float32
+    assert sar.dtype == torch.float32
+    assert cloudy.dtype == torch.float32
     assert decoded["target"].dtype == torch.float32
-    assert torch.isclose(decoded["inputs"]["sar"].min(), torch.tensor(0.0))
-    assert torch.isclose(decoded["inputs"]["sar"].max(), torch.tensor(1.0))
-    assert torch.isclose(decoded["inputs"]["cloudy"].min(), torch.tensor(0.0))
-    assert torch.isclose(decoded["inputs"]["cloudy"].max(), torch.tensor(1.0))
+    assert torch.isclose(sar.min(), torch.tensor(0.0))
+    assert torch.isclose(sar.max(), torch.tensor(1.0))
+    assert torch.isclose(cloudy.min(), torch.tensor(0.0))
+    assert torch.isclose(cloudy.max(), torch.tensor(1.0))
     assert torch.isclose(decoded["target"].max(), torch.tensor(1.0))
 
 
@@ -176,7 +177,8 @@ def test_build_loaders_defaults_to_official_and_reshards_before_shuffle() -> Non
     _ = next(iter(test_loader))
 
     assert resolver_calls == [("official", 13)]
-    assert tuple(batch["inputs"]["sar"].shape) == (1, 2, 2, 2)
+    sar, cloudy = batch["inputs"]
+    assert tuple(sar.shape) == (1, 2, 2, 2)
     assert tuple(batch["target"].shape) == (1, 13, 1, 2)
     assert datasets["train"].calls[:3] == [
         ("reshard",),

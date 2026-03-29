@@ -99,7 +99,7 @@ def _make_rows(values: list[float]) -> list[dict[str, object]]:
     for value in values:
         rows.append(
             {
-                "inputs": {"x": torch.tensor([[value]], dtype=torch.float32)},
+                "inputs": (torch.tensor([[value]], dtype=torch.float32),),
                 "target": torch.tensor([[value]], dtype=torch.float32),
                 "metadata": {"index": value},
             }

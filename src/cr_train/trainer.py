@@ -238,8 +238,8 @@ def _infer_model_device(model: nn.Module) -> torch.device:
     return device
 
 
-def _forward_model(model: nn.Module, inputs: dict[str, torch.Tensor]) -> Any:
-    return model(*inputs.values())
+def _forward_model(model: nn.Module, inputs: tuple[torch.Tensor, ...]) -> Any:
+    return model(*inputs)
 
 
 def _set_loader_epoch(loader: Any, epoch: int) -> None:

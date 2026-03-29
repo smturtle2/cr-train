@@ -56,7 +56,7 @@ class SampleMetadata(TypedDict):
 class SEN12MSCRSample(TypedDict):
     """Standard sample schema consumed by the simplified supervised trainer."""
 
-    inputs: dict[str, torch.Tensor]
+    inputs: tuple[torch.Tensor, torch.Tensor]
     target: torch.Tensor
     metadata: SampleMetadata
 
@@ -283,7 +283,7 @@ def decode_sample(sample: Mapping[str, Any]) -> SEN12MSCRSample:
         "source_shard": f"{sample['season']}/scene_{scene}.parquet",
     }
     return {
-        "inputs": {"sar": sar, "cloudy": cloudy},
+        "inputs": (sar, cloudy),
         "target": target,
         "metadata": metadata,
     }
