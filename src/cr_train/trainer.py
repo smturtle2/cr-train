@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import random
 import re
-import sys
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from rich.progress import SpinnerColumn, TextColumn, TimeElapsedColumn
 from torch import nn
 from tqdm import TqdmExperimentalWarning
 from tqdm.rich import tqdm
@@ -86,6 +86,47 @@ def _progress_desc(stage: str, epoch: int) -> str:
     if stage == "test":
         return "test"
     return f"epoch {epoch + 1} {stage}"
+
+
+def _loader_length(dataloader: Any) -> int | None:
+    try:
+        return len(dataloader)
+    except (TypeError, AttributeError, NotImplementedError):
+        return None
+
+
+def _resolve_progress_total(dataloader: Any, max_batches: int | None) -> int | None:
+    loader_length = _loader_length(dataloader)
+    if loader_length is None:
+        return max_batches
+    if max_batches is None:
+        return loader_length
+    return min(loader_length, max_batches)
+
+
+def _indeterminate_progress_columns() -> tuple[Any, ...]:
+    return (
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TextColumn("{task.completed:>4.0f} batches"),
+        TimeElapsedColumn(),
+    )
+
+
+def _create_progress(*, desc: str, total: int | None, disable: bool, leave: bool) -> tqdm:
+    progress_kwargs: dict[str, Any] = {
+        "total": total,
+        "desc": desc,
+        "disable": disable,
+        "leave": leave,
+        "dynamic_ncols": True,
+        "unit": "batch",
+    }
+    if total is None:
+        progress_kwargs["progress"] = _indeterminate_progress_columns()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", TqdmExperimentalWarning)
+        return tqdm(**progress_kwargs)
 
 
 def _capture_rng_state() -> dict[str, Any]:
@@ -228,7 +269,7 @@ class Trainer:
         self.checkpoint_dir = (
             Path(config.checkpoint_dir) if config.checkpoint_dir is not None else None
         )
-        self.show_progress = sys.stderr.isatty() if config.show_progress is None else config.show_progress
+        self.show_progress = True if config.show_progress is None else config.show_progress
         _move_optimizer_state_to_device(self.optimizer, self.device)
         if self.checkpoint_dir is not None:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -250,13 +291,11 @@ class Trainer:
         if not training:
             self.model.eval()
 
-        progress = tqdm(
-            total=max_batches,
+        progress = _create_progress(
+            total=_resolve_progress_total(dataloader, max_batches),
             desc=_progress_desc(stage, epoch),
             disable=not self.show_progress,
             leave=False,
-            dynamic_ncols=True,
-            unit="batch",
         )
         try:
             for batch_index, batch in enumerate(dataloader):

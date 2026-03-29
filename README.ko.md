@@ -116,6 +116,7 @@ Trainer(
 - 내장 metric object는 `MAE`입니다.
 - 학습은 `for history in trainer.step(): ...`로 실행합니다.
 - 평가는 `trainer.test()`로 실행합니다.
+- `train`, `val`, `test` 진행 바는 기본적으로 `tqdm.rich`를 사용하며, `show_progress=False`로 끌 수 있습니다.
 
 ## 배치 계약
 

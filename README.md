@@ -116,6 +116,7 @@ Trainer(
 - Built-in metric object: `MAE`.
 - Training runs through `for history in trainer.step(): ...`.
 - Evaluation runs through `trainer.test()`.
+- `train`, `val`, and `test` progress bars use `tqdm.rich` by default; set `show_progress=False` to disable them.
 
 ## Batch Contract
 
