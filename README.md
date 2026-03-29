@@ -7,199 +7,259 @@ English | [한국어](./README.ko.md)
 [![Datasets](https://img.shields.io/badge/huggingface-datasets-yellow.svg)](https://huggingface.co/datasets/Hermanni/sen12mscr)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
-Model-agnostic SEN12MS-CR training utilities for deterministic streaming experiments.
+A drop-in training toolkit for [SEN12MS-CR](https://patricktum.github.io/cloud_removal/sen12mscr/) cloud removal experiments.
+Bring your own PyTorch model -- cr-train handles deterministic streaming, preprocessing, checkpointing, and progress tracking.
 
-## Features
+---
 
-- **Deterministic streaming** -- scene-level splits with reproducible batch ordering across epochs
-- **Model-agnostic** -- works with any PyTorch `nn.Module`; just implement `forward(sar, cloudy)`
-- **Auto-tuned I/O** -- worker count, prefetch, and parquet readahead configured automatically
-- **Checkpoint management** -- full RNG state capture for exact resumption
-- **Built-in progress** -- `tqdm.rich` stage bars with live loss/metric updates
+## Installation
 
-## Project Structure
+```bash
+# Recommended
+uv add git+https://github.com/smturtle2/cr-train.git
 
+# Or with pip
+pip install git+https://github.com/smturtle2/cr-train.git
 ```
-cr-train/
-├── src/cr_train/           # Core package
-│   ├── __init__.py         #   public API exports
-│   ├── trainer.py          #   Trainer, TrainerConfig, MAE
-│   ├── data.py             #   dataset loading & preprocessing
-│   └── runtime.py          #   parquet I/O tuning
-├── examples/
-│   ├── minimal_train.py    # Reference training script
-│   └── colab_quickstart.ipynb
-├── tests/
-├── scripts/
-└── pyproject.toml
-```
+
+> Hugging Face rate limits apply. Set `export HF_TOKEN=your_token` for higher throughput.
 
 ## Quick Start
 
-```bash
-git clone https://github.com/smturtle2/cr-train.git
-cd cr-train
-uv sync
-```
-
-Optional but recommended for higher Hugging Face rate limits:
-
-```bash
-export HF_TOKEN=your_token
-```
-
-Run the reference example:
-
-```bash
-uv run python examples/minimal_train.py --epochs 1 --train-max-batches 10 --val-max-batches 2
-```
-
-Or try the Colab notebook: [`examples/colab_quickstart.ipynb`](./examples/colab_quickstart.ipynb)
-
-## Usage
-
-This repository is meant to be cloned and used as a local training module.
-
-1. Clone and install: `git clone ... && uv sync`
-2. Run scripts from the repository root so the local `cr_train` package is importable.
-3. Import from `cr_train` (not `src.cr_train`):
-
 ```python
-from cr_train import Trainer, TrainerConfig, MAE, build_sen12mscr_loaders
+import torch
+from torch import nn
+from cr_train import MAE, Trainer, TrainerConfig, build_sen12mscr_loaders
 
+
+# 1. Define your model -- just implement forward(sar, cloudy)
+class MyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(15, 64, 3, padding=1), nn.GELU(),
+            nn.Conv2d(64, 32, 3, padding=1), nn.GELU(),
+            nn.Conv2d(32, 13, 1),
+        )
+
+    def forward(self, sar, cloudy):
+        return self.net(torch.cat([sar, cloudy], dim=1))
+
+
+# 2. Create data loaders (streams from Hugging Face, no local download)
 train_loader, val_loader, test_loader = build_sen12mscr_loaders(batch_size=4)
+
+# 3. Train
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = MyModel().to(device)
 
 trainer = Trainer(
     model=model,
-    optimizer=optimizer,
+    optimizer=torch.optim.AdamW(model.parameters(), lr=1e-4),
     criterion=nn.MSELoss(),
     metrics=[MAE()],
-    config=TrainerConfig(max_epochs=5),
+    config=TrainerConfig(max_epochs=5, checkpoint_dir="checkpoints"),
     train_loader=train_loader,
     val_loader=val_loader,
     test_loader=test_loader,
 )
 
-for history in trainer.step():
-    print(history["train"], history["val"])
+for epoch in trainer.step():
+    print(f"Epoch {epoch['epoch']}  "
+          f"train_loss={epoch['train']['loss']:.4f}  "
+          f"val_loss={epoch['val']['loss']:.4f}")
 
-test_metrics = trainer.test()
+print(trainer.test())
 ```
 
-For your own scripts, a common layout is:
+```bash
+uv run my_train.py
+```
 
-- `examples/` -- runnable reference scripts
-- `scripts/` -- one-off experiments
-- Repository root -- quick experiments via `uv run python your_script.py`
+For more examples: [`examples/minimal_train.py`](./examples/minimal_train.py) (CLI with all options), [`examples/colab_quickstart.ipynb`](./examples/colab_quickstart.ipynb) (Colab notebook).
 
-The reference implementation is [`examples/minimal_train.py`](./examples/minimal_train.py).
+---
 
-## Public API
+## How It Works
 
-### `build_sen12mscr_loaders`
+```
+Hugging Face (parquet shards)
+  │
+  ▼
+build_sen12mscr_loaders()          ← scene-level split, streaming decode, preprocessing
+  │
+  ├── train_loader                 ← resharded + shuffled per epoch
+  ├── val_loader                   ← fixed order
+  └── test_loader                  ← fixed order
+        │
+        ▼
+    Trainer.step()                 ← train/val loop, progress bars, auto-checkpointing
+        │
+        ▼
+    Trainer.test()                 ← final evaluation
+```
+
+**Data pipeline.** Parquet shards are streamed directly from Hugging Face -- no local download required.  Each sample is decoded to CHW tensors and normalized on the fly.
+
+**Scene isolation.** Scenes are assigned to train/val/test before any shuffling.  No scene appears in multiple splits.
+
+**Deterministic ordering.** Given the same `seed`, batch order is fully reproducible.  The trainer calls `set_epoch()` on each epoch so shuffle order changes deterministically.
+
+**Checkpointing.** When `checkpoint_dir` is set, `last.pt` and `epoch-NNNN.pt` are saved automatically after each epoch. Checkpoints include the full RNG state (Python, NumPy, Torch, CUDA) for exact resumption.
+
+---
+
+## Batch Format
+
+Every batch is a dictionary with this structure:
 
 ```python
-build_sen12mscr_loaders(
-    batch_size,
-    *,
-    seed=0,
-    split="official",              # "official" | "seeded_scene"
-    shuffle_buffer_size=16,
-    num_workers=None,              # None = auto-tune
-    pin_memory=False,
-    prefetch_factor=None,
-    persistent_workers=None,
-    io_profile="smooth",           # "smooth" | "conservative"
-) -> tuple[DataLoader, DataLoader, DataLoader]
+{
+    "inputs": {
+        "sar":    Tensor,  # [B, 2, H, W]   SAR backscatter, float32 [0, 1]
+        "cloudy": Tensor,  # [B, 13, H, W]  cloudy Sentinel-2, float32 [0, 1]
+    },
+    "target": Tensor,      # [B, 13, H, W]  cloud-free Sentinel-2, float32 [0, 1]
+    "metadata": {
+        "season": list[str],        # "spring" | "summer" | "fall" | "winter"
+        "scene":  list[str],        # scene ID
+        "patch":  list[str],        # patch ID within scene
+        "source_shard": list[str],  # e.g. "spring/scene_1.parquet"
+        ...
+    },
+}
 ```
+
+Since `inputs` is a `dict`, the trainer calls your model as `model(sar=..., cloudy=...)`.  If you use a list/tuple, it unpacks as positional args; a single tensor is passed directly.
+
+**Preprocessing:**
+
+| Band | Raw range | Preprocessing | Output |
+|------|-----------|---------------|--------|
+| Optical (cloudy, target) | int16 [0, 10000] | `clip(0, 10000) / 10000` | float32 [0, 1] |
+| SAR | float32 [-25, 0] dB | `clip(-25, 0)` then `(x + 25) / 25` | float32 [0, 1] |
+
+---
+
+## API Reference
+
+### `build_sen12mscr_loaders(batch_size, **kwargs)`
 
 Returns `(train_loader, val_loader, test_loader)`.
 
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| `num_workers` | `None` | Notebook-safe auto mode: a small train-only worker pool |
-| `io_profile` | `"smooth"` | Light parquet readahead without extra thread fan-out; use `"conservative"` for fully synchronous I/O |
-| `persistent_workers` | `None` | Defaults to `False`; opt in explicitly if you want long-lived workers |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `batch_size` | `int` | required | Samples per batch |
+| `seed` | `int` | `0` | Seed for shuffle order and worker init |
+| `split` | `str` | `"official"` | `"official"` (author splits: 155/10/10 scenes) or `"seeded_scene"` (80/10/10 stratified by season) |
+| `shuffle_buffer_size` | `int` | `16` | In-memory shuffle buffer for training |
+| `num_workers` | `int \| None` | `None` | Auto: train gets `min(2, cpu_count//6)` workers, val/test get 0 |
+| `pin_memory` | `bool` | `False` | Pin tensors for faster GPU transfer |
+| `prefetch_factor` | `int \| None` | `None` | Auto `2` when workers > 0 |
+| `persistent_workers` | `bool \| None` | `None` | Auto `False`; set `True` to keep workers alive between epochs |
+| `io_profile` | `str` | `"smooth"` | `"smooth"` (light readahead) or `"conservative"` (fully synchronous) |
+
+### `TrainerConfig`
+
+Immutable (`frozen=True`) configuration for the training loop.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_epochs` | `int` | `1` | Training epochs |
+| `train_max_batches` | `int \| None` | `None` | Cap training batches per epoch |
+| `val_max_batches` | `int \| None` | `None` | Cap validation batches per epoch |
+| `test_max_batches` | `int \| None` | `None` | Cap test batches |
+| `checkpoint_dir` | `str \| Path \| None` | `None` | Checkpoint directory (auto-created); `None` disables saving |
+| `show_progress` | `bool \| None` | `None` | Progress bars; `None` = `True` |
 
 ### `Trainer`
 
 ```python
 Trainer(
-    model,                         # nn.Module
-    optimizer,                     # torch.optim.Optimizer
-    criterion,                     # loss function
-    metrics,                       # e.g. [MAE()]
-    config,                        # TrainerConfig
+    *,
+    model: nn.Module,
+    optimizer: Optimizer,
+    criterion: (outputs, target) -> Tensor,
+    metrics: [MAE(), ...] | None,
+    config: TrainerConfig,
     train_loader,
     val_loader=None,
     test_loader=None,
 )
 ```
 
-**Methods:**
+Device is inferred from model parameters. All batch data is moved to that device automatically.
 
-| Method | Description |
-|--------|-------------|
-| `trainer.step()` | Iterator yielding per-epoch history dicts |
-| `trainer.test()` | Evaluate on test loader, returns metrics dict |
-| `trainer.save_checkpoint(path)` | Save model + optimizer + RNG state |
-| `trainer.load_checkpoint(path)` | Restore from checkpoint |
+#### `trainer.step(**overrides) -> Iterator[dict]`
 
-**Progress bars:**
-
-- Uses `tqdm.rich` by default; disable with `show_progress=False`.
-- Each epoch prints a heading, then stage bars render underneath.
-- Bars show `loading first batch...` initially, then update running `loss` and metrics per batch.
-- `max_batches` stops cleanly without prefetching unused data.
-- Auto loader defaults favor notebook safety: train gets a small background worker pool, val/test stay synchronous, and stage workers are not kept alive unless you opt in.
-
-**Built-in metric:** `MAE` (Mean Absolute Error).
-
-## Batch Contract
-
-Each sample and collated batch follows this schema:
+Runs train/val epochs. Yields one record per epoch:
 
 ```python
 {
-    "inputs": {
-        "sar":    Tensor,    # [B, 2, H, W]   SAR backscatter
-        "cloudy": Tensor,    # [B, 13, H, W]  cloudy optical
-    },
-    "target":     Tensor,    # [B, 13, H, W]  cloud-free optical
-    "metadata": {
-        "season": list[str],
-        "scene":  list[str],
-        "patch":  list[str],
-        ...
-    },
+    "epoch": 1,           # 1-indexed
+    "global_step": 120,   # cumulative optimizer steps
+    "train": {"loss": 0.0512, "mae": 0.0321},
+    "val":   {"loss": 0.0498, "mae": 0.0315},  # {} if no val_loader
 }
 ```
 
-`Trainer` forwards `inputs` to the model and applies `criterion(output, target)` plus each metric to `(output, target)`.
+Optional overrides: `max_epochs`, `train_max_batches`, `val_max_batches`.
 
-## Data Defaults
+#### `trainer.test(**overrides) -> dict[str, float]`
 
-| Setting | Value |
-|---------|-------|
-| Split | `official` (175 scenes: 155 train / 10 val / 10 test) |
-| Optical preprocessing | `clip(0, 10000) / 10000.0` -> float32 |
-| SAR preprocessing | `clip(-25, 0)`, then `(x + 25) / 25` -> [0, 1] |
-| Train pipeline | `reshard() -> shuffle(seed, buffer_size)` -> batch |
-| Scene membership | Fixed across epochs; only train order changes deterministically |
-| Dataset revision | Pinned for reproducibility |
+Returns `{"loss": ..., "mae": ...}`.  Optional override: `max_batches`.
+
+#### `trainer.save_checkpoint(filename) -> Path | None`
+
+Saves to `checkpoint_dir/filename`. Returns `None` if checkpointing is disabled. Includes:
+model state, optimizer state, `TrainerState` (epoch, global_step), and full RNG state.
+
+#### `trainer.load_checkpoint(path)`
+
+Restores all state from a checkpoint file for exact training resumption.
+
+### `TrainerState`
+
+Accessible via `trainer.state`. Tracks `epoch` (0-indexed internally) and `global_step` (cumulative optimizer steps). Persisted in checkpoints.
+
+### `MAE`
+
+Built-in L1 loss metric. Usage: `metrics=[MAE()]`.
+
+---
 
 ## Reproducibility
 
-- Scene-level splitting keeps train, validation, and test sets scene-isolated.
-- The official split is bundled from the authors' supplementary metadata.
-- With the same seed and loader settings, batch order is fully reproducible.
+| Guarantee | Mechanism |
+|-----------|-----------|
+| No scene leakage | Scene-level split before any shuffling |
+| Deterministic batches | Same `seed` + same settings = identical order |
+| Per-epoch shuffle | `set_epoch()` propagated automatically |
+| Exact resumption | Checkpoint captures Python, NumPy, Torch, and CUDA RNG state |
+| Pinned dataset version | Dataset revision is hardcoded |
 
-## Official Split Source
+The **official split** comes from the [authors' supplementary material](https://patricktum.github.io/cloud_removal/sen12mscr/) and is bundled in [`official_scene_splits.csv`](./src/cr_train/resources/official_scene_splits.csv).
 
-| Resource | Link |
-|----------|------|
-| Project page | <https://patricktum.github.io/cloud_removal/sen12mscr/> |
-| Supplementary folder | <https://u.pcloud.link/publink/show?code=kZ46bk0Z5JKM8r2bzfyjYl3dW85U60XaBmPV> |
-| Direct `splits.csv` | <https://api.pcloud.com/getpubtextfile?code=kZ46bk0Z5JKM8r2bzfyjYl3dW85U60XaBmPV&fileid=57823192235> |
-| Bundled manifest | [`official_scene_splits.csv`](./src/cr_train/resources/official_scene_splits.csv) |
-| Refresh script | [`refresh_official_scene_splits.py`](./scripts/refresh_official_scene_splits.py) |
+---
+
+## Project Structure
+
+```
+cr-train/
+├── src/cr_train/
+│   ├── __init__.py         # public API: Trainer, TrainerConfig, MAE, build_sen12mscr_loaders
+│   ├── trainer.py          # training loop, checkpointing, progress
+│   ├── data.py             # streaming dataset, scene splits, preprocessing
+│   └── runtime.py          # parquet I/O tuning
+├── examples/
+│   ├── minimal_train.py    # full CLI training script
+│   └── colab_quickstart.ipynb
+├── tests/
+├── scripts/
+│   └── refresh_official_scene_splits.py
+└── pyproject.toml
+```
+
+## License
+
+[MIT](./LICENSE)
