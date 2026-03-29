@@ -28,6 +28,7 @@ class TinyCloudRemovalNet(nn.Module):
 
 
 def _metric_columns(rows: Sequence[tuple[str, Mapping[str, float]]]) -> list[str]:
+    # stage마다 metric 집합이 조금씩 달라도 한 표에서 같이 보여줄 수 있게 열을 합친다.
     columns: list[str] = []
     seen: set[str] = set()
     for _, metrics in rows:
@@ -78,6 +79,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("artifacts/checkpoints"))
     args = parser.parse_args()
 
+    # 로컬 모듈 사용 예제 기준점이 되도록 loader 옵션을 CLI에서 바로 조절할 수 있게 둔다.
     train_loader, val_loader, test_loader = build_sen12mscr_loaders(
         args.batch_size,
         seed=args.seed,
@@ -93,6 +95,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TinyCloudRemovalNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    # Trainer가 train/val/test 루프와 checkpoint, progress 출력을 모두 묶어서 관리한다.
     trainer = Trainer(
         model=model,
         optimizer=optimizer,
@@ -111,6 +114,7 @@ def main() -> None:
     )
 
     for history in trainer.step():
+        # epoch별 평균 metric만 따로 표로 다시 보여줘 실험 로그를 훑기 쉽게 만든다.
         _print_summary(
             console,
             (

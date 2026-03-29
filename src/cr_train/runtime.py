@@ -20,6 +20,7 @@ def _patch_datasets_parquet_reader() -> None:
     if _PARQUET_PATCHED:
         return
 
+    # datasets 내부 parquet reader를 직접 패치해 streaming 종료와 읽기 동작을 더 안정적으로 맞춘다.
     parquet_mod = importlib.import_module("datasets.packaged_modules.parquet.parquet")
     parquet_cls = parquet_mod.Parquet
     if getattr(parquet_cls, "_cr_train_use_threads_patch", False):
@@ -59,6 +60,7 @@ def _patch_datasets_parquet_reader() -> None:
                             batch_size=batch_size,
                             columns=self.config.columns,
                             filter=filter_expr,
+                            # 보수적인 설정으로 runtime 이슈를 피하고 읽기 순서를 단순하게 유지한다.
                             batch_readahead=0,
                             fragment_readahead=0,
                             use_threads=False,
@@ -87,6 +89,7 @@ def configure_runtime() -> None:
     if _CONFIGURED:
         return
 
+    # 외부 progress bar를 끄고 parquet patch를 적용해 trainer 출력만 보이도록 정리한다.
     tqdm.tqdm.monitor_interval = 0
     disable_datasets_progress_bars()
     disable_hf_progress_bars()

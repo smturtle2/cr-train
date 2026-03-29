@@ -83,6 +83,7 @@ class SceneShard:
         dataset_name: str = DEFAULT_DATASET_NAME,
         revision: str = DEFAULT_DATASET_REVISION,
     ) -> str:
+        # dataset revision을 URL에 박아 재현성을 깨지 않게 한다.
         return f"hf://datasets/{dataset_name}@{revision}/{self.relative_path}"
 
 
@@ -106,6 +107,7 @@ class _LoaderOptions:
             raise ValueError("num_workers must be non-negative")
         if self.prefetch_factor is not None and self.prefetch_factor <= 0:
             raise ValueError("prefetch_factor must be positive when provided")
+        # worker 프로세스가 없으면 prefetch/persistent worker 옵션도 의미가 없다.
         if self.num_workers == 0:
             if self.prefetch_factor is not None:
                 raise ValueError("prefetch_factor requires num_workers > 0")
@@ -124,6 +126,7 @@ def _sort_scene_shards(shards: Sequence[SceneShard]) -> list[SceneShard]:
 
 @lru_cache(maxsize=1)
 def _official_scene_rows() -> tuple[tuple[Stage, SceneShard], ...]:
+    # 번들된 official split CSV는 프로세스당 한 번만 읽는다.
     resource = files("cr_train.resources").joinpath("official_scene_splits.csv")
     rows: list[tuple[Stage, SceneShard]] = []
     with resource.open("r", encoding="utf-8", newline="") as handle:
@@ -151,6 +154,7 @@ def _all_scene_shards() -> tuple[SceneShard, ...]:
 
 
 def _allocate_counts(total: int) -> dict[Stage, int]:
+    # season별 shard 수가 작아도 합계가 정확히 맞도록 나머지를 큰 소수점 순으로 배분한다.
     raw = {stage: total * ratio for stage, ratio in DEFAULT_SEEDED_SPLIT_RATIOS.items()}
     counts = {stage: int(np.floor(value)) for stage, value in raw.items()}
     remainder = total - sum(counts.values())
@@ -181,6 +185,7 @@ def seeded_scene_splits(
     """Create deterministic custom splits with fixed season-stratified 80/10/10 ratios."""
 
     catalog = tuple(scene_catalog) if scene_catalog is not None else _all_scene_shards()
+    # season별 비율을 유지한 채 seed만 바꿔도 항상 같은 split이 나오게 한다.
     by_season: dict[str, list[SceneShard]] = {season: [] for season in SEASON_ORDER}
     for shard in catalog:
         by_season[shard.season].append(shard)
@@ -247,6 +252,7 @@ def _decode_tensor(
     raw = _coerce_bytes(blob)
     array = np.frombuffer(raw, dtype=dtype).reshape(tuple(int(dim) for dim in shape))
     array = _maybe_channels_first(array, channel_counts)
+    # parquet/buffer 메모리와 분리된 torch tensor를 만들어 이후 변형이 안전하게 되게 한다.
     return torch.from_numpy(np.array(array, copy=True))
 
 
@@ -267,6 +273,7 @@ def decode_sample(sample: Mapping[str, Any]) -> SEN12MSCRSample:
     sar_shape = tuple(int(dim) for dim in sample["sar_shape"])
     opt_shape = tuple(int(dim) for dim in sample["opt_shape"])
 
+    # raw payload 세 개를 모두 CHW float tensor로 바꾸고 범위를 정규화한다.
     sar = _preprocess_sar(
         _decode_tensor(
             sample["sar"],
@@ -326,6 +333,7 @@ def _apply_reshard(dataset: Any, target_num_shards: int) -> Any:
 def _default_dataset_loader(urls: Sequence[str], _: Stage) -> HFIterableDataset:
     if not urls:
         return cast(HFIterableDataset, _EmptyIterable())
+    # runtime patch는 실제 HF streaming loader를 열 때만 적용한다.
     configure_runtime()
     return load_dataset(
         "parquet",
@@ -366,6 +374,7 @@ class SEN12MSCRStreamingDataset(IterableDataset[SEN12MSCRSample]):
 
     def __iter__(self) -> Iterator[SEN12MSCRSample]:
         if hasattr(self.source, "set_epoch"):
+            # HF iterable dataset은 iteration 시작 시점의 epoch 값으로 shard/example 순서를 결정한다.
             self.source.set_epoch(self.epoch)
         for row in self.source:
             yield decode_sample(row)
@@ -385,8 +394,7 @@ def _build_stage_dataset(
     urls = _stage_urls(stage, splits)
     source = (dataset_loader or _default_dataset_loader)(urls, stage)
     if stage == "train":
-        # Keep the train pipeline aligned with the explicit invariant:
-        # always reshard before shuffle when streaming.
+        # train만 re-shard 후 shuffle하고, val/test는 고정 순서를 유지한다.
         source = _apply_reshard(source, target_num_shards=1024)
         source = source.shuffle(seed=options.seed, buffer_size=options.shuffle_buffer_size)
     return SEN12MSCRStreamingDataset(source)
@@ -405,6 +413,7 @@ def _build_stage_dataloader(
         splits=splits,
         dataset_loader=dataset_loader,
     )
+    # torch worker seed도 dataloader마다 고정해 streaming 순서를 재현 가능하게 맞춘다.
     generator = torch.Generator()
     generator.manual_seed(options.seed)
     dataloader_kwargs: dict[str, Any] = {

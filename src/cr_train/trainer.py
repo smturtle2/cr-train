@@ -65,6 +65,7 @@ class MAE(nn.Module):
 
 
 def _move_to_device(value: Any, device: torch.device) -> Any:
+    # batch가 dict/list/tuple로 중첩돼도 같은 device로 한 번에 옮긴다.
     if isinstance(value, torch.Tensor):
         return value.to(device)
     if isinstance(value, dict):
@@ -103,6 +104,7 @@ def _live_progress_desc(
     metrics: Mapping[str, float],
 ) -> str:
     _ = batch_count
+    # tqdm.rich는 postfix를 제대로 그리지 않아서 description에 metric을 직접 싣는다.
     summary = _format_metric_summary(metrics)
     return f"{_progress_desc(stage, epoch)} | {summary}"
 
@@ -119,6 +121,7 @@ def _loader_length(dataloader: Any) -> int | None:
 
 
 def _resolve_progress_total(dataloader: Any, max_batches: int | None) -> int | None:
+    # streaming loader는 len()이 없을 수 있으므로 max_batches를 fallback으로 쓴다.
     loader_length = _loader_length(dataloader)
     if loader_length is None:
         return max_batches
@@ -153,6 +156,7 @@ def _create_progress(*, desc: str, total: int | None, disable: bool, leave: bool
 
 
 def _capture_rng_state() -> dict[str, Any]:
+    # checkpoint 복구 후에도 batch 순서와 augmentation RNG를 최대한 그대로 재현한다.
     state: dict[str, Any] = {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
@@ -215,8 +219,7 @@ def _forward_model(model: nn.Module, inputs: Any) -> Any:
 def _set_loader_epoch(loader: Any, epoch: int) -> None:
     dataset = getattr(loader, "dataset", None)
     if dataset is not None and hasattr(dataset, "set_epoch"):
-        # Streaming datasets keep their own epoch-aware shuffle state, so the
-        # trainer forwards the epoch before every stage pass.
+        # train dataset은 epoch별 shuffle 상태를 dataset 내부에서 관리한다.
         dataset.set_epoch(epoch)
 
 
@@ -310,6 +313,7 @@ class Trainer:
         batch_count = 0
 
         if training:
+            # val/test는 고정 순서를 유지해야 하므로 epoch 전달은 train에만 한다.
             _set_loader_epoch(dataloader, epoch)
         self.model.train(training)
         if not training:
@@ -385,6 +389,7 @@ class Trainer:
         while self.state.epoch < target_epochs:
             epoch = self.state.epoch
             if self.show_progress:
+                # epoch 헤더를 먼저 출력해 stage progress가 어느 epoch 소속인지 바로 보이게 한다.
                 print(_epoch_header(epoch, target_epochs), flush=True)
             train_metrics = self._run_stage(
                 "train",
