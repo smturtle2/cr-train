@@ -145,25 +145,31 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
     created: list[dict[str, object]] = []
 
     class _FakeProgress:
-        def update(self, value: int) -> None:
-            _ = value
+        def __init__(self) -> None:
+            self.descriptions: list[tuple[str, bool]] = []
+            self.updates: list[int] = []
 
-        def set_postfix(self, value: object) -> None:
-            _ = value
+        def update(self, value: int) -> None:
+            self.updates.append(value)
+
+        def set_description_str(self, value: str, refresh: bool = True) -> None:
+            self.descriptions.append((value, refresh))
 
         def close(self) -> None:
             return None
 
     def fake_create_progress(*, desc: str, total: int | None, disable: bool, leave: bool) -> _FakeProgress:
+        progress = _FakeProgress()
         created.append(
             {
                 "desc": desc,
                 "total": total,
                 "disable": disable,
                 "leave": leave,
+                "progress": progress,
             }
         )
-        return _FakeProgress()
+        return progress
 
     monkeypatch.setattr(trainer_mod, "_create_progress", fake_create_progress)
 
@@ -172,11 +178,14 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
     test_loader = DataLoader(_ToyDataset(_make_rows([6.0, 7.0])), batch_size=1, shuffle=False)
 
     model = nn.Linear(1, 1).to(torch.device("cpu"))
+    with torch.no_grad():
+        model.weight.zero_()
+        model.bias.zero_()
     trainer = Trainer(
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
         criterion=nn.MSELoss(),
-        metrics=[],
+        metrics=[MAE()],
         config=TrainerConfig(
             max_epochs=1,
             train_max_batches=10,
@@ -191,11 +200,37 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
     list(trainer.step())
     trainer.test()
 
-    assert created == [
+    assert [{key: value for key, value in item.items() if key != "progress"} for item in created] == [
         {"desc": "epoch 1 train", "total": 2, "disable": False, "leave": False},
         {"desc": "epoch 1 val", "total": 1, "disable": False, "leave": False},
         {"desc": "test", "total": 2, "disable": False, "leave": False},
     ]
+
+    train_progress = created[0]["progress"]
+    val_progress = created[1]["progress"]
+    test_progress = created[2]["progress"]
+
+    assert isinstance(train_progress, _FakeProgress)
+    assert isinstance(val_progress, _FakeProgress)
+    assert isinstance(test_progress, _FakeProgress)
+
+    assert train_progress.descriptions == [
+        ("epoch 1 train | loading first batch...", True),
+        ("epoch 1 train | batch 1 | loss=0.5000 mae=0.5000", False),
+        ("epoch 1 train | batch 2 | loss=3.5000 mae=1.5000", False),
+    ]
+    assert train_progress.updates == [1, 1]
+    assert val_progress.descriptions == [
+        ("epoch 1 val | loading first batch...", True),
+        ("epoch 1 val | batch 1 | loss=16.0000 mae=4.0000", False),
+    ]
+    assert val_progress.updates == [1]
+    assert test_progress.descriptions == [
+        ("test | loading first batch...", True),
+        ("test | batch 1 | loss=36.0000 mae=6.0000", False),
+        ("test | batch 2 | loss=42.5000 mae=6.5000", False),
+    ]
+    assert test_progress.updates == [1, 1]
 
 
 def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:

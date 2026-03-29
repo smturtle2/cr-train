@@ -94,6 +94,8 @@ class _LoaderOptions:
     shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE
     num_workers: int = 0
     pin_memory: bool = False
+    prefetch_factor: int | None = None
+    persistent_workers: bool = False
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -102,6 +104,13 @@ class _LoaderOptions:
             raise ValueError("shuffle_buffer_size must be positive")
         if self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
+        if self.prefetch_factor is not None and self.prefetch_factor <= 0:
+            raise ValueError("prefetch_factor must be positive when provided")
+        if self.num_workers == 0:
+            if self.prefetch_factor is not None:
+                raise ValueError("prefetch_factor requires num_workers > 0")
+            if self.persistent_workers:
+                raise ValueError("persistent_workers requires num_workers > 0")
 
 
 def _sort_scene_shards(shards: Sequence[SceneShard]) -> list[SceneShard]:
@@ -398,13 +407,20 @@ def _build_stage_dataloader(
     )
     generator = torch.Generator()
     generator.manual_seed(options.seed)
+    dataloader_kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": options.batch_size,
+        "num_workers": options.num_workers,
+        "pin_memory": options.pin_memory,
+        "worker_init_fn": _seed_worker,
+        "generator": generator,
+    }
+    if options.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = options.persistent_workers
+        if options.prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = options.prefetch_factor
     return DataLoader(
-        dataset,
-        batch_size=options.batch_size,
-        num_workers=options.num_workers,
-        pin_memory=options.pin_memory,
-        worker_init_fn=_seed_worker,
-        generator=generator,
+        **dataloader_kwargs,
     )
 
 
@@ -416,6 +432,8 @@ def build_sen12mscr_loaders(
     shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE,
     num_workers: int = 0,
     pin_memory: bool = False,
+    prefetch_factor: int | None = None,
+    persistent_workers: bool = False,
     _dataset_loader: DatasetLoader | None = None,
     _scene_split_resolver: SceneSplitResolver | None = None,
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
@@ -431,6 +449,8 @@ def build_sen12mscr_loaders(
         shuffle_buffer_size=shuffle_buffer_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
     )
     splits = _resolve_scene_splits(options.split, options.seed, _scene_split_resolver)
     loaders = tuple(

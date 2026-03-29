@@ -88,6 +88,25 @@ def _progress_desc(stage: str, epoch: int) -> str:
     return f"epoch {epoch + 1} {stage}"
 
 
+def _loading_progress_desc(stage: str, epoch: int) -> str:
+    return f"{_progress_desc(stage, epoch)} | loading first batch..."
+
+
+def _format_metric_summary(metrics: Mapping[str, float]) -> str:
+    return " ".join(f"{name}={value:.4f}" for name, value in metrics.items())
+
+
+def _live_progress_desc(
+    stage: str,
+    epoch: int,
+    *,
+    batch_count: int,
+    metrics: Mapping[str, float],
+) -> str:
+    summary = _format_metric_summary(metrics)
+    return f"{_progress_desc(stage, epoch)} | batch {batch_count} | {summary}"
+
+
 def _loader_length(dataloader: Any) -> int | None:
     try:
         return len(dataloader)
@@ -298,6 +317,7 @@ class Trainer:
             leave=False,
         )
         try:
+            progress.set_description_str(_loading_progress_desc(stage, epoch))
             for batch_index, batch in enumerate(dataloader):
                 if max_batches is not None and batch_index >= max_batches:
                     break
@@ -322,10 +342,17 @@ class Trainer:
                     metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value)
 
                 batch_count += 1
-                progress.update(1)
-
                 averages = {name: total / batch_count for name, total in metric_totals.items()}
-                progress.set_postfix({key: f"{value:.4f}" for key, value in averages.items()})
+                progress.set_description_str(
+                    _live_progress_desc(
+                        stage,
+                        epoch,
+                        batch_count=batch_count,
+                        metrics=averages,
+                    ),
+                    refresh=False,
+                )
+                progress.update(1)
         finally:
             progress.close()
 

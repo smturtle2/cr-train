@@ -30,7 +30,11 @@ export HF_TOKEN=your_token
 ## Quick Start
 
 ```python
+from collections.abc import Mapping, Sequence
+
 import torch
+from rich.console import Console
+from rich.table import Table
 from torch import nn
 
 from cr_train import MAE, Trainer, TrainerConfig, build_sen12mscr_loaders
@@ -51,10 +55,41 @@ class TinyCloudRemovalNet(nn.Module):
         return self.net(torch.cat([sar, cloudy], dim=1))
 
 
+def metric_columns(rows: Sequence[tuple[str, Mapping[str, float]]]) -> list[str]:
+    columns: list[str] = []
+    seen: set[str] = set()
+    for _, metrics in rows:
+        for name in metrics:
+            if name not in seen:
+                seen.add(name)
+                columns.append(name)
+    return columns
+
+
+def print_summary(
+    console: Console,
+    title: str,
+    rows: Sequence[tuple[str, Mapping[str, float]]],
+) -> None:
+    visible_rows = [(stage, metrics) for stage, metrics in rows if metrics]
+    if not visible_rows:
+        return
+
+    columns = metric_columns(visible_rows)
+    table = Table(title=title, header_style="bold cyan")
+    table.add_column("stage")
+    for name in columns:
+        table.add_column(name, justify="right")
+    for stage, metrics in visible_rows:
+        table.add_row(stage, *(f"{metrics[name]:.4f}" if name in metrics else "-" for name in columns))
+    console.print(table)
+
+
 train_loader, val_loader, test_loader = build_sen12mscr_loaders(
     batch_size=4,
 )
 
+console = Console()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = TinyCloudRemovalNet().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
@@ -78,9 +113,16 @@ trainer = Trainer(
 )
 
 for history in trainer.step():
-    print(history)
+    print_summary(
+        console,
+        f"Epoch {history['epoch']} Summary (global step {history['global_step']})",
+        (
+            ("train", history["train"]),
+            ("val", history["val"]),
+        ),
+    )
 
-print(trainer.test())
+print_summary(console, "Test Summary", (("test", trainer.test()),))
 ```
 
 ## Public API
@@ -94,6 +136,8 @@ build_sen12mscr_loaders(
     shuffle_buffer_size=16,
     num_workers=0,
     pin_memory=False,
+    prefetch_factor=None,
+    persistent_workers=False,
 )
 ```
 
@@ -117,6 +161,8 @@ Trainer(
 - Training runs through `for history in trainer.step(): ...`.
 - Evaluation runs through `trainer.test()`.
 - `train`, `val`, and `test` progress bars use `tqdm.rich` by default; set `show_progress=False` to disable them.
+- Stage bars show `loading first batch...` before the first batch arrives, then update running `loss` and metrics on every batch.
+- `num_workers`, `prefetch_factor`, and `persistent_workers` can be used to reduce first-batch latency and improve throughput on real training runs. `prefetch_factor` and `persistent_workers` require `num_workers > 0`.
 
 ## Batch Contract
 

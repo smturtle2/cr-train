@@ -177,6 +177,66 @@ def test_loader_builder_rejects_invalid_settings() -> None:
         build_sen12mscr_loaders(0)
     with pytest.raises(ValueError):
         build_sen12mscr_loaders(1, num_workers=-1)
+    with pytest.raises(ValueError):
+        build_sen12mscr_loaders(1, num_workers=2, prefetch_factor=0)
+    with pytest.raises(ValueError):
+        build_sen12mscr_loaders(1, prefetch_factor=2)
+    with pytest.raises(ValueError):
+        build_sen12mscr_loaders(1, persistent_workers=True)
+
+
+def test_loader_builder_passes_prefetch_and_persistent_worker_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[dict[str, object]] = []
+    datasets = {
+        "train": _FakeIterable([_sample_row()]),
+        "val": _FakeIterable([_sample_row(scene="2")]),
+        "test": _FakeIterable([_sample_row(scene="3")]),
+    }
+
+    class _FakeDataLoader:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(dict(kwargs))
+            self.dataset = kwargs["dataset"]
+            self.kwargs = kwargs
+
+        def __class_getitem__(cls, _: object) -> type["_FakeDataLoader"]:
+            return cls
+
+    def fake_dataset_loader(urls: list[str], stage: str) -> _FakeIterable:
+        _ = urls
+        return datasets[stage]
+
+    def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
+        _ = (split, seed)
+        return {
+            "train": (SceneShard("spring", "1"),),
+            "val": (SceneShard("spring", "2"),),
+            "test": (SceneShard("spring", "3"),),
+        }
+
+    monkeypatch.setattr(data_mod, "DataLoader", _FakeDataLoader)
+
+    build_sen12mscr_loaders(
+        2,
+        num_workers=2,
+        pin_memory=True,
+        prefetch_factor=4,
+        persistent_workers=True,
+        _dataset_loader=fake_dataset_loader,
+        _scene_split_resolver=fake_scene_split_resolver,
+    )
+
+    assert len(created) == 3
+    for kwargs in created:
+        assert kwargs["batch_size"] == 2
+        assert kwargs["num_workers"] == 2
+        assert kwargs["pin_memory"] is True
+        assert kwargs["worker_init_fn"] is data_mod._seed_worker
+        assert isinstance(kwargs["generator"], torch.Generator)
+        assert kwargs["prefetch_factor"] == 4
+        assert kwargs["persistent_workers"] is True
 
 
 def test_runtime_is_not_configured_on_import() -> None:
