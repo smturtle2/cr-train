@@ -115,8 +115,8 @@ class _FakeIterable:
         self.rows = rows
         self.calls: list[tuple[object, ...]] = []
 
-    def reshard(self, num_shards: int) -> "_FakeIterable":
-        self.calls.append(("reshard", num_shards))
+    def reshard(self) -> "_FakeIterable":
+        self.calls.append(("reshard",))
         return self
 
     def shuffle(self, *, seed: int, buffer_size: int) -> "_FakeIterable":
@@ -179,7 +179,7 @@ def test_build_loaders_defaults_to_official_and_reshards_before_shuffle() -> Non
     assert tuple(batch["inputs"]["sar"].shape) == (1, 2, 2, 2)
     assert tuple(batch["target"].shape) == (1, 13, 1, 2)
     assert datasets["train"].calls[:3] == [
-        ("reshard", 1024),
+        ("reshard",),
         ("shuffle", 13, 16),
         ("set_epoch", 3),
     ]
@@ -213,7 +213,7 @@ def test_build_loaders_supports_seeded_scene_split_without_custom_resolver() -> 
     _ = next(iter(test_loader))
 
     assert created == [(stage, len(expected_splits[stage])) for stage in ("train", "val", "test")]
-    assert datasets["train"].calls[:2] == [("reshard", 1024), ("shuffle", 7, 16)]
+    assert datasets["train"].calls[:2] == [("reshard",), ("shuffle", 7, 16)]
     assert datasets["val"].calls == [("set_epoch", 0)]
     assert datasets["test"].calls == [("set_epoch", 0)]
 

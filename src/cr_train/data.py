@@ -36,7 +36,6 @@ DEFAULT_SEEDED_SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 DEFAULT_AUTO_PREFETCH_FACTOR = 2
 MAX_AUTO_TRAIN_WORKERS = 2
 MIN_AUTO_TRAIN_WORKERS = 1
-TRAIN_SHARD_CAP = 1024
 OPTICAL_MIN = 0.0
 OPTICAL_MAX = 10000.0
 SAR_DB_MIN = -25.0
@@ -302,20 +301,12 @@ def _auto_train_worker_budget() -> int:
     return min(MAX_AUTO_TRAIN_WORKERS, max(MIN_AUTO_TRAIN_WORKERS, cpu_count // 6))
 
 
-def _stage_shard_cap(stage: Stage, shard_count: int) -> int:
-    if shard_count <= 0:
-        return 0
-    if stage == "train":
-        return TRAIN_SHARD_CAP
-    return shard_count
-
-
-def _resolve_stage_num_workers(stage: Stage, shard_count: int, options: _LoaderOptions) -> int:
+def _resolve_stage_num_workers(stage: Stage, options: _LoaderOptions) -> int:
     if options.num_workers is not None:
         return options.num_workers
     if stage != "train":
         return 0
-    return min(_auto_train_worker_budget(), _stage_shard_cap(stage, shard_count))
+    return _auto_train_worker_budget()
 
 
 def _resolve_stage_prefetch_factor(num_workers: int, options: _LoaderOptions) -> int | None:
@@ -395,7 +386,7 @@ def _build_stage_dataset(
         source = dataset_loader(urls, stage)
     if stage == "train":
         # train만 re-shard 후 shuffle하고, val/test는 고정 순서를 유지한다.
-        source = source.reshard(num_shards=TRAIN_SHARD_CAP)
+        source = source.reshard()
         source = source.shuffle(seed=options.seed, buffer_size=options.shuffle_buffer_size)
     return SEN12MSCRStreamingDataset(source)
 
@@ -417,7 +408,7 @@ def _build_stage_dataloader(
     # torch worker seed도 dataloader마다 고정해 streaming 순서를 재현 가능하게 맞춘다.
     generator = torch.Generator()
     generator.manual_seed(options.seed)
-    num_workers = _resolve_stage_num_workers(stage, len(urls), options)
+    num_workers = _resolve_stage_num_workers(stage, options)
     dataloader_kwargs: dict[str, Any] = {
         "dataset": dataset,
         "batch_size": options.batch_size,
