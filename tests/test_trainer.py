@@ -38,6 +38,29 @@ class _ToyStream(IterableDataset[dict[str, object]]):
         self.epochs.append(epoch)
 
 
+class _LoggingStream(IterableDataset[dict[str, object]]):
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+        self.events: list[str] = []
+
+    def __iter__(self):
+        for index, row in enumerate(self.rows):
+            self.events.append(f"yield:{index}")
+            yield row
+
+
+class _LengthMismatchLoader:
+    def __init__(self, rows: list[dict[str, object]], reported_length: int) -> None:
+        self.rows = rows
+        self.reported_length = reported_length
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self) -> int:
+        return self.reported_length
+
+
 class SquaredError:
     def __call__(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return torch.mean((outputs - target) ** 2)
@@ -265,6 +288,42 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
         ("test | loss=42.5000 mae=6.5000", False),
     ]
     assert test_progress.updates == [1, 1]
+    assert sum(train_progress.updates) == created[0]["total"]
+    assert sum(val_progress.updates) == created[1]["total"]
+    assert sum(test_progress.updates) == created[2]["total"]
+
+
+def test_trainer_step_does_not_prefetch_unused_batch_when_capped() -> None:
+    train_stream = _LoggingStream(_make_rows([0.0, 1.0, 2.0]))
+    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=1, show_progress=False),
+        train_loader=DataLoader(train_stream, batch_size=1),
+    )
+
+    history = list(trainer.step(train_max_batches=1))
+
+    assert len(history) == 1
+    assert train_stream.events == ["yield:0"]
+
+
+def test_trainer_raises_when_sized_stage_ends_before_progress_total() -> None:
+    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=1, show_progress=False),
+        train_loader=_LengthMismatchLoader(_make_rows([0.0]), reported_length=2),
+    )
+
+    with pytest.raises(RuntimeError, match="train stage ended after 1 batches, expected 2 batches"):
+        list(trainer.step())
 
 
 def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:

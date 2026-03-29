@@ -171,6 +171,7 @@ def test_build_loaders_defaults_to_official_and_reshards_before_shuffle() -> Non
     train_loader, val_loader, test_loader = build_sen12mscr_loaders(
         1,
         seed=13,
+        num_workers=0,
         shuffle_buffer_size=16,
         _dataset_loader=fake_dataset_loader,
         _scene_split_resolver=fake_scene_split_resolver,
@@ -210,6 +211,7 @@ def test_build_loaders_supports_seeded_scene_split_without_custom_resolver() -> 
         1,
         seed=7,
         split="seeded_scene",
+        num_workers=0,
         _dataset_loader=fake_dataset_loader,
     )
 
@@ -233,9 +235,57 @@ def test_loader_builder_rejects_invalid_settings() -> None:
     with pytest.raises(ValueError):
         build_sen12mscr_loaders(1, num_workers=2, prefetch_factor=0)
     with pytest.raises(ValueError):
-        build_sen12mscr_loaders(1, prefetch_factor=2)
+        build_sen12mscr_loaders(1, num_workers=0, prefetch_factor=2)
     with pytest.raises(ValueError):
-        build_sen12mscr_loaders(1, persistent_workers=True)
+        build_sen12mscr_loaders(1, num_workers=0, persistent_workers=True)
+
+
+def test_loader_builder_auto_tunes_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    created: list[dict[str, object]] = []
+    datasets = {
+        "train": _FakeIterable([_sample_row()]),
+        "val": _FakeIterable([_sample_row(scene="2")]),
+        "test": _FakeIterable([_sample_row(scene="3")]),
+    }
+
+    class _FakeDataLoader:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(dict(kwargs))
+            self.dataset = kwargs["dataset"]
+            self.kwargs = kwargs
+
+        def __class_getitem__(cls, _: object) -> type["_FakeDataLoader"]:
+            return cls
+
+    def fake_dataset_loader(urls: list[str], stage: str) -> _FakeIterable:
+        _ = urls
+        return datasets[stage]
+
+    def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
+        _ = (split, seed)
+        return {
+            "train": (SceneShard("spring", "1"), SceneShard("spring", "2")),
+            "val": (SceneShard("spring", "3"),),
+            "test": (SceneShard("spring", "4"), SceneShard("spring", "5")),
+        }
+
+    monkeypatch.setattr(data_mod, "DataLoader", _FakeDataLoader)
+    monkeypatch.setattr(data_mod.os, "cpu_count", lambda: 12)
+
+    build_sen12mscr_loaders(
+        2,
+        _dataset_loader=fake_dataset_loader,
+        _scene_split_resolver=fake_scene_split_resolver,
+    )
+
+    assert [kwargs["num_workers"] for kwargs in created] == [6, 1, 2]
+    for kwargs in created:
+        assert kwargs["batch_size"] == 2
+        assert kwargs["worker_init_fn"] is data_mod._seed_worker
+        assert isinstance(kwargs["generator"], torch.Generator)
+        if kwargs["num_workers"] > 0:
+            assert kwargs["prefetch_factor"] == 2
+            assert kwargs["persistent_workers"] is True
 
 
 def test_loader_builder_passes_prefetch_and_persistent_worker_options(
@@ -334,12 +384,34 @@ def test_runtime_is_not_configured_on_import() -> None:
     assert runtime_mod._CONFIGURED is False
 
 
+def test_runtime_configuration_rejects_conflicting_io_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_mod = importlib.import_module("cr_train.runtime")
+    runtime_mod = importlib.reload(runtime_mod)
+    patched_profiles: list[str] = []
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "_patch_datasets_parquet_reader",
+        lambda io_profile: patched_profiles.append(io_profile),
+    )
+
+    runtime_mod.configure_runtime("smooth")
+    runtime_mod.configure_runtime("smooth")
+
+    with pytest.raises(ValueError, match="runtime already configured"):
+        runtime_mod.configure_runtime("conservative")
+
+    assert patched_profiles == ["smooth"]
+
+
 def test_default_dataset_loader_bootstraps_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[object] = []
     dummy_iterable = _FakeIterable([])
 
-    def fake_configure_runtime() -> None:
-        calls.append("configure")
+    def fake_configure_runtime(*, io_profile: str = "smooth") -> None:
+        calls.append(("configure", io_profile))
 
     def fake_load_dataset(*args: object, **kwargs: object) -> _FakeIterable:
         calls.append(("load_dataset", kwargs["data_files"], kwargs["split"], kwargs["streaming"]))
@@ -348,11 +420,15 @@ def test_default_dataset_loader_bootstraps_runtime(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(data_mod, "configure_runtime", fake_configure_runtime)
     monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
 
-    dataset = data_mod._default_dataset_loader(["/tmp/sample.parquet"], "train")
+    dataset = data_mod._default_dataset_loader(
+        ["/tmp/sample.parquet"],
+        "train",
+        io_profile="conservative",
+    )
 
     assert dataset is dummy_iterable
     assert calls == [
-        "configure",
+        ("configure", "conservative"),
         ("load_dataset", {"train": ["/tmp/sample.parquet"]}, "train", True),
     ]
 

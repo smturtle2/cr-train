@@ -7,6 +7,7 @@ import re
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +142,22 @@ def _create_progress(*, desc: str, total: int | None, disable: bool, leave: bool
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", TqdmExperimentalWarning)
         return tqdm(**progress_kwargs)
+
+
+def _stage_batches(dataloader: Any, max_batches: int | None) -> Iterator[Any]:
+    iterator = iter(dataloader)
+    if max_batches is None:
+        return iterator
+    return islice(iterator, max_batches)
+
+
+def _ensure_progress_invariant(stage: str, total: int | None, processed_batches: int) -> None:
+    if total is None:
+        return
+    if processed_batches != total:
+        raise RuntimeError(
+            f"{stage} stage ended after {processed_batches} batches, expected {total} batches"
+        )
 
 
 def _capture_rng_state() -> dict[str, Any]:
@@ -299,6 +316,7 @@ class Trainer:
     ) -> dict[str, float]:
         metric_totals: dict[str, float] = {}
         batch_count = 0
+        progress_total = _resolve_progress_total(dataloader, max_batches)
 
         if training:
             # val/test는 고정 순서를 유지해야 하므로 epoch 전달은 train에만 한다.
@@ -306,17 +324,14 @@ class Trainer:
         self.model.train(training)
 
         progress = _create_progress(
-            total=_resolve_progress_total(dataloader, max_batches),
+            total=progress_total,
             desc=stage,
             disable=not self.show_progress,
             leave=True,
         )
         try:
             progress.set_description_str(f"{stage} | loading first batch...")
-            for batch_index, batch in enumerate(dataloader):
-                if max_batches is not None and batch_index >= max_batches:
-                    break
-
+            for batch in _stage_batches(dataloader, max_batches):
                 moved_batch = _move_to_device(batch, self.device)
                 inputs, target = _extract_inputs_target(moved_batch)
 
@@ -344,7 +359,10 @@ class Trainer:
                     refresh=False,
                 )
                 progress.update(1)
+            _ensure_progress_invariant(stage, progress_total, batch_count)
         finally:
+            if hasattr(progress, "refresh"):
+                progress.refresh()
             progress.close()
 
         if batch_count == 0:

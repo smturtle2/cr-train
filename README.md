@@ -63,10 +63,11 @@ build_sen12mscr_loaders(
     seed=0,
     split="official",
     shuffle_buffer_size=16,
-    num_workers=0,
+    num_workers=None,
     pin_memory=False,
     prefetch_factor=None,
-    persistent_workers=False,
+    persistent_workers=None,
+    io_profile="smooth",
 )
 ```
 
@@ -91,8 +92,9 @@ Trainer(
 - Evaluation runs through `trainer.test()`.
 - `train`, `val`, and `test` progress bars use `tqdm.rich` by default; set `show_progress=False` to disable them.
 - Each epoch prints a heading first, then stage bars render underneath it and stay visible after completion.
-- Stage bars show `loading first batch...` before the first batch arrives, then update running `loss` and metrics on every batch.
-- `num_workers`, `prefetch_factor`, and `persistent_workers` can be used to reduce first-batch latency and improve throughput on real training runs. `prefetch_factor` and `persistent_workers` require `num_workers > 0`.
+- Stage bars show `loading first batch...` before the first batch arrives, then update running `loss` and metrics on every batch. Sized loaders now complete the last visible batch update before advancing to the next stage.
+- `max_batches` caps now stop without fetching one extra batch, so stage bars do not stall at the boundary waiting on unused data.
+- The default loader path is tuned for smoother streaming: `num_workers=None` auto-tunes worker count, `persistent_workers=None` keeps workers alive when enabled, and `io_profile="smooth"` turns on moderate parquet readahead/threading. Use `num_workers=0` with `io_profile="conservative"` to opt back into the old synchronous behavior.
 
 ## Batch Contract
 
@@ -115,6 +117,7 @@ Each decoded sample and collated batch uses the same schema:
 
 - Default split is `official`.
 - Scene membership stays fixed across epochs; only train iteration order changes deterministically with the current epoch.
+- Loader defaults favor smoother epochs by auto-selecting workers and enabling the `smooth` parquet I/O profile.
 - Optical preprocessing defaults to `clip(0, 10000)` and then `/ 10000.0` to `float32` for both `cloudy` and `target`.
 - SAR preprocessing defaults to `clip(-25, 0)` and then `(x + 25) / 25` to map values into `[0, 1]`.
 - The train pipeline keeps the invariant `reshard() -> shuffle(seed, buffer_size)` before batching.

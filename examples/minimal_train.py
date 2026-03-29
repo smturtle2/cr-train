@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import torch
 from rich.console import Console
@@ -63,6 +64,18 @@ def _print_summary(
     console.print(_metrics_table(rows))
 
 
+def _parse_num_workers(value: str) -> int | None:
+    if value == "auto":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("num_workers must be 'auto' or a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("num_workers must be non-negative")
+    return parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal SEN12MS-CR streaming training example.")
     parser.add_argument("--epochs", type=int, default=1)
@@ -72,12 +85,17 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--split", choices=("official", "seeded_scene"), default="official")
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=_parse_num_workers, default=None, metavar="auto|INT")
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--prefetch-factor", type=int, default=None)
-    parser.add_argument("--persistent-workers", action="store_true")
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--io-profile", choices=("smooth", "conservative"), default="smooth")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("artifacts/checkpoints"))
-    args = parser.parse_args()
+    args: Any = parser.parse_args()
 
     # 로컬 모듈 사용 예제 기준점이 되도록 loader 옵션을 CLI에서 바로 조절할 수 있게 둔다.
     train_loader, val_loader, test_loader = build_sen12mscr_loaders(
@@ -89,6 +107,7 @@ def main() -> None:
         pin_memory=args.pin_memory,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
+        io_profile=args.io_profile,
     )
 
     console = Console()

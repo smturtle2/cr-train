@@ -6,6 +6,7 @@ import base64
 import csv
 import hashlib
 import multiprocessing as mp
+import os
 import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ from datasets import IterableDataset as HFIterableDataset
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 
-from .runtime import configure_runtime
+from .runtime import IOProfile, VALID_IO_PROFILES, configure_runtime
 
 Stage = Literal["train", "val", "test"]
 SplitStrategy = Literal["official", "seeded_scene"]
@@ -31,9 +32,14 @@ OPTICAL_CHANNELS = {13}
 DEFAULT_DATASET_NAME = "Hermanni/sen12mscr"
 DEFAULT_DATASET_REVISION = "e2facda8700dd26cb4cbd5c5d9c82d15f10c38c6"
 DEFAULT_SPLIT = "official"
+DEFAULT_IO_PROFILE: IOProfile = "smooth"
 VALID_SPLIT_STRATEGIES: frozenset[SplitStrategy] = frozenset(("official", "seeded_scene"))
 DEFAULT_SHUFFLE_BUFFER_SIZE = 16
 DEFAULT_SEEDED_SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
+DEFAULT_AUTO_PREFETCH_FACTOR = 2
+MAX_AUTO_WORKERS = 8
+MIN_AUTO_WORKERS = 2
+TRAIN_SHARD_CAP = 1024
 OPTICAL_MIN = 0.0
 OPTICAL_MAX = 10000.0
 SAR_DB_MIN = -25.0
@@ -95,10 +101,11 @@ class _LoaderOptions:
     seed: int = 0
     split: SplitStrategy = DEFAULT_SPLIT
     shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE
-    num_workers: int = 0
+    num_workers: int | None = None
     pin_memory: bool = False
     prefetch_factor: int | None = None
-    persistent_workers: bool = False
+    persistent_workers: bool | None = None
+    io_profile: IOProfile = DEFAULT_IO_PROFILE
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -109,7 +116,9 @@ class _LoaderOptions:
             )
         if self.shuffle_buffer_size <= 0:
             raise ValueError("shuffle_buffer_size must be positive")
-        if self.num_workers < 0:
+        if self.io_profile not in VALID_IO_PROFILES:
+            raise ValueError(f"io_profile must be one of {sorted(VALID_IO_PROFILES)!r}")
+        if self.num_workers is not None and self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
         if self.prefetch_factor is not None and self.prefetch_factor <= 0:
             raise ValueError("prefetch_factor must be positive when provided")
@@ -353,11 +362,51 @@ def _apply_reshard(dataset: Any, target_num_shards: int) -> Any:
         return dataset.reshard()
 
 
-def _default_dataset_loader(urls: Sequence[str], _: Stage) -> HFIterableDataset:
+def _auto_worker_budget() -> int:
+    cpu_count = os.cpu_count() or MIN_AUTO_WORKERS
+    return min(MAX_AUTO_WORKERS, max(MIN_AUTO_WORKERS, cpu_count // 2))
+
+
+def _stage_shard_cap(stage: Stage, shard_count: int) -> int:
+    if shard_count <= 0:
+        return 0
+    if stage == "train":
+        return TRAIN_SHARD_CAP
+    return shard_count
+
+
+def _resolve_stage_num_workers(stage: Stage, shard_count: int, options: _LoaderOptions) -> int:
+    if options.num_workers is not None:
+        return options.num_workers
+    return min(_auto_worker_budget(), _stage_shard_cap(stage, shard_count))
+
+
+def _resolve_stage_prefetch_factor(num_workers: int, options: _LoaderOptions) -> int | None:
+    if num_workers == 0:
+        return None
+    if options.prefetch_factor is not None:
+        return options.prefetch_factor
+    return DEFAULT_AUTO_PREFETCH_FACTOR
+
+
+def _resolve_stage_persistent_workers(num_workers: int, options: _LoaderOptions) -> bool | None:
+    if num_workers == 0:
+        return None
+    if options.persistent_workers is not None:
+        return options.persistent_workers
+    return True
+
+
+def _default_dataset_loader(
+    urls: Sequence[str],
+    _: Stage,
+    *,
+    io_profile: IOProfile = DEFAULT_IO_PROFILE,
+) -> HFIterableDataset:
     if not urls:
         return cast(HFIterableDataset, _EmptyIterable())
     # runtime patch는 실제 HF streaming loader를 열 때만 적용한다.
-    configure_runtime()
+    configure_runtime(io_profile=io_profile)
     return load_dataset(
         "parquet",
         data_files={"train": list(urls)},
@@ -423,10 +472,13 @@ def _build_stage_dataset(
     dataset_loader: DatasetLoader | None,
 ) -> SEN12MSCRStreamingDataset:
     urls = _stage_urls(stage, splits)
-    source = (dataset_loader or _default_dataset_loader)(urls, stage)
+    if dataset_loader is None:
+        source = _default_dataset_loader(urls, stage, io_profile=options.io_profile)
+    else:
+        source = dataset_loader(urls, stage)
     if stage == "train":
         # train만 re-shard 후 shuffle하고, val/test는 고정 순서를 유지한다.
-        source = _apply_reshard(source, target_num_shards=1024)
+        source = _apply_reshard(source, target_num_shards=TRAIN_SHARD_CAP)
         source = source.shuffle(seed=options.seed, buffer_size=options.shuffle_buffer_size)
     return SEN12MSCRStreamingDataset(source)
 
@@ -438,6 +490,7 @@ def _build_stage_dataloader(
     splits: Mapping[Stage, Sequence[SceneShard]],
     dataset_loader: DatasetLoader | None,
 ) -> DataLoader[Any]:
+    urls = _stage_urls(stage, splits)
     dataset = _build_stage_dataset(
         stage,
         options,
@@ -447,18 +500,22 @@ def _build_stage_dataloader(
     # torch worker seed도 dataloader마다 고정해 streaming 순서를 재현 가능하게 맞춘다.
     generator = torch.Generator()
     generator.manual_seed(options.seed)
+    num_workers = _resolve_stage_num_workers(stage, len(urls), options)
     dataloader_kwargs: dict[str, Any] = {
         "dataset": dataset,
         "batch_size": options.batch_size,
-        "num_workers": options.num_workers,
+        "num_workers": num_workers,
         "pin_memory": options.pin_memory,
         "worker_init_fn": _seed_worker,
         "generator": generator,
     }
-    if options.num_workers > 0:
-        dataloader_kwargs["persistent_workers"] = options.persistent_workers
-        if options.prefetch_factor is not None:
-            dataloader_kwargs["prefetch_factor"] = options.prefetch_factor
+    resolved_prefetch_factor = _resolve_stage_prefetch_factor(num_workers, options)
+    resolved_persistent_workers = _resolve_stage_persistent_workers(num_workers, options)
+    if num_workers > 0:
+        if resolved_persistent_workers is not None:
+            dataloader_kwargs["persistent_workers"] = resolved_persistent_workers
+        if resolved_prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = resolved_prefetch_factor
     return DataLoader(
         **dataloader_kwargs,
     )
@@ -470,10 +527,11 @@ def build_sen12mscr_loaders(
     seed: int = 0,
     split: SplitStrategy = DEFAULT_SPLIT,
     shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE,
-    num_workers: int = 0,
+    num_workers: int | None = None,
     pin_memory: bool = False,
     prefetch_factor: int | None = None,
-    persistent_workers: bool = False,
+    persistent_workers: bool | None = None,
+    io_profile: IOProfile = DEFAULT_IO_PROFILE,
     _dataset_loader: DatasetLoader | None = None,
     _scene_split_resolver: SceneSplitResolver | None = None,
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
@@ -491,6 +549,7 @@ def build_sen12mscr_loaders(
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
+        io_profile=io_profile,
     )
     splits = _resolve_scene_splits(options.split, options.seed, _scene_split_resolver)
     loaders = tuple(
