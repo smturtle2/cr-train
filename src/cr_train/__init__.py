@@ -13,6 +13,7 @@ from .data import (
     official_scene_splits,
     seeded_scene_splits,
 )
+from .runtime import configure_runtime
 from .trainer import (
     SchedulerFactory,
     SchedulerStepFn,
@@ -39,6 +40,7 @@ __all__ = [
     "TensorLayout",
     "Trainer",
     "TrainerState",
+    "configure_runtime",
     "decode_sample",
     "official_scene_splits",
     "seeded_scene_splits",

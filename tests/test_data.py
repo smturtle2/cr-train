@@ -15,6 +15,7 @@ from cr_train.data import (
     official_scene_splits,
     seeded_scene_splits,
 )
+from cr_train.runtime import configure_runtime
 
 
 def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30") -> dict[str, object]:
@@ -134,3 +135,11 @@ def test_train_pipeline_reshards_before_shuffle() -> None:
 def test_strict_repro_rejects_multi_worker_loader() -> None:
     with pytest.raises(ValueError):
         LoaderConfig(profile="strict_repro", num_workers=1)
+
+
+def test_runtime_patch_is_installed() -> None:
+    configure_runtime()
+    import importlib
+
+    parquet_mod = importlib.import_module("datasets.packaged_modules.parquet.parquet")
+    assert getattr(parquet_mod.Parquet, "_cr_train_use_threads_patch", False) is True

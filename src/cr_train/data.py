@@ -13,10 +13,13 @@ from typing import Any, Literal, TypedDict, cast
 
 import numpy as np
 import torch
+from .runtime import configure_runtime
 from datasets import IterableDataset as HFIterableDataset
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.utils.data import DataLoader, IterableDataset
+
+configure_runtime()
 
 Stage = Literal["train", "val", "test"]
 SplitStrategy = Literal["official", "seeded_scene"]

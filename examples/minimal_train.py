@@ -74,6 +74,7 @@ def main() -> None:
         val_max_batches=args.val_max_batches,
     )
     print(history)
+    print(trainer.test(test_max_batches=1))
 
 
 if __name__ == "__main__":

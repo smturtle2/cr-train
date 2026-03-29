@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import sys
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,9 +10,13 @@ from typing import Any, Protocol
 
 import numpy as np
 import torch
+from tqdm import TqdmExperimentalWarning
 from torch import nn
+from tqdm.rich import tqdm
 
 from .data import Stage
+
+warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
 Scalar = float | int | torch.Tensor
 
@@ -54,6 +60,12 @@ def _to_float(value: Scalar) -> float:
     return float(value)
 
 
+def _progress_desc(stage: Stage, epoch: int) -> str:
+    if stage == "test":
+        return "test"
+    return f"epoch {epoch + 1} {stage}"
+
+
 def _capture_rng_state() -> dict[str, Any]:
     state: dict[str, Any] = {
         "python": random.getstate(),
@@ -92,6 +104,7 @@ class Trainer:
         scheduler_step_fn: SchedulerStepFn | None = None,
         device: torch.device | str | None = None,
         checkpoint_dir: str | Path | None = None,
+        show_progress: bool | None = None,
     ) -> None:
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -104,6 +117,7 @@ class Trainer:
         self.scheduler_step_fn = scheduler_step_fn
         self.state = TrainerState()
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
+        self.show_progress = sys.stderr.isatty() if show_progress is None else show_progress
         if self.checkpoint_dir is not None:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -114,6 +128,7 @@ class Trainer:
         *,
         max_batches: int | None,
         training: bool,
+        epoch: int,
     ) -> dict[str, float]:
         metric_totals: dict[str, float] = {}
         batch_count = 0
@@ -122,30 +137,45 @@ class Trainer:
         if not training:
             self.model.eval()
 
-        for batch_index, batch in enumerate(dataloader):
-            if max_batches is not None and batch_index >= max_batches:
-                break
+        progress = tqdm(
+            total=max_batches,
+            desc=_progress_desc(stage, epoch),
+            disable=not self.show_progress,
+            leave=False,
+            dynamic_ncols=True,
+            unit="batch",
+        )
+        try:
+            for batch_index, batch in enumerate(dataloader):
+                if max_batches is not None and batch_index >= max_batches:
+                    break
 
-            moved_batch = _move_to_device(batch, self.device)
-            if training:
-                self.optimizer.zero_grad(set_to_none=True)
-
-            with torch.set_grad_enabled(training):
-                result = self.step_fn(self.model, moved_batch, stage)
+                moved_batch = _move_to_device(batch, self.device)
                 if training:
-                    if result.loss is None:
-                        raise ValueError("training step_fn must return a loss tensor")
-                    result.loss.backward()
-                    self.optimizer.step()
-                    self.state.global_step += 1
+                    self.optimizer.zero_grad(set_to_none=True)
 
-            if result.loss is not None:
-                metric_totals["loss"] = metric_totals.get("loss", 0.0) + _to_float(result.loss)
+                with torch.set_grad_enabled(training):
+                    result = self.step_fn(self.model, moved_batch, stage)
+                    if training:
+                        if result.loss is None:
+                            raise ValueError("training step_fn must return a loss tensor")
+                        result.loss.backward()
+                        self.optimizer.step()
+                        self.state.global_step += 1
 
-            for name, value in result.metrics.items():
-                metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(value)
+                if result.loss is not None:
+                    metric_totals["loss"] = metric_totals.get("loss", 0.0) + _to_float(result.loss)
 
-            batch_count += 1
+                for name, value in result.metrics.items():
+                    metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(value)
+
+                batch_count += 1
+                progress.update(1)
+
+                averages = {name: total / batch_count for name, total in metric_totals.items()}
+                progress.set_postfix({key: f"{value:.4f}" for key, value in averages.items()})
+        finally:
+            progress.close()
 
         if batch_count == 0:
             return {}
@@ -169,6 +199,7 @@ class Trainer:
                 train_loader,
                 max_batches=train_max_batches,
                 training=True,
+                epoch=epoch,
             )
 
             val_loader = self.datamodule.val_dataloader(epoch=epoch)
@@ -177,6 +208,7 @@ class Trainer:
                 val_loader,
                 max_batches=val_max_batches,
                 training=False,
+                epoch=epoch,
             )
 
             epoch_metrics = {"train": train_metrics, "val": val_metrics}
@@ -193,7 +225,13 @@ class Trainer:
 
     def test(self, *, test_max_batches: int | None = None) -> dict[str, float]:
         test_loader = self.datamodule.test_dataloader(epoch=self.state.epoch)
-        return self._run_stage("test", test_loader, max_batches=test_max_batches, training=False)
+        return self._run_stage(
+            "test",
+            test_loader,
+            max_batches=test_max_batches,
+            training=False,
+            epoch=self.state.epoch,
+        )
 
     def save_checkpoint(self, filename: str | Path) -> Path | None:
         if self.checkpoint_dir is None:
