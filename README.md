@@ -68,7 +68,6 @@ def metric_columns(rows: Sequence[tuple[str, Mapping[str, float]]]) -> list[str]
 
 def print_summary(
     console: Console,
-    title: str,
     rows: Sequence[tuple[str, Mapping[str, float]]],
 ) -> None:
     visible_rows = [(stage, metrics) for stage, metrics in rows if metrics]
@@ -76,7 +75,7 @@ def print_summary(
         return
 
     columns = metric_columns(visible_rows)
-    table = Table(title=title, header_style="bold cyan")
+    table = Table(header_style="bold cyan")
     table.add_column("stage")
     for name in columns:
         table.add_column(name, justify="right")
@@ -115,14 +114,13 @@ trainer = Trainer(
 for history in trainer.step():
     print_summary(
         console,
-        f"Epoch {history['epoch']} Summary (global step {history['global_step']})",
         (
             ("train", history["train"]),
             ("val", history["val"]),
         ),
     )
 
-print_summary(console, "Test Summary", (("test", trainer.test()),))
+print_summary(console, (("test", trainer.test()),))
 ```
 
 ## Public API

@@ -38,9 +38,9 @@ def _metric_columns(rows: Sequence[tuple[str, Mapping[str, float]]]) -> list[str
     return columns
 
 
-def _metrics_table(title: str, rows: Sequence[tuple[str, Mapping[str, float]]]) -> Table:
+def _metrics_table(rows: Sequence[tuple[str, Mapping[str, float]]]) -> Table:
     columns = _metric_columns(rows)
-    table = Table(title=title, header_style="bold cyan")
+    table = Table(header_style="bold cyan")
     table.add_column("stage")
     for name in columns:
         table.add_column(name, justify="right")
@@ -54,13 +54,12 @@ def _metrics_table(title: str, rows: Sequence[tuple[str, Mapping[str, float]]]) 
 
 def _print_summary(
     console: Console,
-    title: str,
     stage_metrics: Sequence[tuple[str, Mapping[str, float]]],
 ) -> None:
     rows = [(stage, metrics) for stage, metrics in stage_metrics if metrics]
     if not rows:
         return
-    console.print(_metrics_table(title, rows))
+    console.print(_metrics_table(rows))
 
 
 def main() -> None:
@@ -114,13 +113,12 @@ def main() -> None:
     for history in trainer.step():
         _print_summary(
             console,
-            f"Epoch {history['epoch']} Summary (global step {history['global_step']})",
             (
                 ("train", history["train"]),
                 ("val", history["val"]),
             ),
         )
-    _print_summary(console, "Test Summary", (("test", trainer.test()),))
+    _print_summary(console, (("test", trainer.test()),))
 
 
 if __name__ == "__main__":

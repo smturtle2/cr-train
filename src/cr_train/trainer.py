@@ -102,8 +102,9 @@ def _live_progress_desc(
     batch_count: int,
     metrics: Mapping[str, float],
 ) -> str:
+    _ = batch_count
     summary = _format_metric_summary(metrics)
-    return f"{_progress_desc(stage, epoch)} | batch {batch_count} | {summary}"
+    return f"{_progress_desc(stage, epoch)} | {summary}"
 
 
 def _epoch_header(epoch: int, total_epochs: int) -> str:

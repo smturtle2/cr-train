@@ -219,19 +219,19 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
 
     assert train_progress.descriptions == [
         ("train | loading first batch...", True),
-        ("train | batch 1 | loss=0.5000 mae=0.5000", False),
-        ("train | batch 2 | loss=3.5000 mae=1.5000", False),
+        ("train | loss=0.5000 mae=0.5000", False),
+        ("train | loss=3.5000 mae=1.5000", False),
     ]
     assert train_progress.updates == [1, 1]
     assert val_progress.descriptions == [
         ("val | loading first batch...", True),
-        ("val | batch 1 | loss=16.0000 mae=4.0000", False),
+        ("val | loss=16.0000 mae=4.0000", False),
     ]
     assert val_progress.updates == [1]
     assert test_progress.descriptions == [
         ("test | loading first batch...", True),
-        ("test | batch 1 | loss=36.0000 mae=6.0000", False),
-        ("test | batch 2 | loss=42.5000 mae=6.5000", False),
+        ("test | loss=36.0000 mae=6.0000", False),
+        ("test | loss=42.5000 mae=6.5000", False),
     ]
     assert test_progress.updates == [1, 1]
 
