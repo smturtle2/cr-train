@@ -161,6 +161,7 @@ Trainer(
 - Training runs through `for history in trainer.step(): ...`.
 - Evaluation runs through `trainer.test()`.
 - `train`, `val`, and `test` progress bars use `tqdm.rich` by default; set `show_progress=False` to disable them.
+- Each epoch prints a heading first, then stage bars render underneath it and stay visible after completion.
 - Stage bars show `loading first batch...` before the first batch arrives, then update running `loss` and metrics on every batch.
 - `num_workers`, `prefetch_factor`, and `persistent_workers` can be used to reduce first-batch latency and improve throughput on real training runs. `prefetch_factor` and `persistent_workers` require `num_workers > 0`.
 

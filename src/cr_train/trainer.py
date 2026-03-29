@@ -83,9 +83,8 @@ def _to_float(value: Scalar) -> float:
 
 
 def _progress_desc(stage: str, epoch: int) -> str:
-    if stage == "test":
-        return "test"
-    return f"epoch {epoch + 1} {stage}"
+    _ = epoch
+    return stage
 
 
 def _loading_progress_desc(stage: str, epoch: int) -> str:
@@ -105,6 +104,10 @@ def _live_progress_desc(
 ) -> str:
     summary = _format_metric_summary(metrics)
     return f"{_progress_desc(stage, epoch)} | batch {batch_count} | {summary}"
+
+
+def _epoch_header(epoch: int, total_epochs: int) -> str:
+    return f"epoch {epoch + 1}/{total_epochs}"
 
 
 def _loader_length(dataloader: Any) -> int | None:
@@ -314,7 +317,7 @@ class Trainer:
             total=_resolve_progress_total(dataloader, max_batches),
             desc=_progress_desc(stage, epoch),
             disable=not self.show_progress,
-            leave=False,
+            leave=True,
         )
         try:
             progress.set_description_str(_loading_progress_desc(stage, epoch))
@@ -379,6 +382,8 @@ class Trainer:
 
         while self.state.epoch < target_epochs:
             epoch = self.state.epoch
+            if self.show_progress:
+                print(_epoch_header(epoch, target_epochs), flush=True)
             train_metrics = self._run_stage(
                 "train",
                 self.train_loader,

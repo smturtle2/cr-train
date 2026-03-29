@@ -161,6 +161,7 @@ Trainer(
 - 학습은 `for history in trainer.step(): ...`로 실행합니다.
 - 평가는 `trainer.test()`로 실행합니다.
 - `train`, `val`, `test` 진행 바는 기본적으로 `tqdm.rich`를 사용하며, `show_progress=False`로 끌 수 있습니다.
+- 각 epoch는 먼저 헤더를 출력하고, 그 아래에 stage 진행 바가 표시되며 완료 후에도 남아 있습니다.
 - 각 stage는 첫 배치 전 `loading first batch...`를 먼저 보여주고, 이후에는 배치마다 running `loss`와 metrics를 갱신합니다.
 - 실제 학습에서는 `num_workers`, `prefetch_factor`, `persistent_workers`로 첫 배치 대기 시간과 처리량을 조절할 수 있습니다. `prefetch_factor`와 `persistent_workers`는 `num_workers > 0`일 때만 사용할 수 있습니다.
 

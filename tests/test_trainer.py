@@ -143,6 +143,7 @@ def test_trainer_progress_defaults_on_and_supports_unsized_loaders() -> None:
 
 def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch: pytest.MonkeyPatch) -> None:
     created: list[dict[str, object]] = []
+    printed: list[str] = []
 
     class _FakeProgress:
         def __init__(self) -> None:
@@ -172,6 +173,7 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
         return progress
 
     monkeypatch.setattr(trainer_mod, "_create_progress", fake_create_progress)
+    monkeypatch.setattr("builtins.print", lambda *args, **kwargs: printed.append(" ".join(map(str, args))))
 
     train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0, 2.0, 3.0])), batch_size=2, shuffle=False)
     val_loader = DataLoader(_ToyDataset(_make_rows([4.0, 5.0])), batch_size=1, shuffle=False)
@@ -200,10 +202,11 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
     list(trainer.step())
     trainer.test()
 
+    assert printed == ["epoch 1/1"]
     assert [{key: value for key, value in item.items() if key != "progress"} for item in created] == [
-        {"desc": "epoch 1 train", "total": 2, "disable": False, "leave": False},
-        {"desc": "epoch 1 val", "total": 1, "disable": False, "leave": False},
-        {"desc": "test", "total": 2, "disable": False, "leave": False},
+        {"desc": "train", "total": 2, "disable": False, "leave": True},
+        {"desc": "val", "total": 1, "disable": False, "leave": True},
+        {"desc": "test", "total": 2, "disable": False, "leave": True},
     ]
 
     train_progress = created[0]["progress"]
@@ -215,14 +218,14 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
     assert isinstance(test_progress, _FakeProgress)
 
     assert train_progress.descriptions == [
-        ("epoch 1 train | loading first batch...", True),
-        ("epoch 1 train | batch 1 | loss=0.5000 mae=0.5000", False),
-        ("epoch 1 train | batch 2 | loss=3.5000 mae=1.5000", False),
+        ("train | loading first batch...", True),
+        ("train | batch 1 | loss=0.5000 mae=0.5000", False),
+        ("train | batch 2 | loss=3.5000 mae=1.5000", False),
     ]
     assert train_progress.updates == [1, 1]
     assert val_progress.descriptions == [
-        ("epoch 1 val | loading first batch...", True),
-        ("epoch 1 val | batch 1 | loss=16.0000 mae=4.0000", False),
+        ("val | loading first batch...", True),
+        ("val | batch 1 | loss=16.0000 mae=4.0000", False),
     ]
     assert val_progress.updates == [1]
     assert test_progress.descriptions == [
