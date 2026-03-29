@@ -105,7 +105,7 @@ def _epoch_header(epoch: int, total_epochs: int) -> str:
 def _loader_length(dataloader: Any) -> int | None:
     try:
         return len(dataloader)
-    except (TypeError, AttributeError, NotImplementedError):
+    except TypeError:
         return None
 
 
@@ -146,9 +146,12 @@ def _create_progress(*, desc: str, total: int | None, disable: bool, leave: bool
 
 def _stage_batches(dataloader: Any, max_batches: int | None) -> Iterator[Any]:
     iterator = iter(dataloader)
-    if max_batches is None:
-        return iterator
-    return islice(iterator, max_batches)
+    try:
+        for batch in islice(iterator, max_batches):
+            yield batch
+    finally:
+        # max_batches로 조기 종료 시 prefetch된 미소비 배치와 worker 상태를 즉시 정리한다.
+        del iterator
 
 
 def _ensure_progress_invariant(stage: str, total: int | None, processed_batches: int) -> None:
@@ -160,11 +163,35 @@ def _ensure_progress_invariant(stage: str, total: int | None, processed_batches:
         )
 
 
+def _numpy_rng_to_safe(state: tuple[Any, ...]) -> dict[str, Any]:
+    """numpy RNG 상태를 torch.save(weights_only=True)가 직렬화할 수 있는 형태로 변환한다."""
+    kind, keys, pos, has_gauss, gauss = state
+    return {
+        "kind": kind,
+        "keys": torch.from_numpy(keys.copy()),
+        "pos": int(pos),
+        "has_gauss": int(has_gauss),
+        "gauss": float(gauss),
+    }
+
+
+def _safe_to_numpy_rng(safe: Mapping[str, Any]) -> tuple[Any, ...]:
+    """torch-safe 형태를 numpy가 받아들이는 RNG 상태 tuple로 복원한다."""
+    return (
+        safe["kind"],
+        safe["keys"].numpy(),
+        safe["pos"],
+        safe["has_gauss"],
+        safe["gauss"],
+    )
+
+
 def _capture_rng_state() -> dict[str, Any]:
     # checkpoint 복구 후에도 batch 순서와 augmentation RNG를 최대한 그대로 재현한다.
+    # numpy 상태는 ndarray를 포함하므로 torch tensor로 변환해 weights_only=True를 허용한다.
     state: dict[str, Any] = {
         "python": random.getstate(),
-        "numpy": np.random.get_state(),
+        "numpy": _numpy_rng_to_safe(np.random.get_state()),
         "torch": torch.random.get_rng_state(),
     }
     if torch.cuda.is_available():
@@ -174,7 +201,7 @@ def _capture_rng_state() -> dict[str, Any]:
 
 def _restore_rng_state(state: Mapping[str, Any]) -> None:
     random.setstate(state["python"])
-    np.random.set_state(state["numpy"])
+    np.random.set_state(_safe_to_numpy_rng(state["numpy"]))
     torch.random.set_rng_state(state["torch"].cpu())
     if "cuda" in state and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["cuda"])
@@ -211,14 +238,8 @@ def _infer_model_device(model: nn.Module) -> torch.device:
     return device
 
 
-def _forward_model(model: nn.Module, inputs: Any) -> Any:
-    # Keep the trainer compatible with the common supervised patterns:
-    # `model(x)`, `model(*inputs)`, and `model(**inputs)`.
-    if isinstance(inputs, Mapping):
-        return model(**inputs)
-    if isinstance(inputs, (list, tuple)):
-        return model(*inputs)
-    return model(inputs)
+def _forward_model(model: nn.Module, inputs: dict[str, torch.Tensor]) -> Any:
+    return model(*inputs.values())
 
 
 def _set_loader_epoch(loader: Any, epoch: int) -> None:
@@ -283,6 +304,7 @@ class Trainer:
         train_loader: Any,
         val_loader: Any | None = None,
         test_loader: Any | None = None,
+        scheduler: Any | None = None,
     ) -> None:
         """Bind the model, optimization objects, direct dataloaders, and metric objects."""
 
@@ -290,6 +312,7 @@ class Trainer:
         self.model = model
         self.device = _infer_model_device(model)
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.criterion = criterion
         self.metrics = _prepare_metrics(metrics)
         self.config = config
@@ -314,7 +337,9 @@ class Trainer:
         training: bool,
         epoch: int,
     ) -> dict[str, float]:
+        # per-sample 가중 평균을 위해 metric 합산은 batch_size를 곱해서 누적한다.
         metric_totals: dict[str, float] = {}
+        sample_count = 0
         batch_count = 0
         progress_total = _resolve_progress_total(dataloader, max_batches)
 
@@ -334,6 +359,7 @@ class Trainer:
             for batch in _stage_batches(dataloader, max_batches):
                 moved_batch = _move_to_device(batch, self.device)
                 inputs, target = _extract_inputs_target(moved_batch)
+                batch_size = target.shape[0]
 
                 if training:
                     self.optimizer.zero_grad(set_to_none=True)
@@ -346,28 +372,33 @@ class Trainer:
                         self.optimizer.step()
                         self.state.global_step += 1
 
-                metric_totals["loss"] = metric_totals.get("loss", 0.0) + _to_float(loss)
+                # criterion/metric은 기본적으로 batch 내 평균을 반환하므로
+                # batch_size를 곱해 sample 단위 합계로 변환한다.
+                metric_totals["loss"] = metric_totals.get("loss", 0.0) + _to_float(loss) * batch_size
                 with torch.no_grad():
                     for name, metric in self.metrics:
                         metric_value = metric(outputs, target)
-                        metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value)
+                        metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value) * batch_size
 
+                sample_count += batch_size
                 batch_count += 1
-                averages = {name: total / batch_count for name, total in metric_totals.items()}
+                averages = {name: total / sample_count for name, total in metric_totals.items()}
                 progress.set_description_str(
                     _progress_metrics_desc(stage, averages),
                     refresh=False,
                 )
                 progress.update(1)
+            if hasattr(progress, "refresh"):
+                progress.refresh()
             _ensure_progress_invariant(stage, progress_total, batch_count)
         finally:
             if hasattr(progress, "refresh"):
                 progress.refresh()
             progress.close()
 
-        if batch_count == 0:
+        if sample_count == 0:
             return {}
-        return {name: total / batch_count for name, total in metric_totals.items()}
+        return {name: total / sample_count for name, total in metric_totals.items()}
 
     def step(
         self,
@@ -418,6 +449,8 @@ class Trainer:
                 else {}
             )
 
+            if self.scheduler is not None:
+                self.scheduler.step()
             self.state.epoch += 1
             self.save_checkpoint("last.pt")
             self.save_checkpoint(f"epoch-{self.state.epoch:04d}.pt")
@@ -453,22 +486,26 @@ class Trainer:
         if self.checkpoint_dir is None:
             return None
         path = self.checkpoint_dir / filename
-        checkpoint = {
+        checkpoint: dict[str, Any] = {
             "state": {"epoch": self.state.epoch, "global_step": self.state.global_step},
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "rng": _capture_rng_state(),
         }
+        if self.scheduler is not None:
+            checkpoint["scheduler"] = self.scheduler.state_dict()
         torch.save(checkpoint, path)
         return path
 
     def load_checkpoint(self, path: str | Path) -> None:
         """Restore model, optimizer, RNG, and trainer state from a checkpoint."""
 
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         self.model.load_state_dict(checkpoint["model"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         _move_optimizer_state_to_device(self.optimizer, self.device)
+        if self.scheduler is not None and "scheduler" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler"])
         state = checkpoint["state"]
         self.state = TrainerState(epoch=state["epoch"], global_step=state["global_step"])
         _restore_rng_state(checkpoint["rng"])

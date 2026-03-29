@@ -61,6 +61,15 @@ class _LengthMismatchLoader:
         return self.reported_length
 
 
+class _ToyModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
 class SquaredError:
     def __call__(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return torch.mean((outputs - target) ** 2)
@@ -90,7 +99,7 @@ def _make_rows(values: list[float]) -> list[dict[str, object]]:
     for value in values:
         rows.append(
             {
-                "inputs": torch.tensor([[value]], dtype=torch.float32),
+                "inputs": {"x": torch.tensor([[value]], dtype=torch.float32)},
                 "target": torch.tensor([[value]], dtype=torch.float32),
                 "metadata": {"index": value},
             }
@@ -103,7 +112,7 @@ def test_trainer_step_yields_epoch_history_and_test_metrics(tmp_path: Path) -> N
     val_loader = DataLoader(_ToyDataset(_make_rows([4.0, 5.0])), batch_size=1, shuffle=False)
     test_loader = DataLoader(_ToyDataset(_make_rows([6.0, 7.0])), batch_size=1, shuffle=False)
 
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
     trainer = Trainer(
         model=model,
@@ -148,7 +157,7 @@ def test_trainer_step_yields_epoch_history_and_test_metrics(tmp_path: Path) -> N
 def test_trainer_disables_autograd_during_metric_evaluation() -> None:
     metric = GradStateMetric()
     train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0])), batch_size=2, shuffle=False)
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     trainer = Trainer(
         model=model,
         optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
@@ -168,7 +177,7 @@ def test_trainer_progress_defaults_on_and_supports_unsized_loaders() -> None:
     train_dataset = _ToyStream(_make_rows([0.0, 1.0, 2.0]))
     val_dataset = _ToyStream(_make_rows([3.0, 4.0]))
     test_dataset = _ToyStream(_make_rows([5.0, 6.0]))
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
 
     trainer = Trainer(
         model=model,
@@ -233,10 +242,10 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
     val_loader = DataLoader(_ToyDataset(_make_rows([4.0, 5.0])), batch_size=1, shuffle=False)
     test_loader = DataLoader(_ToyDataset(_make_rows([6.0, 7.0])), batch_size=1, shuffle=False)
 
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     with torch.no_grad():
-        model.weight.zero_()
-        model.bias.zero_()
+        model.linear.weight.zero_()
+        model.linear.bias.zero_()
     trainer = Trainer(
         model=model,
         optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
@@ -295,7 +304,7 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
 
 def test_trainer_step_does_not_prefetch_unused_batch_when_capped() -> None:
     train_stream = _LoggingStream(_make_rows([0.0, 1.0, 2.0]))
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     trainer = Trainer(
         model=model,
         optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
@@ -312,7 +321,7 @@ def test_trainer_step_does_not_prefetch_unused_batch_when_capped() -> None:
 
 
 def test_trainer_raises_when_sized_stage_ends_before_progress_total() -> None:
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     trainer = Trainer(
         model=model,
         optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
@@ -330,7 +339,7 @@ def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
     train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0])), batch_size=2, shuffle=False)
     val_loader = DataLoader(_ToyDataset(_make_rows([2.0])), batch_size=1, shuffle=False)
 
-    first_model = nn.Linear(1, 1).to(torch.device("cpu"))
+    first_model = _ToyModel().to(torch.device("cpu"))
     first = Trainer(
         model=first_model,
         optimizer=torch.optim.SGD(first_model.parameters(), lr=0.1),
@@ -348,7 +357,7 @@ def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
     )
     list(first.step())
 
-    restored_model = nn.Linear(1, 1).to(torch.device("cpu"))
+    restored_model = _ToyModel().to(torch.device("cpu"))
     restored = Trainer(
         model=restored_model,
         optimizer=torch.optim.SGD(restored_model.parameters(), lr=0.1),
@@ -365,8 +374,8 @@ def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
 
 
 def test_trainer_rejects_optimizer_from_other_model() -> None:
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
-    other_model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
+    other_model = _ToyModel().to(torch.device("cpu"))
 
     with pytest.raises(ValueError):
         Trainer(
@@ -380,7 +389,7 @@ def test_trainer_rejects_optimizer_from_other_model() -> None:
 
 
 def test_trainer_rejects_duplicate_metric_names() -> None:
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     with pytest.raises(ValueError):
         Trainer(
             model=model,
@@ -393,7 +402,7 @@ def test_trainer_rejects_duplicate_metric_names() -> None:
 
 
 def test_trainer_rejects_legacy_metric_mapping() -> None:
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     with pytest.raises(TypeError):
         Trainer(
             model=model,
@@ -406,7 +415,7 @@ def test_trainer_rejects_legacy_metric_mapping() -> None:
 
 
 def test_trainer_rejects_lambda_metrics() -> None:
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     with pytest.raises(ValueError):
         Trainer(
             model=model,
@@ -419,7 +428,7 @@ def test_trainer_rejects_lambda_metrics() -> None:
 
 
 def test_trainer_requires_test_loader_for_test_call() -> None:
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     trainer = Trainer(
         model=model,
         optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
@@ -434,7 +443,7 @@ def test_trainer_requires_test_loader_for_test_call() -> None:
 
 
 def test_trainer_rejects_invalid_runtime_step_overrides() -> None:
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     trainer = Trainer(
         model=model,
         optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
@@ -454,7 +463,7 @@ def test_trainer_rejects_invalid_runtime_step_overrides() -> None:
 
 
 def test_trainer_rejects_invalid_runtime_test_override() -> None:
-    model = nn.Linear(1, 1).to(torch.device("cpu"))
+    model = _ToyModel().to(torch.device("cpu"))
     trainer = Trainer(
         model=model,
         optimizer=torch.optim.SGD(model.parameters(), lr=0.1),

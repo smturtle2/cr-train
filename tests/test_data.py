@@ -32,15 +32,8 @@ def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30")
         ],
         dtype=np.float32,
     )
-    optical = np.array(
-        [
-            [
-                [-10, 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 12000],
-                [12000, 10000, 9000, 8000, 7000, 6000, 5000, 4000, 3000, 2000, 1000, 0, -10],
-            ]
-        ],
-        dtype=np.int16,
-    )
+    # CHW: 13 channels, 1x2 spatial
+    optical = np.arange(13 * 1 * 2, dtype=np.int16).reshape(13, 1, 2) * 800 - 10
     return {
         "sar": sar.tobytes(),
         "cloudy": optical.tobytes(),

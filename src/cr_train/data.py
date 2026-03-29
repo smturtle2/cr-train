@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import csv
 import hashlib
 import multiprocessing as mp
@@ -27,8 +26,6 @@ SplitStrategy = Literal["official", "seeded_scene"]
 
 SEASON_ORDER = ("spring", "summer", "fall", "winter")
 STAGE_ORDER: tuple[Stage, Stage, Stage] = ("train", "val", "test")
-SAR_CHANNELS = {2}
-OPTICAL_CHANNELS = {13}
 DEFAULT_DATASET_NAME = "Hermanni/sen12mscr"
 DEFAULT_DATASET_REVISION = "e2facda8700dd26cb4cbd5c5d9c82d15f10c38c6"
 DEFAULT_SPLIT = "official"
@@ -44,6 +41,8 @@ OPTICAL_MIN = 0.0
 OPTICAL_MAX = 10000.0
 SAR_DB_MIN = -25.0
 SAR_DB_MAX = 0.0
+SAR_DTYPE = np.dtype("float32")
+OPTICAL_DTYPE = np.dtype("int16")
 
 
 class SampleMetadata(TypedDict):
@@ -53,10 +52,6 @@ class SampleMetadata(TypedDict):
     scene: str
     patch: str
     source_shard: str
-    sar_shape: tuple[int, ...]
-    opt_shape: tuple[int, ...]
-    sar_dtype: str
-    optical_dtype: str
 
 
 class SEN12MSCRSample(TypedDict):
@@ -250,36 +245,8 @@ def _resolve_scene_splits(
     raise AssertionError(f"unreachable split strategy: {split}")
 
 
-def _coerce_bytes(blob: bytes | bytearray | memoryview | str) -> bytes:
-    if isinstance(blob, bytes):
-        return blob
-    if isinstance(blob, bytearray):
-        return bytes(blob)
-    if isinstance(blob, memoryview):
-        return blob.tobytes()
-    if isinstance(blob, str):
-        return base64.b64decode(blob.strip('"'))
-    raise TypeError(f"unsupported binary payload type: {type(blob)!r}")
-
-
-def _maybe_channels_first(array: np.ndarray, channel_counts: set[int]) -> np.ndarray:
-    if array.ndim != 3:
-        return array
-    if array.shape[-1] in channel_counts and array.shape[0] not in channel_counts:
-        return np.moveaxis(array, -1, 0)
-    return array
-
-
-def _decode_tensor(
-    blob: bytes | bytearray | memoryview | str,
-    *,
-    dtype: np.dtype[Any],
-    shape: Sequence[int],
-    channel_counts: set[int],
-) -> torch.Tensor:
-    raw = _coerce_bytes(blob)
-    array = np.frombuffer(raw, dtype=dtype).reshape(tuple(int(dim) for dim in shape))
-    array = _maybe_channels_first(array, channel_counts)
+def _decode_tensor(blob: bytes, *, dtype: np.dtype[Any], shape: tuple[int, ...]) -> torch.Tensor:
+    array = np.frombuffer(blob, dtype=dtype).reshape(shape)
     # parquet/buffer 메모리와 분리된 torch tensor를 만들어 이후 변형이 안전하게 되게 한다.
     return torch.from_numpy(np.array(array, copy=True))
 
@@ -293,42 +260,21 @@ def _preprocess_sar(tensor: torch.Tensor) -> torch.Tensor:
     return (clipped - SAR_DB_MIN) / (SAR_DB_MAX - SAR_DB_MIN)
 
 
-def _decode_optical_sample(
-    sample: Mapping[str, Any],
-    field: str,
-    *,
-    dtype: np.dtype[Any],
-    shape: Sequence[int],
-) -> torch.Tensor:
-    return _preprocess_optical(
-        _decode_tensor(
-            sample[field],
-            dtype=dtype,
-            shape=shape,
-            channel_counts=OPTICAL_CHANNELS,
-        )
-    )
-
-
 def decode_sample(sample: Mapping[str, Any]) -> SEN12MSCRSample:
     """Decode one raw Hugging Face row into preprocessed CHW tensors and metadata."""
 
-    sar_dtype = np.dtype(sample.get("dtype", "float32"))
-    optical_dtype = np.dtype("int16")
     sar_shape = tuple(int(dim) for dim in sample["sar_shape"])
     opt_shape = tuple(int(dim) for dim in sample["opt_shape"])
 
-    # raw payload 세 개를 모두 CHW float tensor로 바꾸고 범위를 정규화한다.
     sar = _preprocess_sar(
-        _decode_tensor(
-            sample["sar"],
-            dtype=sar_dtype,
-            shape=sar_shape,
-            channel_counts=SAR_CHANNELS,
-        )
+        _decode_tensor(sample["sar"], dtype=SAR_DTYPE, shape=sar_shape)
     )
-    cloudy = _decode_optical_sample(sample, "cloudy", dtype=optical_dtype, shape=opt_shape)
-    target = _decode_optical_sample(sample, "target", dtype=optical_dtype, shape=opt_shape)
+    cloudy = _preprocess_optical(
+        _decode_tensor(sample["cloudy"], dtype=OPTICAL_DTYPE, shape=opt_shape)
+    )
+    target = _preprocess_optical(
+        _decode_tensor(sample["target"], dtype=OPTICAL_DTYPE, shape=opt_shape)
+    )
 
     scene = str(sample["scene"])
     metadata: SampleMetadata = {
@@ -336,10 +282,6 @@ def decode_sample(sample: Mapping[str, Any]) -> SEN12MSCRSample:
         "scene": scene,
         "patch": str(sample["patch"]),
         "source_shard": f"{sample['season']}/scene_{scene}.parquet",
-        "sar_shape": sar_shape,
-        "opt_shape": opt_shape,
-        "sar_dtype": sar_dtype.name,
-        "optical_dtype": optical_dtype.name,
     }
     return {
         "inputs": {"sar": sar, "cloudy": cloudy},
@@ -353,13 +295,6 @@ def _seed_worker(worker_id: int) -> None:
     worker_seed = torch.initial_seed() % (2**32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
-
-
-def _apply_reshard(dataset: Any, target_num_shards: int) -> Any:
-    try:
-        return dataset.reshard(num_shards=target_num_shards)
-    except TypeError:
-        return dataset.reshard()
 
 
 def _auto_train_worker_budget() -> int:
@@ -405,8 +340,6 @@ def _default_dataset_loader(
     *,
     io_profile: IOProfile = DEFAULT_IO_PROFILE,
 ) -> HFIterableDataset:
-    if not urls:
-        return cast(HFIterableDataset, _EmptyIterable())
     # runtime patch는 실제 HF streaming loader를 열 때만 적용한다.
     configure_runtime(io_profile=io_profile)
     return load_dataset(
@@ -415,22 +348,6 @@ def _default_dataset_loader(
         split="train",
         streaming=True,
     )
-
-
-class _EmptyIterable:
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        return iter(())
-
-    def reshard(self, num_shards: int) -> "_EmptyIterable":
-        _ = num_shards
-        return self
-
-    def shuffle(self, *, seed: int, buffer_size: int) -> "_EmptyIterable":
-        _ = (seed, buffer_size)
-        return self
-
-    def set_epoch(self, epoch: int) -> None:
-        _ = epoch
 
 
 class SEN12MSCRStreamingDataset(IterableDataset[SEN12MSCRSample]):
@@ -455,9 +372,7 @@ class SEN12MSCRStreamingDataset(IterableDataset[SEN12MSCRSample]):
 
     def __iter__(self) -> Iterator[SEN12MSCRSample]:
         current_epoch = self.epoch
-        if hasattr(self.source, "set_epoch"):
-            # HF iterable dataset은 iteration 시작 시점의 epoch 값으로 shard/example 순서를 결정한다.
-            self.source.set_epoch(current_epoch)
+        self.source.set_epoch(current_epoch)
         for row in self.source:
             yield decode_sample(row)
 
@@ -480,7 +395,7 @@ def _build_stage_dataset(
         source = dataset_loader(urls, stage)
     if stage == "train":
         # train만 re-shard 후 shuffle하고, val/test는 고정 순서를 유지한다.
-        source = _apply_reshard(source, target_num_shards=TRAIN_SHARD_CAP)
+        source = source.reshard(num_shards=TRAIN_SHARD_CAP)
         source = source.shuffle(seed=options.seed, buffer_size=options.shuffle_buffer_size)
     return SEN12MSCRStreamingDataset(source)
 

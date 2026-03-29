@@ -130,7 +130,7 @@ Every batch is a dictionary with this structure:
 }
 ```
 
-Since `inputs` is a `dict`, the trainer calls your model as `model(sar=..., cloudy=...)`.  If you use a list/tuple, it unpacks as positional args; a single tensor is passed directly.
+The trainer unpacks `inputs` values as positional arguments: `model(sar, cloudy)`. The order is always SAR first, cloudy second.
 
 **Preprocessing:**
 
