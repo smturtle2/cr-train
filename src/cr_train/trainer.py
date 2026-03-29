@@ -1,41 +1,54 @@
+"""Simple supervised trainer built around direct dataloaders."""
+
 from __future__ import annotations
 
 import random
 import sys
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import numpy as np
 import torch
-from tqdm import TqdmExperimentalWarning
 from torch import nn
+from tqdm import TqdmExperimentalWarning
 from tqdm.rich import tqdm
-
-from .data import Stage
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
 Scalar = float | int | torch.Tensor
+MetricFn = Callable[[Any, Any], Scalar]
 
 
-@dataclass
-class StepResult:
-    loss: torch.Tensor | None = None
-    metrics: dict[str, Scalar] = field(default_factory=dict)
+@dataclass(frozen=True)
+class TrainerConfig:
+    """Epoch-level training options consumed by `Trainer.step()` and `Trainer.test()`."""
 
+    max_epochs: int = 1
+    train_max_batches: int | None = None
+    val_max_batches: int | None = None
+    test_max_batches: int | None = None
+    checkpoint_dir: str | Path | None = None
+    show_progress: bool | None = None
 
-class StepFn(Protocol):
-    def __call__(self, model: nn.Module, batch: Mapping[str, Any], stage: Stage) -> StepResult: ...
-
-
-SchedulerStepFn = Callable[[Any, Mapping[str, float]], None]
+    def __post_init__(self) -> None:
+        if self.max_epochs <= 0:
+            raise ValueError("max_epochs must be positive")
+        for name, value in (
+            ("train_max_batches", self.train_max_batches),
+            ("val_max_batches", self.val_max_batches),
+            ("test_max_batches", self.test_max_batches),
+        ):
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive when provided")
 
 
 @dataclass
 class TrainerState:
+    """Mutable training progress tracked across checkpoint save/restore."""
+
     epoch: int = 0
     global_step: int = 0
 
@@ -58,7 +71,7 @@ def _to_float(value: Scalar) -> float:
     return float(value)
 
 
-def _progress_desc(stage: Stage, epoch: int) -> str:
+def _progress_desc(stage: str, epoch: int) -> str:
     if stage == "test":
         return "test"
     return f"epoch {epoch + 1} {stage}"
@@ -114,49 +127,69 @@ def _infer_model_device(model: nn.Module) -> torch.device:
     return device
 
 
-def _scheduler_metrics(
-    train_metrics: Mapping[str, float],
-    val_metrics: Mapping[str, float],
-) -> dict[str, float]:
-    metrics = {f"train/{name}": value for name, value in train_metrics.items()}
-    metrics.update({f"val/{name}": value for name, value in val_metrics.items()})
-    return metrics
+def _forward_model(model: nn.Module, inputs: Any) -> Any:
+    # Keep the trainer compatible with the common supervised patterns:
+    # `model(x)`, `model(*inputs)`, and `model(**inputs)`.
+    if isinstance(inputs, Mapping):
+        return model(**inputs)
+    if isinstance(inputs, (list, tuple)):
+        return model(*inputs)
+    return model(inputs)
+
+
+def _set_loader_epoch(loader: Any, epoch: int) -> None:
+    dataset = getattr(loader, "dataset", None)
+    if dataset is not None and hasattr(dataset, "set_epoch"):
+        # Streaming datasets keep their own epoch-aware shuffle state, so the
+        # trainer forwards the epoch before every stage pass.
+        dataset.set_epoch(epoch)
+
+
+def _extract_inputs_target(batch: Mapping[str, Any]) -> tuple[Any, Any]:
+    if "inputs" not in batch or "target" not in batch:
+        raise ValueError("trainer batches must contain 'inputs' and 'target'")
+    return batch["inputs"], batch["target"]
 
 
 class Trainer:
+    """Supervised trainer that owns the common train/val/test loop."""
+
     def __init__(
         self,
         *,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
-        datamodule: Any,
-        step_fn: StepFn,
-        scheduler: Any | None = None,
-        scheduler_step_fn: SchedulerStepFn | None = None,
-        checkpoint_dir: str | Path | None = None,
-        show_progress: bool | None = None,
+        criterion: Callable[[Any, Any], torch.Tensor],
+        metrics: Mapping[str, MetricFn] | None,
+        config: TrainerConfig,
+        train_loader: Any,
+        val_loader: Any | None = None,
+        test_loader: Any | None = None,
     ) -> None:
-        if (scheduler is None) != (scheduler_step_fn is None):
-            raise ValueError("scheduler and scheduler_step_fn must be provided together")
+        """Bind the model, optimization objects, and direct dataloaders to the trainer."""
 
         _validate_optimizer_model_pair(model, optimizer)
         self.model = model
         self.device = _infer_model_device(model)
-        self.datamodule = datamodule
-        self.step_fn = step_fn
         self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.scheduler_step_fn = scheduler_step_fn
+        self.criterion = criterion
+        self.metrics = dict(metrics or {})
+        self.config = config
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
         self.state = TrainerState()
-        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
-        self.show_progress = sys.stderr.isatty() if show_progress is None else show_progress
+        self.checkpoint_dir = (
+            Path(config.checkpoint_dir) if config.checkpoint_dir is not None else None
+        )
+        self.show_progress = sys.stderr.isatty() if config.show_progress is None else config.show_progress
         _move_optimizer_state_to_device(self.optimizer, self.device)
         if self.checkpoint_dir is not None:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     def _run_stage(
         self,
-        stage: Stage,
+        stage: str,
         dataloader: Any,
         *,
         max_batches: int | None,
@@ -166,6 +199,7 @@ class Trainer:
         metric_totals: dict[str, float] = {}
         batch_count = 0
 
+        _set_loader_epoch(dataloader, epoch)
         self.model.train(training)
         if not training:
             self.model.eval()
@@ -184,23 +218,23 @@ class Trainer:
                     break
 
                 moved_batch = _move_to_device(batch, self.device)
+                inputs, target = _extract_inputs_target(moved_batch)
+
                 if training:
                     self.optimizer.zero_grad(set_to_none=True)
 
                 with torch.set_grad_enabled(training):
-                    result = self.step_fn(self.model, moved_batch, stage)
+                    outputs = _forward_model(self.model, inputs)
+                    loss = self.criterion(outputs, target)
                     if training:
-                        if result.loss is None:
-                            raise ValueError("training step_fn must return a loss tensor")
-                        result.loss.backward()
+                        loss.backward()
                         self.optimizer.step()
                         self.state.global_step += 1
 
-                if result.loss is not None:
-                    metric_totals["loss"] = metric_totals.get("loss", 0.0) + _to_float(result.loss)
-
-                for name, value in result.metrics.items():
-                    metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(value)
+                metric_totals["loss"] = metric_totals.get("loss", 0.0) + _to_float(loss)
+                for name, metric in self.metrics.items():
+                    metric_value = metric(outputs, target)
+                    metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value)
 
                 batch_count += 1
                 progress.update(1)
@@ -215,58 +249,73 @@ class Trainer:
 
         return {name: total / batch_count for name, total in metric_totals.items()}
 
-    def fit(
+    def step(
         self,
         *,
-        max_epochs: int,
+        max_epochs: int | None = None,
         train_max_batches: int | None = None,
         val_max_batches: int | None = None,
-    ) -> list[dict[str, dict[str, float]]]:
-        history: list[dict[str, dict[str, float]]] = []
+    ) -> Iterator[dict[str, Any]]:
+        """Run epochs and yield one history record per completed epoch."""
 
-        while self.state.epoch < max_epochs:
+        target_epochs = self.config.max_epochs if max_epochs is None else max_epochs
+        active_train_max_batches = (
+            self.config.train_max_batches if train_max_batches is None else train_max_batches
+        )
+        active_val_max_batches = (
+            self.config.val_max_batches if val_max_batches is None else val_max_batches
+        )
+
+        while self.state.epoch < target_epochs:
             epoch = self.state.epoch
-            train_loader = self.datamodule.train_dataloader(epoch=epoch)
             train_metrics = self._run_stage(
                 "train",
-                train_loader,
-                max_batches=train_max_batches,
+                self.train_loader,
+                max_batches=active_train_max_batches,
                 training=True,
                 epoch=epoch,
             )
 
-            val_loader = self.datamodule.val_dataloader(epoch=epoch)
-            val_metrics = self._run_stage(
-                "val",
-                val_loader,
-                max_batches=val_max_batches,
-                training=False,
-                epoch=epoch,
+            val_metrics = (
+                self._run_stage(
+                    "val",
+                    self.val_loader,
+                    max_batches=active_val_max_batches,
+                    training=False,
+                    epoch=epoch,
+                )
+                if self.val_loader is not None
+                else {}
             )
-
-            epoch_metrics = {"train": train_metrics, "val": val_metrics}
-            history.append(epoch_metrics)
-
-            if self.scheduler is not None and self.scheduler_step_fn is not None:
-                self.scheduler_step_fn(self.scheduler, _scheduler_metrics(train_metrics, val_metrics))
 
             self.state.epoch += 1
             self.save_checkpoint("last.pt")
             self.save_checkpoint(f"epoch-{self.state.epoch:04d}.pt")
 
-        return history
+            yield {
+                "epoch": self.state.epoch,
+                "global_step": self.state.global_step,
+                "train": train_metrics,
+                "val": val_metrics,
+            }
 
-    def test(self, *, test_max_batches: int | None = None) -> dict[str, float]:
-        test_loader = self.datamodule.test_dataloader(epoch=self.state.epoch)
+    def test(self, *, max_batches: int | None = None) -> dict[str, float]:
+        """Evaluate the configured test loader and return averaged metrics."""
+
+        if self.test_loader is None:
+            raise ValueError("test_loader is required to run test()")
+        active_max_batches = self.config.test_max_batches if max_batches is None else max_batches
         return self._run_stage(
             "test",
-            test_loader,
-            max_batches=test_max_batches,
+            self.test_loader,
+            max_batches=active_max_batches,
             training=False,
             epoch=self.state.epoch,
         )
 
     def save_checkpoint(self, filename: str | Path) -> Path | None:
+        """Save model, optimizer, RNG, and trainer state when checkpointing is enabled."""
+
         if self.checkpoint_dir is None:
             return None
         path = self.checkpoint_dir / filename
@@ -276,18 +325,16 @@ class Trainer:
             "optimizer": self.optimizer.state_dict(),
             "rng": _capture_rng_state(),
         }
-        if self.scheduler is not None and hasattr(self.scheduler, "state_dict"):
-            checkpoint["scheduler"] = self.scheduler.state_dict()
         torch.save(checkpoint, path)
         return path
 
     def load_checkpoint(self, path: str | Path) -> None:
+        """Restore model, optimizer, RNG, and trainer state from a checkpoint."""
+
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         self.model.load_state_dict(checkpoint["model"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         _move_optimizer_state_to_device(self.optimizer, self.device)
-        if self.scheduler is not None and "scheduler" in checkpoint and hasattr(self.scheduler, "load_state_dict"):
-            self.scheduler.load_state_dict(checkpoint["scheduler"])
         state = checkpoint["state"]
         self.state = TrainerState(epoch=state["epoch"], global_step=state["global_step"])
         _restore_rng_state(checkpoint["rng"])

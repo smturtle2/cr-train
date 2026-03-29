@@ -1,3 +1,5 @@
+"""Streaming SEN12MS-CR dataset and dataloader builders."""
+
 from __future__ import annotations
 
 import base64
@@ -12,11 +14,12 @@ from typing import Any, Literal, TypedDict, cast
 
 import numpy as np
 import torch
-from .runtime import configure_runtime
 from datasets import IterableDataset as HFIterableDataset
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.utils.data import DataLoader, IterableDataset
+
+from .runtime import configure_runtime
 
 Stage = Literal["train", "val", "test"]
 SplitStrategy = Literal["official", "seeded_scene"]
@@ -31,6 +34,8 @@ DEFAULT_DATASET_REVISION = "main"
 
 
 class SampleMetadata(TypedDict):
+    """Per-sample metadata preserved through batching for debugging and reproducibility."""
+
     season: str
     scene: str
     patch: str
@@ -41,20 +46,23 @@ class SampleMetadata(TypedDict):
     optical_dtype: str
 
 
-class DecodedSample(TypedDict):
-    sar: torch.Tensor
-    cloudy: torch.Tensor
+class SEN12MSCRSample(TypedDict):
+    """Standard supervised sample schema consumed by the simplified trainer."""
+
+    inputs: dict[str, torch.Tensor]
     target: torch.Tensor
     metadata: SampleMetadata
 
 
-Transform = Callable[[DecodedSample], DecodedSample]
-SceneSplitResolver = Callable[["DataModuleConfig"], Mapping[Stage, Sequence["SceneShard"]]]
+Transform = Callable[[SEN12MSCRSample], SEN12MSCRSample]
+SceneSplitResolver = Callable[["SEN12MSCRDataConfig"], Mapping[Stage, Sequence["SceneShard"]]]
 DatasetLoader = Callable[[Sequence[str], Stage], HFIterableDataset]
 
 
 @dataclass(frozen=True, order=True)
 class SceneShard:
+    """A single `season/scene` parquet shard in SEN12MS-CR."""
+
     season: str
     scene: str
 
@@ -76,6 +84,8 @@ class SceneShard:
 
 @dataclass(frozen=True)
 class SplitRatios:
+    """Train/validation/test ratios for deterministic scene-level splitting."""
+
     train: float = 0.8
     val: float = 0.1
     test: float = 0.1
@@ -93,6 +103,8 @@ class SplitRatios:
 
 @dataclass(frozen=True)
 class ShuffleConfig:
+    """Streaming shuffle settings applied to the train split."""
+
     enabled: bool = True
     buffer_size: int = 16
     reshard_num_shards: int = 1024
@@ -106,6 +118,8 @@ class ShuffleConfig:
 
 @dataclass(frozen=True)
 class LoaderConfig:
+    """PyTorch DataLoader settings used by the SEN12MS-CR loader builder."""
+
     batch_size: int = 8
     num_workers: int = 0
     pin_memory: bool = False
@@ -126,7 +140,9 @@ class LoaderConfig:
 
 
 @dataclass(frozen=True)
-class DataModuleConfig:
+class SEN12MSCRDataConfig:
+    """Configuration for building SEN12MS-CR streaming datasets and dataloaders."""
+
     dataset_name: str = DEFAULT_DATASET_NAME
     revision: str = DEFAULT_DATASET_REVISION
     split_strategy: SplitStrategy = "seeded_scene"
@@ -164,6 +180,8 @@ def _official_scene_rows() -> tuple[tuple[Stage, SceneShard], ...]:
 
 @lru_cache(maxsize=1)
 def official_scene_splits() -> dict[Stage, tuple[SceneShard, ...]]:
+    """Return the bundled official scene-level train/val/test split."""
+
     splits: dict[Stage, list[SceneShard]] = {stage: [] for stage in STAGE_ORDER}
     for stage, shard in _official_scene_rows():
         splits[stage].append(shard)
@@ -201,6 +219,8 @@ def seeded_scene_splits(
     split_ratios: SplitRatios,
     scene_catalog: Sequence[SceneShard] | None = None,
 ) -> dict[Stage, tuple[SceneShard, ...]]:
+    """Create deterministic custom splits by shuffling scenes within each season."""
+
     catalog = tuple(scene_catalog) if scene_catalog is not None else all_scene_shards()
     by_season: dict[str, list[SceneShard]] = {season: [] for season in SEASON_ORDER}
     for shard in catalog:
@@ -222,7 +242,9 @@ def seeded_scene_splits(
     return {stage: tuple(_sort_scene_shards(shards)) for stage, shards in assigned.items()}
 
 
-def resolve_scene_splits(config: DataModuleConfig) -> dict[Stage, tuple[SceneShard, ...]]:
+def resolve_scene_splits(config: SEN12MSCRDataConfig) -> dict[Stage, tuple[SceneShard, ...]]:
+    """Resolve train/val/test scenes from the configured split strategy."""
+
     if config.split_strategy == "official":
         return official_scene_splits()
     return seeded_scene_splits(seed=config.seed, split_ratios=config.split_ratios)
@@ -266,11 +288,14 @@ def _decode_tensor(
     return torch.from_numpy(np.ascontiguousarray(array))
 
 
-def decode_sample(sample: Mapping[str, Any], tensor_layout: TensorLayout = "channels_first") -> DecodedSample:
+def decode_sample(sample: Mapping[str, Any], tensor_layout: TensorLayout = "channels_first") -> SEN12MSCRSample:
+    """Decode a raw Hugging Face sample into the standard trainer batch schema."""
+
     sar_dtype = np.dtype(sample.get("dtype", "float32"))
     optical_dtype = np.dtype("int16")
     sar_shape = tuple(int(dim) for dim in sample["sar_shape"])
     opt_shape = tuple(int(dim) for dim in sample["opt_shape"])
+
     sar = _decode_tensor(
         sample["sar"],
         dtype=sar_dtype,
@@ -303,7 +328,11 @@ def decode_sample(sample: Mapping[str, Any], tensor_layout: TensorLayout = "chan
         "sar_dtype": sar_dtype.name,
         "optical_dtype": optical_dtype.name,
     }
-    return {"sar": sar, "cloudy": cloudy, "target": target, "metadata": metadata}
+    return {
+        "inputs": {"sar": sar, "cloudy": cloudy},
+        "target": target,
+        "metadata": metadata,
+    }
 
 
 def _seed_worker(worker_id: int) -> None:
@@ -347,7 +376,9 @@ class _EmptyIterable:
         _ = epoch
 
 
-class SEN12MSCRStreamingDataset(IterableDataset[DecodedSample]):
+class SEN12MSCRStreamingDataset(IterableDataset[SEN12MSCRSample]):
+    """Iterable dataset that decodes raw SEN12MS-CR bytes on the fly."""
+
     def __init__(
         self,
         source: HFIterableDataset,
@@ -363,9 +394,11 @@ class SEN12MSCRStreamingDataset(IterableDataset[DecodedSample]):
         self.epoch = epoch
 
     def set_epoch(self, epoch: int) -> None:
+        """Update the epoch forwarded to the underlying streaming source."""
+
         self.epoch = epoch
 
-    def __iter__(self) -> Iterator[DecodedSample]:
+    def __iter__(self) -> Iterator[SEN12MSCRSample]:
         if hasattr(self.source, "set_epoch"):
             self.source.set_epoch(self.epoch)
         for row in self.source:
@@ -375,115 +408,102 @@ class SEN12MSCRStreamingDataset(IterableDataset[DecodedSample]):
             yield sample
 
 
-class SEN12MSCRDataModule:
-    def __init__(
-        self,
-        config: DataModuleConfig,
-        *,
-        train_transform: Transform | None = None,
-        eval_transform: Transform | None = None,
-        dataset_loader: DatasetLoader | None = None,
-        scene_split_resolver: SceneSplitResolver | None = None,
-    ) -> None:
-        self.config = config
-        self.train_transform = train_transform
-        self.eval_transform = eval_transform
-        self.dataset_loader = dataset_loader or _default_dataset_loader
-        resolved = (
-            {
-                stage: tuple(_sort_scene_shards(list(shards)))
-                for stage, shards in scene_split_resolver(config).items()
-            }
-            if scene_split_resolver is not None
-            else resolve_scene_splits(config)
+def _resolve_scene_splits_for_config(
+    config: SEN12MSCRDataConfig,
+    scene_split_resolver: SceneSplitResolver | None,
+) -> dict[Stage, tuple[SceneShard, ...]]:
+    if scene_split_resolver is None:
+        return resolve_scene_splits(config)
+    resolved = {
+        stage: tuple(_sort_scene_shards(list(shards)))
+        for stage, shards in scene_split_resolver(config).items()
+    }
+    return {stage: tuple(resolved.get(stage, ())) for stage in STAGE_ORDER}
+
+
+def _urls_for_stage(
+    stage: Stage,
+    *,
+    config: SEN12MSCRDataConfig,
+    scene_split_resolver: SceneSplitResolver | None,
+) -> list[str]:
+    splits = _resolve_scene_splits_for_config(config, scene_split_resolver)
+    return [
+        shard.resolve_url(config.dataset_name, config.revision)
+        for shard in splits[stage]
+    ]
+
+
+def _should_shuffle(stage: Stage, config: SEN12MSCRDataConfig) -> bool:
+    return stage == "train" and config.shuffle.enabled
+
+
+def build_sen12mscr_dataset(
+    stage: Stage,
+    config: SEN12MSCRDataConfig,
+    *,
+    transform: Transform | None = None,
+    dataset_loader: DatasetLoader | None = None,
+    scene_split_resolver: SceneSplitResolver | None = None,
+) -> SEN12MSCRStreamingDataset:
+    """Build a stage-specific streaming dataset that yields `inputs/target/metadata`."""
+
+    urls = _urls_for_stage(stage, config=config, scene_split_resolver=scene_split_resolver)
+    source = (dataset_loader or _default_dataset_loader)(urls, stage)
+
+    if _should_shuffle(stage, config):
+        # Keep the train pipeline aligned with the user's explicit invariant:
+        # always reshard before shuffle when streaming.
+        source = _apply_reshard(source, config.shuffle.reshard_num_shards)
+        source = source.shuffle(seed=config.seed, buffer_size=config.shuffle.buffer_size)
+
+    if config.distributed_world_size > 1:
+        source = split_dataset_by_node(
+            source,
+            rank=config.distributed_rank,
+            world_size=config.distributed_world_size,
         )
-        self.scene_splits = {stage: tuple(resolved.get(stage, ())) for stage in STAGE_ORDER}
 
-    def scenes_for(self, stage: Stage) -> tuple[SceneShard, ...]:
-        return self.scene_splits[stage]
+    return SEN12MSCRStreamingDataset(
+        source,
+        tensor_layout=config.tensor_layout,
+        transform=transform,
+    )
 
-    def _urls_for_stage(self, stage: Stage) -> list[str]:
-        return [
-            shard.resolve_url(self.config.dataset_name, self.config.revision)
-            for shard in self.scenes_for(stage)
-        ]
 
-    def _should_shuffle(self, stage: Stage) -> bool:
-        return stage == "train" and self.config.shuffle.enabled
+def build_sen12mscr_dataloader(
+    stage: Stage,
+    config: SEN12MSCRDataConfig,
+    *,
+    transform: Transform | None = None,
+    collate_fn: Callable[[list[SEN12MSCRSample]], Any] | None = None,
+    dataset_loader: DatasetLoader | None = None,
+    scene_split_resolver: SceneSplitResolver | None = None,
+) -> DataLoader[Any]:
+    """Build a stage-specific PyTorch DataLoader for SEN12MS-CR streaming samples."""
 
-    def _stage_transform(self, stage: Stage) -> Transform | None:
-        return self.train_transform if stage == "train" else self.eval_transform
+    dataset = build_sen12mscr_dataset(
+        stage,
+        config,
+        transform=transform,
+        dataset_loader=dataset_loader,
+        scene_split_resolver=scene_split_resolver,
+    )
+    generator = torch.Generator()
+    generator.manual_seed(config.seed)
 
-    def make_stage_dataset(self, stage: Stage, *, epoch: int = 0) -> SEN12MSCRStreamingDataset:
-        urls = self._urls_for_stage(stage)
-        dataset = self.dataset_loader(urls, stage)
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": config.loader.batch_size,
+        "num_workers": config.loader.num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": config.loader.pin_memory,
+        "drop_last": config.loader.drop_last,
+        "worker_init_fn": _seed_worker,
+        "generator": generator,
+        "persistent_workers": config.loader.persistent_workers,
+        "in_order": config.loader.in_order,
+    }
+    if config.loader.num_workers > 0 and config.loader.prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = config.loader.prefetch_factor
 
-        if self._should_shuffle(stage):
-            dataset = _apply_reshard(dataset, self.config.shuffle.reshard_num_shards)
-            dataset = dataset.shuffle(seed=self.config.seed, buffer_size=self.config.shuffle.buffer_size)
-
-        if self.config.distributed_world_size > 1:
-            dataset = split_dataset_by_node(
-                dataset,
-                rank=self.config.distributed_rank,
-                world_size=self.config.distributed_world_size,
-            )
-
-        wrapped = SEN12MSCRStreamingDataset(
-            dataset,
-            tensor_layout=self.config.tensor_layout,
-            transform=self._stage_transform(stage),
-            epoch=epoch,
-        )
-        return wrapped
-
-    def make_dataloader(
-        self,
-        stage: Stage,
-        *,
-        epoch: int = 0,
-        collate_fn: Callable[[list[DecodedSample]], Any] | None = None,
-    ) -> DataLoader[Any]:
-        dataset = self.make_stage_dataset(stage, epoch=epoch)
-        generator = torch.Generator()
-        generator.manual_seed(self.config.seed + epoch)
-
-        loader_kwargs: dict[str, Any] = {
-            "batch_size": self.config.loader.batch_size,
-            "num_workers": self.config.loader.num_workers,
-            "collate_fn": collate_fn,
-            "pin_memory": self.config.loader.pin_memory,
-            "drop_last": self.config.loader.drop_last,
-            "worker_init_fn": _seed_worker,
-            "generator": generator,
-            "persistent_workers": self.config.loader.persistent_workers,
-            "in_order": self.config.loader.in_order,
-        }
-        if self.config.loader.num_workers > 0 and self.config.loader.prefetch_factor is not None:
-            loader_kwargs["prefetch_factor"] = self.config.loader.prefetch_factor
-
-        return DataLoader(dataset, **loader_kwargs)
-
-    def train_dataloader(
-        self,
-        *,
-        epoch: int = 0,
-        collate_fn: Callable[[list[DecodedSample]], Any] | None = None,
-    ) -> DataLoader[Any]:
-        return self.make_dataloader("train", epoch=epoch, collate_fn=collate_fn)
-
-    def val_dataloader(
-        self,
-        *,
-        epoch: int = 0,
-        collate_fn: Callable[[list[DecodedSample]], Any] | None = None,
-    ) -> DataLoader[Any]:
-        return self.make_dataloader("val", epoch=epoch, collate_fn=collate_fn)
-
-    def test_dataloader(
-        self,
-        *,
-        epoch: int = 0,
-        collate_fn: Callable[[list[DecodedSample]], Any] | None = None,
-    ) -> DataLoader[Any]:
-        return self.make_dataloader("test", epoch=epoch, collate_fn=collate_fn)
+    return DataLoader(dataset, **loader_kwargs)

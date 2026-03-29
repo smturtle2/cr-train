@@ -8,12 +8,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from cr_train import (
-    DataModuleConfig,
     LoaderConfig,
-    SEN12MSCRDataModule,
+    SEN12MSCRDataConfig,
     ShuffleConfig,
-    StepResult,
     Trainer,
+    TrainerConfig,
+    build_sen12mscr_dataloader,
 )
 
 
@@ -29,17 +29,12 @@ class TinyCloudRemovalNet(nn.Module):
         )
 
     def forward(self, sar: torch.Tensor, cloudy: torch.Tensor) -> torch.Tensor:
-        optical = cloudy.float()
-        fused = torch.cat([sar.float(), optical], dim=1)
-        return self.net(fused)
+        return self.net(torch.cat([sar.float(), cloudy.float()], dim=1))
 
 
-def step_fn(model: nn.Module, batch: dict[str, torch.Tensor], stage: str) -> StepResult:
-    prediction = model(batch["sar"], batch["cloudy"])
-    target = batch["target"].float()
-    loss = F.mse_loss(prediction, target)
-    mae = F.l1_loss(prediction, target)
-    return StepResult(loss=loss, metrics={"mae": mae})
+class FloatMSELoss(nn.Module):
+    def forward(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.mse_loss(outputs, target.float())
 
 
 def main() -> None:
@@ -47,37 +42,50 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--train-max-batches", type=int, default=10)
     parser.add_argument("--val-max-batches", type=int, default=2)
+    parser.add_argument("--test-max-batches", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--split-strategy", choices=("official", "seeded_scene"), default="seeded_scene")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("artifacts/checkpoints"))
     args = parser.parse_args()
 
-    datamodule = SEN12MSCRDataModule(
-        DataModuleConfig(
-            split_strategy=args.split_strategy,
-            seed=args.seed,
-            loader=LoaderConfig(batch_size=args.batch_size),
-            shuffle=ShuffleConfig(buffer_size=16, reshard_num_shards=16),
-        )
+    data_config = SEN12MSCRDataConfig(
+        split_strategy=args.split_strategy,
+        seed=args.seed,
+        loader=LoaderConfig(batch_size=args.batch_size),
+        shuffle=ShuffleConfig(buffer_size=16, reshard_num_shards=16),
     )
+    train_loader = build_sen12mscr_dataloader("train", data_config)
+    val_loader = build_sen12mscr_dataloader("val", data_config)
+    test_loader = build_sen12mscr_dataloader("test", data_config)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TinyCloudRemovalNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    # SEN12MS-CR optical targets decode as int16, so the regression loss and
+    # metrics cast them to float explicitly.
+    criterion = FloatMSELoss()
+    metrics = {"mae": lambda outputs, target: F.l1_loss(outputs, target.float())}
     trainer = Trainer(
         model=model,
         optimizer=optimizer,
-        datamodule=datamodule,
-        step_fn=step_fn,
-        checkpoint_dir=args.checkpoint_dir,
+        criterion=criterion,
+        metrics=metrics,
+        config=TrainerConfig(
+            max_epochs=args.epochs,
+            train_max_batches=args.train_max_batches,
+            val_max_batches=args.val_max_batches,
+            test_max_batches=args.test_max_batches,
+            checkpoint_dir=args.checkpoint_dir,
+        ),
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
     )
-    history = trainer.fit(
-        max_epochs=args.epochs,
-        train_max_batches=args.train_max_batches,
-        val_max_batches=args.val_max_batches,
-    )
-    print(history)
-    print(trainer.test(test_max_batches=1))
+
+    for history in trainer.step():
+        print(history)
+    print(trainer.test())
 
 
 if __name__ == "__main__":

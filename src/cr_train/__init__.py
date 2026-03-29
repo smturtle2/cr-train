@@ -1,40 +1,39 @@
+"""Public API for the SEN12MS-CR streaming training helpers."""
+
 from .data import (
-    DataModuleConfig,
     LoaderConfig,
-    SEN12MSCRDataModule,
+    SEN12MSCRDataConfig,
+    SEN12MSCRSample,
     SEN12MSCRStreamingDataset,
     SceneShard,
     ShuffleConfig,
     SplitRatios,
     SplitStrategy,
     TensorLayout,
+    build_sen12mscr_dataloader,
+    build_sen12mscr_dataset,
     decode_sample,
     official_scene_splits,
     seeded_scene_splits,
 )
-from .trainer import (
-    SchedulerStepFn,
-    StepFn,
-    StepResult,
-    Trainer,
-    TrainerState,
-)
+from .trainer import MetricFn, Trainer, TrainerConfig, TrainerState
 
 __all__ = [
-    "DataModuleConfig",
     "LoaderConfig",
-    "SEN12MSCRDataModule",
+    "MetricFn",
+    "SEN12MSCRDataConfig",
+    "SEN12MSCRSample",
     "SEN12MSCRStreamingDataset",
     "SceneShard",
-    "SchedulerStepFn",
     "ShuffleConfig",
     "SplitRatios",
     "SplitStrategy",
-    "StepFn",
-    "StepResult",
     "TensorLayout",
     "Trainer",
+    "TrainerConfig",
     "TrainerState",
+    "build_sen12mscr_dataloader",
+    "build_sen12mscr_dataset",
     "decode_sample",
     "official_scene_splits",
     "seeded_scene_splits",

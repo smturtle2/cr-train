@@ -14,12 +14,12 @@ import torch
 
 import cr_train.data as data_mod
 from cr_train.data import (
-    DataModuleConfig,
     LoaderConfig,
-    SEN12MSCRDataModule,
+    SEN12MSCRDataConfig,
     SceneShard,
     ShuffleConfig,
     SplitRatios,
+    build_sen12mscr_dataloader,
     decode_sample,
     official_scene_splits,
     seeded_scene_splits,
@@ -42,16 +42,16 @@ def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30")
     }
 
 
-def test_decode_sample_transforms_bytes_into_tensors() -> None:
+def test_decode_sample_transforms_bytes_into_standard_batch_schema() -> None:
     decoded = decode_sample(_sample_row(), tensor_layout="channels_first")
 
-    assert decoded["sar"].shape == (2, 3, 2)
-    assert decoded["cloudy"].shape == (13, 3, 2)
+    assert decoded["inputs"]["sar"].shape == (2, 3, 2)
+    assert decoded["inputs"]["cloudy"].shape == (13, 3, 2)
     assert decoded["target"].shape == (13, 3, 2)
     assert decoded["metadata"]["source_shard"] == "spring/scene_1.parquet"
     assert decoded["metadata"]["patch"] == "p30"
-    assert decoded["sar"].dtype == torch.float32
-    assert decoded["cloudy"].dtype == torch.int16
+    assert decoded["inputs"]["sar"].dtype == torch.float32
+    assert decoded["inputs"]["cloudy"].dtype == torch.int16
 
 
 def test_official_scene_splits_are_scene_isolated() -> None:
@@ -105,10 +105,11 @@ class _FakeIterable:
         return iter(self.rows)
 
 
-def test_train_pipeline_reshards_before_shuffle() -> None:
+def test_train_pipeline_reshards_before_shuffle_and_uses_standard_batch_shape() -> None:
     fake_iterable = _FakeIterable([_sample_row()])
-    datamodule = SEN12MSCRDataModule(
-        DataModuleConfig(
+    loader = build_sen12mscr_dataloader(
+        "train",
+        SEN12MSCRDataConfig(
             seed=13,
             loader=LoaderConfig(batch_size=1),
             shuffle=ShuffleConfig(enabled=True, buffer_size=16, reshard_num_shards=8),
@@ -121,9 +122,11 @@ def test_train_pipeline_reshards_before_shuffle() -> None:
         },
     )
 
-    batch = next(iter(datamodule.train_dataloader(epoch=3)))
+    loader.dataset.set_epoch(3)
+    batch = next(iter(loader))
 
-    assert tuple(batch["sar"].shape) == (1, 2, 3, 2)
+    assert tuple(batch["inputs"]["sar"].shape) == (1, 2, 3, 2)
+    assert tuple(batch["target"].shape) == (1, 13, 3, 2)
     assert fake_iterable.calls[:3] == [
         ("reshard", 8),
         ("shuffle", 13, 16),
