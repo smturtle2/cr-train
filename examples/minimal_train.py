@@ -78,11 +78,11 @@ def _parse_num_workers(value: str) -> int | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal SEN12MS-CR streaming training example.")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--train-max-batches", type=int, default=10)
-    parser.add_argument("--val-max-batches", type=int, default=2)
-    parser.add_argument("--test-max-batches", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--train-max-batches", type=int, default=50)
+    parser.add_argument("--val-max-batches", type=int, default=10)
+    parser.add_argument("--test-max-batches", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--split", choices=("official", "seeded_scene"), default="official")
     parser.add_argument("--num-workers", type=_parse_num_workers, default=None, metavar="auto|INT")
