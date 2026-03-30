@@ -88,7 +88,7 @@ Hugging Face (parquet shards)
   ▼
 build_sen12mscr_loaders()          ← scene-level split, streaming decode, preprocessing
   │
-  ├── train_loader                 ← resharded + shuffled per epoch
+  ├── train_loader                 ← one-time row-group expansion + sample-buffer shuffle
   ├── val_loader                   ← fixed order
   └── test_loader                  ← fixed order
         │
@@ -99,11 +99,11 @@ build_sen12mscr_loaders()          ← scene-level split, streaming decode, prep
     Trainer.test()                 ← final evaluation
 ```
 
-**Data pipeline.** Parquet shards are streamed directly from Hugging Face -- no local download required. Each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical) and normalized on the fly.
+**Data pipeline.** Parquet shards are streamed directly from Hugging Face -- no local download required. Train row groups are materialized once at loader creation, only the required parquet columns are scanned, and each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical) and normalized on the fly.
 
 **Scene isolation.** Scenes are assigned to train/val/test before any shuffling. No scene appears in multiple splits.
 
-**Deterministic ordering.** Given the same `seed`, batch order is fully reproducible. The trainer calls `set_epoch()` on each epoch so shuffle order changes deterministically.
+**Deterministic ordering.** Given the same `seed`, batch order is fully reproducible. The trainer calls `set_epoch()` on each epoch so train-side sample-buffer shuffle changes deterministically while shard order stays fixed.
 
 **Checkpointing.** When `checkpoint_dir` is set, `last.pt` and `epoch-NNNN.pt` are saved automatically after each epoch. Checkpoints include model, optimizer, scheduler (if provided), and full RNG state for exact resumption.
 
@@ -151,13 +151,14 @@ Returns `(train_loader, val_loader, test_loader)`. Only train is shuffled; val/t
 | `batch_size` | `int` | required | Samples per batch |
 | `seed` | `int` | `0` | Seed for shuffle order and worker init |
 | `split` | `str` | `"official"` | `"official"` (author splits: 155/10/10 scenes) or `"seeded_scene"` (80/10/10 stratified by season) |
-| `shuffle_buffer_size` | `int` | `16` | In-memory shuffle buffer for training |
+| `shuffle_buffer_size` | `int` | `64` | In-memory sample shuffle buffer for training |
 | `num_workers` | `int \| None` | `None` | Auto: train gets `min(2, cpu_count//6)` workers, val/test get 0 |
 | `pin_memory` | `bool` | `False` | Pin tensors for faster GPU transfer |
 | `timeout` | `float` | `0.0` | Worker batch wait timeout in seconds; only applied to stages with `num_workers > 0` |
 | `prefetch_factor` | `int \| None` | `None` | Auto `2` when workers > 0 |
-| `persistent_workers` | `bool \| None` | `None` | Auto `False`; opt in when worker reuse is known to be stable |
-| `io_profile` | `str` | `"smooth"` | `"smooth"` (light readahead) or `"conservative"` (fully synchronous) |
+| `persistent_workers` | `bool \| None` | `None` | Auto `True` when workers > 0 |
+| `io_profile` | `str` | `"smooth"` | `"smooth"` (throughput-first readahead) or `"conservative"` (fully synchronous) |
+| `fragment_scan_options` | `ParquetFragmentScanOptions \| None` | `None` | Optional pyarrow fragment cache/range tuning override |
 
 ### `TrainerConfig`
 
@@ -230,7 +231,7 @@ Built-in L1 loss metric. Usage: `metrics=[MAE()]`.
 |-----------|-----------|
 | No scene leakage | Scene-level split before any shuffling |
 | Deterministic batches | Same `seed` + same settings = identical order |
-| Per-epoch shuffle | `set_epoch()` propagated automatically (train only) |
+| Per-epoch shuffle | `set_epoch()` reseeds the train sample buffer (train only) |
 | Exact resumption | Checkpoint captures model, optimizer, scheduler, and full RNG state |
 | Pinned dataset version | Dataset revision is hardcoded |
 
@@ -244,6 +245,7 @@ The **official split** comes from the [authors' supplementary material](https://
 cr-train/
 ├── src/cr_train/
 │   ├── __init__.py         # public API
+│   ├── _parquet_streaming.py  # parquet column pruning and row-group expansion
 │   ├── trainer.py          # training loop, checkpointing, progress
 │   ├── data.py             # streaming dataset, scene splits, preprocessing
 │   └── runtime.py          # parquet I/O tuning

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import random
 import subprocess
 import sys
 import textwrap
@@ -8,12 +9,15 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 import torch
 
+import cr_train._parquet_streaming as parquet_streaming_mod
 import cr_train.data as data_mod
 from cr_train import build_sen12mscr_loaders
+from cr_train._parquet_streaming import PARQUET_COLUMNS, expand_parquet_row_groups
 from cr_train.data import (
     DEFAULT_DATASET_REVISION,
     SEN12MSCRStreamingDataset,
@@ -116,33 +120,41 @@ class _FakeIterable:
         self.rows = rows
         self.calls: list[tuple[object, ...]] = []
 
-    def reshard(self) -> "_FakeIterable":
-        self.calls.append(("reshard",))
-        return self
-
-    def shuffle(self, *, seed: int, buffer_size: int) -> "_FakeIterable":
-        self.calls.append(("shuffle", seed, buffer_size))
-        return self
-
-    def set_epoch(self, epoch: int) -> None:
-        self.calls.append(("set_epoch", epoch))
-
     def __iter__(self):
+        self.calls.append(("iter",))
         return iter(self.rows)
 
 
-class _EpochAwareSource:
-    def __init__(self) -> None:
-        self.epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
+class _RowsSource:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
 
     def __iter__(self):
-        yield _sample_row(scene=str(self.epoch), patch=f"p{self.epoch}")
+        yield from self.rows
 
 
-def test_build_loaders_defaults_to_official_and_reshards_before_shuffle() -> None:
+def _expected_patch_order(
+    patches: list[str],
+    *,
+    seed: int,
+    shuffle_buffer_size: int,
+) -> list[str]:
+    rng = random.Random(seed)
+    buffer: list[str] = []
+    ordered: list[str] = []
+    for patch in patches:
+        if len(buffer) == shuffle_buffer_size:
+            index = rng.randrange(shuffle_buffer_size)
+            ordered.append(buffer[index])
+            buffer[index] = patch
+        else:
+            buffer.append(patch)
+    rng.shuffle(buffer)
+    ordered.extend(buffer)
+    return ordered
+
+
+def test_build_loaders_defaults_to_official_and_shuffles_inside_wrapper() -> None:
     resolver_calls: list[tuple[str, int]] = []
     datasets = {
         "train": _FakeIterable([_sample_row()]),
@@ -180,13 +192,15 @@ def test_build_loaders_defaults_to_official_and_reshards_before_shuffle() -> Non
     sar, cloudy = batch["inputs"]
     assert tuple(sar.shape) == (1, 2, 2, 2)
     assert tuple(batch["target"].shape) == (1, 13, 2, 1)
-    assert datasets["train"].calls[:3] == [
-        ("reshard",),
-        ("shuffle", 13, 16),
-        ("set_epoch", 3),
-    ]
-    assert datasets["val"].calls == [("set_epoch", 0)]
-    assert datasets["test"].calls == [("set_epoch", 0)]
+    assert train_loader.dataset.stage == "train"
+    assert train_loader.dataset.seed == 13
+    assert train_loader.dataset.shuffle_buffer_size == 16
+    assert train_loader.dataset.epoch == 3
+    assert val_loader.dataset.stage == "val"
+    assert test_loader.dataset.stage == "test"
+    assert datasets["train"].calls == [("iter",)]
+    assert datasets["val"].calls == [("iter",)]
+    assert datasets["test"].calls == [("iter",)]
 
 
 def test_build_loaders_supports_seeded_scene_split_without_custom_resolver() -> None:
@@ -215,9 +229,12 @@ def test_build_loaders_supports_seeded_scene_split_without_custom_resolver() -> 
     _ = next(iter(test_loader))
 
     assert created == [(stage, len(expected_splits[stage])) for stage in ("train", "val", "test")]
-    assert datasets["train"].calls[:2] == [("reshard",), ("shuffle", 7, 16)]
-    assert datasets["val"].calls == [("set_epoch", 0)]
-    assert datasets["test"].calls == [("set_epoch", 0)]
+    assert train_loader.dataset.stage == "train"
+    assert train_loader.dataset.seed == 7
+    assert train_loader.dataset.shuffle_buffer_size == data_mod.DEFAULT_SHUFFLE_BUFFER_SIZE
+    assert datasets["train"].calls == [("iter",)]
+    assert datasets["val"].calls == [("iter",)]
+    assert datasets["test"].calls == [("iter",)]
 
 
 def test_loader_builder_rejects_invalid_settings() -> None:
@@ -283,7 +300,7 @@ def test_loader_builder_auto_tunes_worker_defaults(monkeypatch: pytest.MonkeyPat
         assert kwargs["timeout"] == 0.0
         if kwargs["num_workers"] > 0:
             assert kwargs["prefetch_factor"] == 2
-            assert kwargs["persistent_workers"] is False
+            assert kwargs["persistent_workers"] is True
         else:
             assert "prefetch_factor" not in kwargs
             assert "persistent_workers" not in kwargs
@@ -391,7 +408,13 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
 
 @pytest.mark.filterwarnings("ignore:This process .* multi-threaded, use of fork")
 def test_streaming_dataset_shares_epoch_updates_with_persistent_workers() -> None:
-    dataset = SEN12MSCRStreamingDataset(_EpochAwareSource())
+    rows = [_sample_row(patch=f"p{index}") for index in range(4)]
+    dataset = SEN12MSCRStreamingDataset(
+        _RowsSource(rows),
+        stage="train",
+        seed=11,
+        shuffle_buffer_size=2,
+    )
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=None,
@@ -400,12 +423,15 @@ def test_streaming_dataset_shares_epoch_updates_with_persistent_workers() -> Non
     )
 
     try:
-        observed_scenes: list[str] = []
+        observed_patches: list[str] = []
         for epoch in range(3):
             dataset.set_epoch(epoch)
             sample = next(iter(loader))
-            observed_scenes.append(sample["metadata"]["scene"])
-        assert observed_scenes == ["0", "1", "2"]
+            observed_patches.append(sample["metadata"]["patch"])
+        assert observed_patches == [
+            _expected_patch_order([f"p{index}" for index in range(4)], seed=11 + epoch, shuffle_buffer_size=2)[0]
+            for epoch in range(3)
+        ]
     finally:
         iterator = getattr(loader, "_iterator", None)
         if iterator is not None:
@@ -457,23 +483,58 @@ def test_runtime_smooth_profile_uses_notebook_safe_scan_behavior() -> None:
     runtime_mod = importlib.import_module("cr_train.runtime")
     runtime_mod = importlib.reload(runtime_mod)
 
-    assert runtime_mod._scan_behavior("smooth") == (1, 1, False)
+    assert runtime_mod._scan_behavior("smooth") == (2, 2, False)
     assert runtime_mod._scan_behavior("conservative") == (0, 0, False)
 
 
-def test_default_dataset_loader_bootstraps_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_dataset_loader_uses_smooth_fragment_scan_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[object] = []
     dummy_iterable = _FakeIterable([])
 
-    def fake_configure_runtime(*, io_profile: str = "smooth") -> None:
-        calls.append(("configure", io_profile))
-
-    def fake_load_dataset(*args: object, **kwargs: object) -> _FakeIterable:
-        calls.append(("load_dataset", kwargs["data_files"], kwargs["split"], kwargs["streaming"]))
+    def fake_load_streaming_parquet_dataset(
+        urls: list[str],
+        *,
+        io_profile: str,
+        fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None,
+    ) -> _FakeIterable:
+        calls.append((urls, io_profile, fragment_scan_options))
         return dummy_iterable
 
-    monkeypatch.setattr(data_mod, "configure_runtime", fake_configure_runtime)
-    monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(data_mod, "load_streaming_parquet_dataset", fake_load_streaming_parquet_dataset)
+
+    dataset = data_mod._default_dataset_loader(
+        ["/tmp/sample.parquet"],
+        "train",
+    )
+
+    assert dataset is dummy_iterable
+    assert len(calls) == 1
+    urls, io_profile, scan_options = calls[0]
+    assert urls == ["/tmp/sample.parquet"]
+    assert io_profile == "smooth"
+    assert isinstance(scan_options, pa_ds.ParquetFragmentScanOptions)
+    assert scan_options.cache_options.prefetch_limit == 1
+    assert scan_options.cache_options.range_size_limit == 128 << 20
+
+
+def test_default_dataset_loader_keeps_conservative_fragment_scan_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    dummy_iterable = _FakeIterable([])
+
+    def fake_load_streaming_parquet_dataset(
+        urls: list[str],
+        *,
+        io_profile: str,
+        fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None,
+    ) -> _FakeIterable:
+        calls.append((urls, io_profile, fragment_scan_options))
+        return dummy_iterable
+
+    monkeypatch.setattr(data_mod, "load_streaming_parquet_dataset", fake_load_streaming_parquet_dataset)
 
     dataset = data_mod._default_dataset_loader(
         ["/tmp/sample.parquet"],
@@ -482,15 +543,74 @@ def test_default_dataset_loader_bootstraps_runtime(monkeypatch: pytest.MonkeyPat
     )
 
     assert dataset is dummy_iterable
+    assert calls == [(["/tmp/sample.parquet"], "conservative", None)]
+
+
+def test_load_streaming_parquet_dataset_bootstraps_runtime_with_column_pruning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    def fake_configure_runtime(*, io_profile: str = "smooth") -> None:
+        calls.append(("configure", io_profile))
+
+    def fake_load_dataset(*args: object, **kwargs: object) -> _FakeIterable:
+        calls.append(("load_dataset", kwargs))
+        return _FakeIterable([])
+
+    monkeypatch.setattr(parquet_streaming_mod, "configure_runtime", fake_configure_runtime)
+    monkeypatch.setattr(parquet_streaming_mod, "load_dataset", fake_load_dataset)
+
+    scan_options = pa_ds.ParquetFragmentScanOptions()
+    dataset = parquet_streaming_mod.load_streaming_parquet_dataset(
+        ["/tmp/sample.parquet"],
+        io_profile="smooth",
+        fragment_scan_options=scan_options,
+    )
+
+    assert isinstance(dataset, _FakeIterable)
     assert calls == [
-        ("configure", "conservative"),
-        ("load_dataset", {"train": ["/tmp/sample.parquet"]}, "train", True),
+        ("configure", "smooth"),
+        (
+            "load_dataset",
+            {
+                "data_files": {"train": ["/tmp/sample.parquet"]},
+                "split": "train",
+                "streaming": True,
+                "columns": list(PARQUET_COLUMNS),
+                "fragment_scan_options": scan_options,
+            },
+        ),
     ]
+
+
+def test_expand_parquet_row_groups_materializes_row_group_shards(tmp_path: Path) -> None:
+    parquet_path = tmp_path / "sample.parquet"
+    table = pa.table({"value": [1, 2, 3, 4]})
+    pq.write_table(table, parquet_path, row_group_size=2)
+
+    dataset = data_mod._default_dataset_loader([str(parquet_path)], "train", io_profile="conservative")
+    expanded = expand_parquet_row_groups(dataset)
+
+    assert dataset.num_shards == 1
+    assert expanded.num_shards == 2
 
 
 def test_runtime_patch_allows_clean_subprocess_exit_with_live_iterator(tmp_path: Path) -> None:
     parquet_path = tmp_path / "sample.parquet"
-    table = pa.table({"value": [1]})
+    row = _sample_row()
+    table = pa.table(
+        {
+            "sar": [row["sar"]],
+            "cloudy": [row["cloudy"]],
+            "target": [row["target"]],
+            "sar_shape": [row["sar_shape"]],
+            "opt_shape": [row["opt_shape"]],
+            "season": [row["season"]],
+            "scene": [row["scene"]],
+            "patch": [row["patch"]],
+        }
+    )
     pq.write_table(table, parquet_path)
 
     script = textwrap.dedent(
@@ -502,7 +622,7 @@ def test_runtime_patch_allows_clean_subprocess_exit_with_live_iterator(tmp_path:
         iterator = iter(dataset)
         row = next(iterator)
         globals()["live_iterator"] = iterator
-        print(row["value"])
+        print(row["patch"])
         """
     )
     result = subprocess.run(
@@ -514,4 +634,4 @@ def test_runtime_patch_allows_clean_subprocess_exit_with_live_iterator(tmp_path:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "1"
+    assert result.stdout.strip() == "p30"

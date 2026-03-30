@@ -215,12 +215,16 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
         def __init__(self) -> None:
             self.descriptions: list[tuple[str, bool]] = []
             self.updates: list[int] = []
+            self.refresh_count = 0
 
         def update(self, value: int) -> None:
             self.updates.append(value)
 
         def set_description_str(self, value: str, refresh: bool = True) -> None:
             self.descriptions.append((value, refresh))
+
+        def refresh(self) -> None:
+            self.refresh_count += 1
 
         def close(self) -> None:
             return None

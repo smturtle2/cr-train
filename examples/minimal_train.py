@@ -103,7 +103,7 @@ def main() -> None:
         args.batch_size,
         seed=args.seed,
         split=args.split,
-        shuffle_buffer_size=16,
+        shuffle_buffer_size=64,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
         timeout=args.timeout,

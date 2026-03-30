@@ -457,12 +457,10 @@ class Trainer:
                     refresh=False,
                 )
                 progress.update(1)
-            if hasattr(progress, "refresh"):
-                progress.refresh()
+            progress.refresh()
             _ensure_progress_invariant(stage, progress_total, batch_count)
         finally:
-            if hasattr(progress, "refresh"):
-                progress.refresh()
+            progress.refresh()
             progress.close()
 
         if sample_count == 0:

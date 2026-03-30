@@ -14,12 +14,17 @@ from importlib.resources import files
 from typing import Any, Literal, TypedDict, cast
 
 import numpy as np
+import pyarrow.dataset as pa_ds
 import torch
 from datasets import IterableDataset as HFIterableDataset
-from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 
-from .runtime import IOProfile, VALID_IO_PROFILES, configure_runtime
+from ._parquet_streaming import (
+    default_fragment_scan_options,
+    expand_parquet_row_groups,
+    load_streaming_parquet_dataset,
+)
+from .runtime import IOProfile, VALID_IO_PROFILES
 
 Stage = Literal["train", "val", "test"]
 SplitStrategy = Literal["official", "seeded_scene"]
@@ -31,7 +36,7 @@ DEFAULT_DATASET_REVISION = "e2facda8700dd26cb4cbd5c5d9c82d15f10c38c6"
 DEFAULT_SPLIT = "official"
 DEFAULT_IO_PROFILE: IOProfile = "smooth"
 VALID_SPLIT_STRATEGIES: frozenset[SplitStrategy] = frozenset(("official", "seeded_scene"))
-DEFAULT_SHUFFLE_BUFFER_SIZE = 16
+DEFAULT_SHUFFLE_BUFFER_SIZE = 64
 DEFAULT_SEEDED_SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 DEFAULT_AUTO_PREFETCH_FACTOR = 2
 MAX_AUTO_TRAIN_WORKERS = 2
@@ -101,6 +106,7 @@ class _LoaderOptions:
     prefetch_factor: int | None = None
     persistent_workers: bool | None = None
     io_profile: IOProfile = DEFAULT_IO_PROFILE
+    fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -329,7 +335,7 @@ def _resolve_stage_persistent_workers(num_workers: int, options: _LoaderOptions)
         return None
     if options.persistent_workers is not None:
         return options.persistent_workers
-    return False
+    return True
 
 
 def _resolve_stage_timeout(num_workers: int, options: _LoaderOptions) -> float:
@@ -343,24 +349,35 @@ def _default_dataset_loader(
     _: Stage,
     *,
     io_profile: IOProfile = DEFAULT_IO_PROFILE,
+    fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None = None,
 ) -> HFIterableDataset:
-    # runtime patch는 실제 HF streaming loader를 열 때만 적용한다.
-    configure_runtime(io_profile=io_profile)
-    return load_dataset(
-        "parquet",
-        data_files={"train": list(urls)},
-        split="train",
-        streaming=True,
+    scan_options = fragment_scan_options
+    if scan_options is None:
+        scan_options = default_fragment_scan_options(io_profile)
+    return load_streaming_parquet_dataset(
+        urls,
+        io_profile=io_profile,
+        fragment_scan_options=scan_options,
     )
 
 
 class SEN12MSCRStreamingDataset(IterableDataset[SEN12MSCRSample]):
     """Iterable dataset that decodes and preprocesses SEN12MS-CR rows on the fly."""
 
-    def __init__(self, source: HFIterableDataset, *, epoch: int = 0) -> None:
+    def __init__(
+        self,
+        source: Any,
+        *,
+        stage: Stage,
+        seed: int,
+        shuffle_buffer_size: int,
+        epoch: int = 0,
+    ) -> None:
         super().__init__()
         self.source = source
-        # persistent worker에서도 최신 epoch가 보이도록 shared value로 유지한다.
+        self.stage = stage
+        self.seed = seed
+        self.shuffle_buffer_size = shuffle_buffer_size
         self._shared_epoch = mp.Value("q", epoch)
 
     @property
@@ -369,15 +386,34 @@ class SEN12MSCRStreamingDataset(IterableDataset[SEN12MSCRSample]):
             return int(self._shared_epoch.value)
 
     def set_epoch(self, epoch: int) -> None:
-        """Forward the current epoch to the underlying streaming source."""
-
         with self._shared_epoch.get_lock():
             self._shared_epoch.value = epoch
 
+    def _iter_rows(self) -> Iterator[Mapping[str, Any]]:
+        for row in self.source:
+            yield cast(Mapping[str, Any], row)
+
+    def _iter_train_rows(self, epoch: int) -> Iterator[Mapping[str, Any]]:
+        rng = random.Random(self.seed + epoch)
+        buffer: list[Mapping[str, Any]] = []
+        for row in self._iter_rows():
+            if len(buffer) == self.shuffle_buffer_size:
+                index = rng.randrange(self.shuffle_buffer_size)
+                yield buffer[index]
+                buffer[index] = row
+            else:
+                buffer.append(row)
+        rng.shuffle(buffer)
+        yield from buffer
+
     def __iter__(self) -> Iterator[SEN12MSCRSample]:
         current_epoch = self.epoch
-        self.source.set_epoch(current_epoch)
-        for row in self.source:
+        rows = (
+            self._iter_train_rows(current_epoch)
+            if self.stage == "train"
+            else self._iter_rows()
+        )
+        for row in rows:
             yield decode_sample(row)
 
 
@@ -394,14 +430,22 @@ def _build_stage_dataset(
 ) -> SEN12MSCRStreamingDataset:
     urls = _stage_urls(stage, splits)
     if dataset_loader is None:
-        source = _default_dataset_loader(urls, stage, io_profile=options.io_profile)
+        source = _default_dataset_loader(
+            urls,
+            stage,
+            io_profile=options.io_profile,
+            fragment_scan_options=options.fragment_scan_options,
+        )
     else:
         source = dataset_loader(urls, stage)
-    if stage == "train":
-        # train만 re-shard 후 shuffle하고, val/test는 고정 순서를 유지한다.
-        source = source.reshard()
-        source = source.shuffle(seed=options.seed, buffer_size=options.shuffle_buffer_size)
-    return SEN12MSCRStreamingDataset(source)
+    if stage == "train" and dataset_loader is None:
+        source = expand_parquet_row_groups(source)
+    return SEN12MSCRStreamingDataset(
+        source,
+        stage=stage,
+        seed=options.seed,
+        shuffle_buffer_size=options.shuffle_buffer_size,
+    )
 
 
 def _build_stage_dataloader(
@@ -454,6 +498,7 @@ def build_sen12mscr_loaders(
     prefetch_factor: int | None = None,
     persistent_workers: bool | None = None,
     io_profile: IOProfile = DEFAULT_IO_PROFILE,
+    fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None = None,
     _dataset_loader: DatasetLoader | None = None,
     _scene_split_resolver: SceneSplitResolver | None = None,
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
@@ -473,6 +518,7 @@ def build_sen12mscr_loaders(
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
         io_profile=io_profile,
+        fragment_scan_options=fragment_scan_options,
     )
     splits = _resolve_scene_splits(options.split, options.seed, _scene_split_resolver)
     loaders = tuple(
