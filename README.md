@@ -166,9 +166,9 @@ Immutable (`frozen=True`) configuration for the training loop.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `max_epochs` | `int` | `1` | Training epochs |
-| `train_max_batches` | `int \| None` | `None` | Cap training batches per epoch |
-| `val_max_batches` | `int \| None` | `None` | Cap validation batches per epoch |
-| `test_max_batches` | `int \| None` | `None` | Cap test batches |
+| `train_max_samples` | `int \| None` | `None` | Cap training samples per epoch |
+| `val_max_samples` | `int \| None` | `None` | Cap validation samples per epoch |
+| `test_max_samples` | `int \| None` | `None` | Cap test samples |
 | `checkpoint_dir` | `str \| Path \| None` | `None` | Checkpoint directory (auto-created); `None` disables saving |
 | `show_progress` | `bool \| None` | `None` | Progress bars; `None` = `True` |
 
@@ -204,11 +204,11 @@ Runs train/val epochs. Yields one record per epoch:
 }
 ```
 
-If a `scheduler` is provided, `scheduler.step()` is called after each epoch. Optional overrides: `max_epochs`, `train_max_batches`, `val_max_batches`.
+If a `scheduler` is provided, `scheduler.step()` is called after each epoch. Optional overrides: `max_epochs`, `train_max_samples`, `val_max_samples`.
 
 #### `trainer.test(**overrides) -> dict[str, float]`
 
-Returns `{"loss": ..., "mae": ...}`. Optional override: `max_batches`.
+Returns `{"loss": ..., "mae": ...}`. Optional override: `max_samples`.
 
 #### `trainer.save_checkpoint(filename) -> Path | None`
 

@@ -124,9 +124,9 @@ def test_trainer_step_yields_epoch_history_and_test_metrics(tmp_path: Path) -> N
         metrics=[MAE(), SquaredError()],
         config=TrainerConfig(
             max_epochs=2,
-            train_max_batches=1,
-            val_max_batches=1,
-            test_max_batches=1,
+            train_max_samples=2,
+            val_max_samples=1,
+            test_max_samples=1,
             checkpoint_dir=tmp_path,
             show_progress=False,
         ),
@@ -166,7 +166,7 @@ def test_trainer_disables_autograd_during_metric_evaluation() -> None:
         optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
         criterion=nn.MSELoss(),
         metrics=[metric],
-        config=TrainerConfig(max_epochs=1, train_max_batches=1, show_progress=False),
+        config=TrainerConfig(max_epochs=1, train_max_samples=1, show_progress=False),
         train_loader=train_loader,
     )
 
@@ -256,9 +256,9 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
         metrics=[MAE()],
         config=TrainerConfig(
             max_epochs=1,
-            train_max_batches=10,
-            val_max_batches=1,
-            test_max_batches=3,
+            train_max_samples=10,
+            val_max_samples=1,
+            test_max_samples=3,
         ),
         train_loader=train_loader,
         val_loader=val_loader,
@@ -270,7 +270,7 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
 
     assert printed == ["epoch 1/1"]
     assert [{key: value for key, value in item.items() if key != "progress"} for item in created] == [
-        {"desc": "train", "total": 2, "disable": False, "leave": True},
+        {"desc": "train", "total": 4, "disable": False, "leave": True},
         {"desc": "val", "total": 1, "disable": False, "leave": True},
         {"desc": "test", "total": 2, "disable": False, "leave": True},
     ]
@@ -288,7 +288,7 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
         ("train | loss=0.5000 mae=0.5000", False),
         ("train | loss=3.5000 mae=1.5000", False),
     ]
-    assert train_progress.updates == [1, 1]
+    assert train_progress.updates == [2, 2]
     assert val_progress.descriptions == [
         ("val | loading first batch...", True),
         ("val | loss=16.0000 mae=4.0000", False),
@@ -305,7 +305,7 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
     assert sum(test_progress.updates) == created[2]["total"]
 
 
-def test_trainer_step_does_not_prefetch_unused_batch_when_capped() -> None:
+def test_trainer_step_does_not_prefetch_unused_sample_when_capped() -> None:
     train_stream = _LoggingStream(_make_rows([0.0, 1.0, 2.0]))
     model = _ToyModel().to(torch.device("cpu"))
     trainer = Trainer(
@@ -317,17 +317,41 @@ def test_trainer_step_does_not_prefetch_unused_batch_when_capped() -> None:
         train_loader=DataLoader(train_stream, batch_size=1),
     )
 
-    history = list(trainer.step(train_max_batches=1))
+    history = list(trainer.step(train_max_samples=1))
 
     assert len(history) == 1
     assert train_stream.events == ["yield:0"]
+
+
+def test_trainer_caps_metrics_by_samples_even_when_batch_is_larger() -> None:
+    train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0, 2.0, 3.0])), batch_size=2, shuffle=False)
+    model = _ToyModel().to(torch.device("cpu"))
+    with torch.no_grad():
+        model.linear.weight.zero_()
+        model.linear.bias.zero_()
+
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
+        criterion=nn.MSELoss(),
+        metrics=[MAE()],
+        config=TrainerConfig(max_epochs=1, train_max_samples=3, show_progress=False),
+        train_loader=train_loader,
+    )
+
+    history = list(trainer.step())
+
+    assert len(history) == 1
+    assert trainer.state.global_step == 2
+    assert history[0]["train"]["loss"] == pytest.approx(5.0 / 3.0)
+    assert history[0]["train"]["mae"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
     ("num_workers", "persistent_workers"),
     [(0, False), (1, False), (1, True)],
 )
-def test_stage_batches_allows_clean_subprocess_exit_after_early_stop(
+def test_stage_samples_allows_clean_subprocess_exit_after_early_stop(
     num_workers: int,
     persistent_workers: bool,
 ) -> None:
@@ -339,7 +363,7 @@ def test_stage_batches_allows_clean_subprocess_exit_after_early_stop(
 
         from cr_train import build_sen12mscr_loaders
         from cr_train.data import SceneShard
-        from cr_train.trainer import _stage_batches
+        from cr_train.trainer import _stage_samples
 
 
         def sample_row():
@@ -402,7 +426,7 @@ def test_stage_batches_allows_clean_subprocess_exit_after_early_stop(
             loader_kwargs["persistent_workers"] = persistent_workers
 
         train_loader, _, _ = build_sen12mscr_loaders(**loader_kwargs)
-        batches = list(_stage_batches(train_loader, 1))
+        batches = list(_stage_samples(train_loader, 1))
         print(batches[0]["metadata"]["scene"][0])
         """
     )
@@ -430,7 +454,7 @@ def test_trainer_raises_when_sized_stage_ends_before_progress_total() -> None:
         train_loader=_LengthMismatchLoader(_make_rows([0.0]), reported_length=2),
     )
 
-    with pytest.raises(RuntimeError, match="train stage ended after 1 batches, expected 2 batches"):
+    with pytest.raises(RuntimeError, match="train stage ended after 1 samples, expected 2 samples"):
         list(trainer.step())
 
 
@@ -446,8 +470,8 @@ def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
         metrics=[MAE()],
         config=TrainerConfig(
             max_epochs=1,
-            train_max_batches=1,
-            val_max_batches=1,
+            train_max_samples=2,
+            val_max_samples=1,
             checkpoint_dir=tmp_path,
             show_progress=False,
         ),
@@ -555,10 +579,10 @@ def test_trainer_rejects_invalid_runtime_step_overrides() -> None:
 
     with pytest.raises(ValueError, match="max_epochs must be positive"):
         list(trainer.step(max_epochs=0))
-    with pytest.raises(ValueError, match="train_max_batches must be positive when provided"):
-        list(trainer.step(train_max_batches=0))
-    with pytest.raises(ValueError, match="val_max_batches must be positive when provided"):
-        list(trainer.step(val_max_batches=0))
+    with pytest.raises(ValueError, match="train_max_samples must be positive when provided"):
+        list(trainer.step(train_max_samples=0))
+    with pytest.raises(ValueError, match="val_max_samples must be positive when provided"):
+        list(trainer.step(val_max_samples=0))
 
 
 def test_trainer_rejects_invalid_runtime_test_override() -> None:
@@ -573,5 +597,5 @@ def test_trainer_rejects_invalid_runtime_test_override() -> None:
         test_loader=DataLoader(_ToyDataset(_make_rows([1.0])), batch_size=1, shuffle=False),
     )
 
-    with pytest.raises(ValueError, match="max_batches must be positive when provided"):
-        trainer.test(max_batches=0)
+    with pytest.raises(ValueError, match="max_samples must be positive when provided"):
+        trainer.test(max_samples=0)

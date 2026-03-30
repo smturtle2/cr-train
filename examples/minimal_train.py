@@ -79,9 +79,9 @@ def _parse_num_workers(value: str) -> int | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal SEN12MS-CR streaming training example.")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--train-max-batches", type=int, default=50)
-    parser.add_argument("--val-max-batches", type=int, default=10)
-    parser.add_argument("--test-max-batches", type=int, default=5)
+    parser.add_argument("--train-max-samples", type=int, default=400)
+    parser.add_argument("--val-max-samples", type=int, default=80)
+    parser.add_argument("--test-max-samples", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--split", choices=("official", "seeded_scene"), default="official")
@@ -124,9 +124,9 @@ def main() -> None:
         metrics=[MAE()],
         config=TrainerConfig(
             max_epochs=args.epochs,
-            train_max_batches=args.train_max_batches,
-            val_max_batches=args.val_max_batches,
-            test_max_batches=args.test_max_batches,
+            train_max_samples=args.train_max_samples,
+            val_max_samples=args.val_max_samples,
+            test_max_samples=args.test_max_samples,
             checkpoint_dir=args.checkpoint_dir,
         ),
         train_loader=train_loader,

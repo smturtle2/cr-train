@@ -7,7 +7,6 @@ import re
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -28,18 +27,18 @@ class TrainerConfig:
     """Epoch-level training options consumed by `Trainer.step()` and `Trainer.test()`."""
 
     max_epochs: int = 1
-    train_max_batches: int | None = None
-    val_max_batches: int | None = None
-    test_max_batches: int | None = None
+    train_max_samples: int | None = None
+    val_max_samples: int | None = None
+    test_max_samples: int | None = None
     checkpoint_dir: str | Path | None = None
     show_progress: bool | None = None
 
     def __post_init__(self) -> None:
         _validate_positive("max_epochs", self.max_epochs)
         for name, value in (
-            ("train_max_batches", self.train_max_batches),
-            ("val_max_batches", self.val_max_batches),
-            ("test_max_batches", self.test_max_batches),
+            ("train_max_samples", self.train_max_samples),
+            ("val_max_samples", self.val_max_samples),
+            ("test_max_samples", self.test_max_samples),
         ):
             _validate_optional_positive(name, value)
 
@@ -109,21 +108,33 @@ def _loader_length(dataloader: Any) -> int | None:
         return None
 
 
-def _resolve_progress_total(dataloader: Any, max_batches: int | None) -> int | None:
-    # streaming loader는 len()이 없을 수 있으므로 max_batches를 fallback으로 쓴다.
-    loader_length = _loader_length(dataloader)
-    if loader_length is None:
-        return max_batches
-    if max_batches is None:
-        return loader_length
-    return min(loader_length, max_batches)
+def _dataset_length(dataloader: Any) -> int | None:
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is None:
+        return None
+    try:
+        return len(dataset)
+    except TypeError:
+        return None
+
+
+def _resolve_progress_total(dataloader: Any, max_samples: int | None) -> int | None:
+    # sample 기준 cap을 우선 보여주되, 길이를 모르는 loader는 max_samples만 fallback으로 사용한다.
+    sample_total = _dataset_length(dataloader)
+    if sample_total is None:
+        sample_total = _loader_length(dataloader)
+    if sample_total is None:
+        return max_samples
+    if max_samples is None:
+        return sample_total
+    return min(sample_total, max_samples)
 
 
 def _indeterminate_progress_columns() -> tuple[Any, ...]:
     return (
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
-        TextColumn("{task.completed:>4.0f} batches"),
+        TextColumn("{task.completed:>4.0f} samples"),
         TimeElapsedColumn(),
     )
 
@@ -135,7 +146,7 @@ def _create_progress(*, desc: str, total: int | None, disable: bool, leave: bool
         "disable": disable,
         "leave": leave,
         "dynamic_ncols": True,
-        "unit": "batch",
+        "unit": "sample",
     }
     if total is None:
         progress_kwargs["progress"] = _indeterminate_progress_columns()
@@ -144,22 +155,81 @@ def _create_progress(*, desc: str, total: int | None, disable: bool, leave: bool
         return tqdm(**progress_kwargs)
 
 
-def _stage_batches(dataloader: Any, max_batches: int | None) -> Iterator[Any]:
-    iterator = iter(dataloader)
+def _batch_size(target: Any) -> int:
+    if isinstance(target, torch.Tensor):
+        if target.ndim == 0:
+            raise ValueError("trainer target tensors must include a leading batch dimension")
+        return int(target.shape[0])
     try:
-        for batch in islice(iterator, max_batches):
-            yield batch
+        return len(target)
+    except TypeError as exc:
+        raise ValueError("trainer targets must be batched sequences or tensors") from exc
+
+
+def _slice_batch_value(value: Any, limit: int, *, batch_size: int) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0 or value.shape[0] != batch_size:
+            return value
+        return value[:limit]
+    if isinstance(value, Mapping):
+        return {
+            key: _slice_batch_value(item, limit, batch_size=batch_size)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        if len(value) == batch_size and all(
+            not isinstance(item, (torch.Tensor, Mapping, list, tuple)) for item in value
+        ):
+            return value[:limit]
+        return [_slice_batch_value(item, limit, batch_size=batch_size) for item in value]
+    if isinstance(value, tuple):
+        if len(value) == batch_size and all(
+            not isinstance(item, (torch.Tensor, Mapping, list, tuple)) for item in value
+        ):
+            return value[:limit]
+        return tuple(_slice_batch_value(item, limit, batch_size=batch_size) for item in value)
+    return value
+
+
+def _slice_batch(batch: Any, limit: int) -> Any:
+    _, target = _extract_inputs_target(batch)
+    batch_size = _batch_size(target)
+    if limit >= batch_size:
+        return batch
+    return _slice_batch_value(batch, limit, batch_size=batch_size)
+
+
+def _stage_samples(dataloader: Any, max_samples: int | None) -> Iterator[Any]:
+    iterator = iter(dataloader)
+    remaining_samples = max_samples
+    try:
+        if remaining_samples is None:
+            for batch in iterator:
+                yield batch
+            return
+        while remaining_samples > 0:
+            batch = next(iterator)
+            _, target = _extract_inputs_target(batch)
+            batch_sample_count = _batch_size(target)
+            if batch_sample_count <= remaining_samples:
+                yield batch
+                remaining_samples -= batch_sample_count
+                continue
+            yield _slice_batch(batch, remaining_samples)
+            break
+    except StopIteration:
+        return
     finally:
-        # max_batches로 조기 종료 시 prefetch된 미소비 배치와 worker 상태를 즉시 정리한다.
+        # max_samples로 조기 종료 시 prefetch된 미소비 배치와 worker 상태를 즉시 정리한다.
         del iterator
 
 
-def _ensure_progress_invariant(stage: str, total: int | None, processed_batches: int) -> None:
+def _ensure_progress_invariant(stage: str, total: int | None, processed_samples: int) -> None:
     if total is None:
         return
-    if processed_batches != total:
+    if processed_samples != total:
         raise RuntimeError(
-            f"{stage} stage ended after {processed_batches} batches, expected {total} batches"
+            f"{stage} stage ended after {processed_samples} samples, expected {total} samples"
         )
 
 
@@ -333,15 +403,14 @@ class Trainer:
         stage: str,
         dataloader: Any,
         *,
-        max_batches: int | None,
+        max_samples: int | None,
         training: bool,
         epoch: int,
     ) -> dict[str, float]:
         # per-sample 가중 평균을 위해 metric 합산은 batch_size를 곱해서 누적한다.
         metric_totals: dict[str, float] = {}
         sample_count = 0
-        batch_count = 0
-        progress_total = _resolve_progress_total(dataloader, max_batches)
+        progress_total = _resolve_progress_total(dataloader, max_samples)
 
         if training:
             # val/test는 고정 순서를 유지해야 하므로 epoch 전달은 train에만 한다.
@@ -356,7 +425,7 @@ class Trainer:
         )
         try:
             progress.set_description_str(f"{stage} | loading first batch...")
-            for batch in _stage_batches(dataloader, max_batches):
+            for batch in _stage_samples(dataloader, max_samples):
                 moved_batch = _move_to_device(batch, self.device)
                 inputs, target = _extract_inputs_target(moved_batch)
                 batch_size = target.shape[0]
@@ -381,16 +450,15 @@ class Trainer:
                         metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value) * batch_size
 
                 sample_count += batch_size
-                batch_count += 1
                 averages = {name: total / sample_count for name, total in metric_totals.items()}
                 progress.set_description_str(
                     _progress_metrics_desc(stage, averages),
                     refresh=False,
                 )
-                progress.update(1)
+                progress.update(batch_size)
             if hasattr(progress, "refresh"):
                 progress.refresh()
-            _ensure_progress_invariant(stage, progress_total, batch_count)
+            _ensure_progress_invariant(stage, progress_total, sample_count)
         finally:
             if hasattr(progress, "refresh"):
                 progress.refresh()
@@ -404,8 +472,8 @@ class Trainer:
         self,
         *,
         max_epochs: int | None = None,
-        train_max_batches: int | None = None,
-        val_max_batches: int | None = None,
+        train_max_samples: int | None = None,
+        val_max_samples: int | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Run epochs and yield one history record per completed epoch."""
 
@@ -414,15 +482,15 @@ class Trainer:
             if max_epochs is None
             else _validate_positive("max_epochs", max_epochs)
         )
-        active_train_max_batches = (
-            self.config.train_max_batches
-            if train_max_batches is None
-            else _validate_optional_positive("train_max_batches", train_max_batches)
+        active_train_max_samples = (
+            self.config.train_max_samples
+            if train_max_samples is None
+            else _validate_optional_positive("train_max_samples", train_max_samples)
         )
-        active_val_max_batches = (
-            self.config.val_max_batches
-            if val_max_batches is None
-            else _validate_optional_positive("val_max_batches", val_max_batches)
+        active_val_max_samples = (
+            self.config.val_max_samples
+            if val_max_samples is None
+            else _validate_optional_positive("val_max_samples", val_max_samples)
         )
 
         while self.state.epoch < target_epochs:
@@ -433,7 +501,7 @@ class Trainer:
             train_metrics = self._run_stage(
                 "train",
                 self.train_loader,
-                max_batches=active_train_max_batches,
+                max_samples=active_train_max_samples,
                 training=True,
                 epoch=epoch,
             )
@@ -441,7 +509,7 @@ class Trainer:
                 self._run_stage(
                     "val",
                     self.val_loader,
-                    max_batches=active_val_max_batches,
+                    max_samples=active_val_max_samples,
                     training=False,
                     epoch=epoch,
                 )
@@ -462,20 +530,20 @@ class Trainer:
                 "val": val_metrics,
             }
 
-    def test(self, *, max_batches: int | None = None) -> dict[str, float]:
+    def test(self, *, max_samples: int | None = None) -> dict[str, float]:
         """Evaluate the configured test loader and return averaged metrics."""
 
         if self.test_loader is None:
             raise ValueError("test_loader is required to run test()")
-        active_max_batches = (
-            self.config.test_max_batches
-            if max_batches is None
-            else _validate_optional_positive("max_batches", max_batches)
+        active_max_samples = (
+            self.config.test_max_samples
+            if max_samples is None
+            else _validate_optional_positive("max_samples", max_samples)
         )
         return self._run_stage(
             "test",
             self.test_loader,
-            max_batches=active_max_batches,
+            max_samples=active_max_samples,
             training=False,
             epoch=self.state.epoch,
         )
