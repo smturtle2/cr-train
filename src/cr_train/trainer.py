@@ -72,16 +72,15 @@ def _validate_optional_positive(name: str, value: int | None) -> int | None:
     return value
 
 
-def _move_to_device(value: Any, device: torch.device) -> Any:
-    # batch가 dict/list/tuple로 중첩돼도 같은 device로 한 번에 옮긴다.
+def _move_value_to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, torch.Tensor):
         return value.to(device)
     if isinstance(value, dict):
-        return {key: _move_to_device(item, device) for key, item in value.items()}
+        return {key: _move_value_to_device(item, device) for key, item in value.items()}
     if isinstance(value, list):
-        return [_move_to_device(item, device) for item in value]
+        return [_move_value_to_device(item, device) for item in value]
     if isinstance(value, tuple):
-        return tuple(_move_to_device(item, device) for item in value)
+        return tuple(_move_value_to_device(item, device) for item in value)
     return value
 
 
@@ -279,7 +278,7 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
 def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
     for state in optimizer.state.values():
         for key, value in list(state.items()):
-            state[key] = _move_to_device(value, device)
+            state[key] = _move_value_to_device(value, device)
 
 
 def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> list[nn.Parameter]:
@@ -426,7 +425,7 @@ class Trainer:
         try:
             progress.set_description_str(f"{stage} | loading first batch...")
             for batch in _stage_samples(dataloader, max_samples):
-                moved_batch = _move_to_device(batch, self.device)
+                moved_batch = _move_value_to_device(batch, self.device)
                 inputs, target = _extract_inputs_target(moved_batch)
                 batch_size = target.shape[0]
 

@@ -73,6 +73,15 @@ class _ToyModel(nn.Module):
         return self.linear(x)
 
 
+class _DictInputModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(1, 1)
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.linear(batch["x"])
+
+
 class SquaredError:
     def __call__(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return torch.mean((outputs - target) ** 2)
@@ -103,6 +112,31 @@ def _make_rows(values: list[float]) -> list[dict[str, object]]:
         rows.append(
             {
                 "inputs": (torch.tensor([[value]], dtype=torch.float32),),
+                "target": torch.tensor([[value]], dtype=torch.float32),
+                "metadata": {"index": value},
+            }
+        )
+    return rows
+
+
+def _make_rows_without_metadata(values: list[float]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for value in values:
+        rows.append(
+            {
+                "inputs": (torch.tensor([[value]], dtype=torch.float32),),
+                "target": torch.tensor([[value]], dtype=torch.float32),
+            }
+        )
+    return rows
+
+
+def _make_nested_input_rows(values: list[float]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for value in values:
+        rows.append(
+            {
+                "inputs": ({"x": torch.tensor([[value]], dtype=torch.float32)},),
                 "target": torch.tensor([[value]], dtype=torch.float32),
                 "metadata": {"index": value},
             }
@@ -351,6 +385,51 @@ def test_trainer_caps_metrics_by_samples_even_when_batch_is_larger() -> None:
     assert history[0]["train"]["mae"] == pytest.approx(1.0)
 
 
+def test_trainer_supports_nested_input_batches() -> None:
+    train_loader = DataLoader(_ToyDataset(_make_nested_input_rows([0.0, 1.0])), batch_size=2, shuffle=False)
+    model = _DictInputModel().to(torch.device("cpu"))
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        criterion=nn.MSELoss(),
+        metrics=[MAE()],
+        config=TrainerConfig(max_epochs=1, show_progress=False),
+        train_loader=train_loader,
+    )
+
+    history = list(trainer.step())
+
+    assert len(history) == 1
+    assert "loss" in history[0]["train"]
+    assert "mae" in history[0]["train"]
+
+
+def test_trainer_slices_partial_batch_without_metadata() -> None:
+    train_loader = DataLoader(
+        _ToyDataset(_make_rows_without_metadata([0.0, 1.0, 2.0])),
+        batch_size=2,
+        shuffle=False,
+    )
+    model = _ToyModel().to(torch.device("cpu"))
+    with torch.no_grad():
+        model.linear.weight.zero_()
+        model.linear.bias.zero_()
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
+        criterion=nn.MSELoss(),
+        metrics=[MAE()],
+        config=TrainerConfig(max_epochs=1, train_max_samples=3, show_progress=False),
+        train_loader=train_loader,
+    )
+
+    history = list(trainer.step())
+
+    assert len(history) == 1
+    assert history[0]["train"]["loss"] == pytest.approx(5.0 / 3.0)
+    assert history[0]["train"]["mae"] == pytest.approx(1.0)
+
+
 @pytest.mark.parametrize(
     ("num_workers", "persistent_workers"),
     [(0, False), (1, False), (1, True)],
@@ -388,16 +467,6 @@ def test_stage_samples_allows_clean_subprocess_exit_after_early_stop(
         class FakeIterable:
             def __init__(self) -> None:
                 self.rows = [sample_row() for _ in range(4)]
-
-            def reshard(self):
-                return self
-
-            def shuffle(self, *, seed, buffer_size):
-                _ = (seed, buffer_size)
-                return self
-
-            def set_epoch(self, epoch):
-                self.epoch = epoch
 
             def __iter__(self):
                 yield from self.rows

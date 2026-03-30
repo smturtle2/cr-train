@@ -17,7 +17,7 @@ import torch
 import cr_train._parquet_streaming as parquet_streaming_mod
 import cr_train.data as data_mod
 from cr_train import build_sen12mscr_loaders
-from cr_train._parquet_streaming import PARQUET_COLUMNS, expand_parquet_row_groups
+from cr_train._parquet_streaming import PARQUET_COLUMNS
 from cr_train.data import (
     DEFAULT_DATASET_REVISION,
     SEN12MSCRStreamingDataset,
@@ -487,7 +487,7 @@ def test_runtime_smooth_profile_uses_notebook_safe_scan_behavior() -> None:
     assert runtime_mod._scan_behavior("conservative") == (0, 0, False)
 
 
-def test_default_dataset_loader_uses_smooth_fragment_scan_defaults(
+def test_default_dataset_loader_uses_smooth_cache_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[object] = []
@@ -497,9 +497,9 @@ def test_default_dataset_loader_uses_smooth_fragment_scan_defaults(
         urls: list[str],
         *,
         io_profile: str,
-        fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None,
+        cache_options: pa.CacheOptions | None,
     ) -> _FakeIterable:
-        calls.append((urls, io_profile, fragment_scan_options))
+        calls.append((urls, io_profile, cache_options))
         return dummy_iterable
 
     monkeypatch.setattr(data_mod, "load_streaming_parquet_dataset", fake_load_streaming_parquet_dataset)
@@ -511,15 +511,15 @@ def test_default_dataset_loader_uses_smooth_fragment_scan_defaults(
 
     assert dataset is dummy_iterable
     assert len(calls) == 1
-    urls, io_profile, scan_options = calls[0]
+    urls, io_profile, cache_options = calls[0]
     assert urls == ["/tmp/sample.parquet"]
     assert io_profile == "smooth"
-    assert isinstance(scan_options, pa_ds.ParquetFragmentScanOptions)
-    assert scan_options.cache_options.prefetch_limit == 1
-    assert scan_options.cache_options.range_size_limit == 128 << 20
+    assert isinstance(cache_options, pa.CacheOptions)
+    assert cache_options.prefetch_limit == 1
+    assert cache_options.range_size_limit == 128 << 20
 
 
-def test_default_dataset_loader_keeps_conservative_fragment_scan_defaults(
+def test_default_dataset_loader_keeps_conservative_cache_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[object] = []
@@ -529,9 +529,9 @@ def test_default_dataset_loader_keeps_conservative_fragment_scan_defaults(
         urls: list[str],
         *,
         io_profile: str,
-        fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None,
+        cache_options: pa.CacheOptions | None,
     ) -> _FakeIterable:
-        calls.append((urls, io_profile, fragment_scan_options))
+        calls.append((urls, io_profile, cache_options))
         return dummy_iterable
 
     monkeypatch.setattr(data_mod, "load_streaming_parquet_dataset", fake_load_streaming_parquet_dataset)
@@ -561,14 +561,21 @@ def test_load_streaming_parquet_dataset_bootstraps_runtime_with_column_pruning(
     monkeypatch.setattr(parquet_streaming_mod, "configure_runtime", fake_configure_runtime)
     monkeypatch.setattr(parquet_streaming_mod, "load_dataset", fake_load_dataset)
 
-    scan_options = pa_ds.ParquetFragmentScanOptions()
+    cache_options = pa.CacheOptions(range_size_limit=32 << 20, prefetch_limit=3, lazy=False)
     dataset = parquet_streaming_mod.load_streaming_parquet_dataset(
         ["/tmp/sample.parquet"],
         io_profile="smooth",
-        fragment_scan_options=scan_options,
+        cache_options=cache_options,
     )
 
     assert isinstance(dataset, _FakeIterable)
+    kwargs = calls[1][1]
+    assert isinstance(kwargs["fragment_scan_options"], pa_ds.ParquetFragmentScanOptions)
+    scan_cache_options = kwargs["fragment_scan_options"].cache_options
+    assert isinstance(scan_cache_options, pa.CacheOptions)
+    assert scan_cache_options.prefetch_limit == cache_options.prefetch_limit
+    assert scan_cache_options.range_size_limit == cache_options.range_size_limit
+    assert scan_cache_options.lazy == cache_options.lazy
     assert calls == [
         ("configure", "smooth"),
         (
@@ -578,22 +585,12 @@ def test_load_streaming_parquet_dataset_bootstraps_runtime_with_column_pruning(
                 "split": "train",
                 "streaming": True,
                 "columns": list(PARQUET_COLUMNS),
-                "fragment_scan_options": scan_options,
+                "fragment_scan_options": kwargs["fragment_scan_options"],
             },
         ),
     ]
 
 
-def test_expand_parquet_row_groups_materializes_row_group_shards(tmp_path: Path) -> None:
-    parquet_path = tmp_path / "sample.parquet"
-    table = pa.table({"value": [1, 2, 3, 4]})
-    pq.write_table(table, parquet_path, row_group_size=2)
-
-    dataset = data_mod._default_dataset_loader([str(parquet_path)], "train", io_profile="conservative")
-    expanded = expand_parquet_row_groups(dataset)
-
-    assert dataset.num_shards == 1
-    assert expanded.num_shards == 2
 
 
 def test_runtime_patch_allows_clean_subprocess_exit_with_live_iterator(tmp_path: Path) -> None:

@@ -88,7 +88,7 @@ Hugging Face (parquet shards)
   ▼
 build_sen12mscr_loaders()          ← scene-level split, streaming decode, preprocessing
   │
-  ├── train_loader                 ← one-time row-group expansion + sample-buffer shuffle
+  ├── train_loader                 ← file-shard streaming + sample-buffer shuffle
   ├── val_loader                   ← fixed order
   └── test_loader                  ← fixed order
         │
@@ -99,11 +99,11 @@ build_sen12mscr_loaders()          ← scene-level split, streaming decode, prep
     Trainer.test()                 ← final evaluation
 ```
 
-**Data pipeline.** Parquet shards are streamed directly from Hugging Face -- no local download required. Train row groups are materialized once at loader creation, only the required parquet columns are scanned, and each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical) and normalized on the fly.
+**Data pipeline.** Parquet shards are streamed directly from Hugging Face -- no local download required. Only the required parquet columns are scanned, and each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical) and normalized on the fly.
 
 **Scene isolation.** Scenes are assigned to train/val/test before any shuffling. No scene appears in multiple splits.
 
-**Deterministic ordering.** Given the same `seed`, batch order is fully reproducible. The trainer calls `set_epoch()` on each epoch so train-side sample-buffer shuffle changes deterministically while shard order stays fixed.
+**Deterministic ordering.** Given the same `seed`, batch order is fully reproducible. The trainer calls `set_epoch()` on each epoch so train-side sample-buffer shuffle changes deterministically while file-shard order stays fixed.
 
 **Checkpointing.** When `checkpoint_dir` is set, `last.pt` and `epoch-NNNN.pt` are saved automatically after each epoch. Checkpoints include model, optimizer, scheduler (if provided), and full RNG state for exact resumption.
 
@@ -158,7 +158,7 @@ Returns `(train_loader, val_loader, test_loader)`. Only train is shuffled; val/t
 | `prefetch_factor` | `int \| None` | `None` | Auto `2` when workers > 0 |
 | `persistent_workers` | `bool \| None` | `None` | Auto `True` when workers > 0 |
 | `io_profile` | `str` | `"smooth"` | `"smooth"` (throughput-first readahead) or `"conservative"` (fully synchronous) |
-| `fragment_scan_options` | `ParquetFragmentScanOptions \| None` | `None` | Optional pyarrow fragment cache/range tuning override |
+| `cache_options` | `CacheOptions \| None` | `None` | Optional pyarrow range-cache override; when omitted, `"smooth"` installs the default cache preset |
 
 ### `TrainerConfig`
 
@@ -245,7 +245,7 @@ The **official split** comes from the [authors' supplementary material](https://
 cr-train/
 ├── src/cr_train/
 │   ├── __init__.py         # public API
-│   ├── _parquet_streaming.py  # parquet column pruning and row-group expansion
+│   ├── _parquet_streaming.py  # parquet column pruning and scan tuning
 │   ├── trainer.py          # training loop, checkpointing, progress
 │   ├── data.py             # streaming dataset, scene splits, preprocessing
 │   └── runtime.py          # parquet I/O tuning

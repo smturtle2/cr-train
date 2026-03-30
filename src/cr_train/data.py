@@ -14,14 +14,13 @@ from importlib.resources import files
 from typing import Any, Literal, TypedDict, cast
 
 import numpy as np
-import pyarrow.dataset as pa_ds
+import pyarrow as pa
 import torch
 from datasets import IterableDataset as HFIterableDataset
 from torch.utils.data import DataLoader, IterableDataset
 
 from ._parquet_streaming import (
-    default_fragment_scan_options,
-    expand_parquet_row_groups,
+    default_cache_options,
     load_streaming_parquet_dataset,
 )
 from .runtime import IOProfile, VALID_IO_PROFILES
@@ -106,7 +105,7 @@ class _LoaderOptions:
     prefetch_factor: int | None = None
     persistent_workers: bool | None = None
     io_profile: IOProfile = DEFAULT_IO_PROFILE
-    fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None = None
+    cache_options: pa.CacheOptions | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -349,15 +348,15 @@ def _default_dataset_loader(
     _: Stage,
     *,
     io_profile: IOProfile = DEFAULT_IO_PROFILE,
-    fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None = None,
+    cache_options: pa.CacheOptions | None = None,
 ) -> HFIterableDataset:
-    scan_options = fragment_scan_options
-    if scan_options is None:
-        scan_options = default_fragment_scan_options(io_profile)
+    resolved_cache_options = cache_options
+    if resolved_cache_options is None:
+        resolved_cache_options = default_cache_options(io_profile)
     return load_streaming_parquet_dataset(
         urls,
         io_profile=io_profile,
-        fragment_scan_options=scan_options,
+        cache_options=resolved_cache_options,
     )
 
 
@@ -434,12 +433,10 @@ def _build_stage_dataset(
             urls,
             stage,
             io_profile=options.io_profile,
-            fragment_scan_options=options.fragment_scan_options,
+            cache_options=options.cache_options,
         )
     else:
         source = dataset_loader(urls, stage)
-    if stage == "train" and dataset_loader is None:
-        source = expand_parquet_row_groups(source)
     return SEN12MSCRStreamingDataset(
         source,
         stage=stage,
@@ -498,7 +495,7 @@ def build_sen12mscr_loaders(
     prefetch_factor: int | None = None,
     persistent_workers: bool | None = None,
     io_profile: IOProfile = DEFAULT_IO_PROFILE,
-    fragment_scan_options: pa_ds.ParquetFragmentScanOptions | None = None,
+    cache_options: pa.CacheOptions | None = None,
     _dataset_loader: DatasetLoader | None = None,
     _scene_split_resolver: SceneSplitResolver | None = None,
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
@@ -518,7 +515,7 @@ def build_sen12mscr_loaders(
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
         io_profile=io_profile,
-        fragment_scan_options=fragment_scan_options,
+        cache_options=cache_options,
     )
     splits = _resolve_scene_splits(options.split, options.seed, _scene_split_resolver)
     loaders = tuple(
