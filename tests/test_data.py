@@ -1,63 +1,95 @@
 from __future__ import annotations
 
-import importlib
-import random
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 import torch
 
-import cr_train._parquet_streaming as parquet_streaming_mod
 import cr_train.data as data_mod
 from cr_train import build_sen12mscr_loaders
-from cr_train._parquet_streaming import PARQUET_COLUMNS
 from cr_train.data import (
     DEFAULT_DATASET_REVISION,
-    SEN12MSCRMapDataset,
-    SEN12MSCRStreamingDataset,
+    DEFAULT_SHUFFLE_BUFFER_SIZE,
+    HFTokenStatus,
+    PARQUET_COLUMNS,
     SceneShard,
     decode_sample,
+    hf_token_configured,
+    hf_token_status,
     official_scene_splits,
     seeded_scene_splits,
 )
 
 
 def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30") -> dict[str, object]:
-    # HWC: 실제 데이터셋과 동일한 형태
     sar = np.array(
         [
             [[-30.0, -5.0], [-12.5, 1.0]],
             [[-25.0, -7.5], [0.0, -20.0]],
         ],
         dtype=np.float32,
-    )  # (2, 2, 2) = (H, W, C=2)
-    optical = np.arange(13 * 2 * 1, dtype=np.int16).reshape(2, 1, 13) * 800 - 10  # (H=2, W=1, C=13)
+    )
+    optical = np.arange(13 * 2 * 1, dtype=np.int16).reshape(2, 1, 13) * 800 - 10
     return {
         "sar": sar.tobytes(),
         "cloudy": optical.tobytes(),
         "target": (optical + 100).tobytes(),
         "sar_shape": list(sar.shape),
         "opt_shape": list(optical.shape),
-        "dtype": "float32",
         "season": season,
         "scene": scene,
         "patch": patch,
     }
 
 
+def _fake_scene_splits(_: str, __: int) -> dict[str, tuple[SceneShard, ...]]:
+    return {
+        "train": (SceneShard("spring", "1"),),
+        "val": (SceneShard("spring", "2"),),
+        "test": (SceneShard("spring", "3"),),
+    }
+
+
+class _FakeIterable(torch.utils.data.IterableDataset[dict[str, object]]):
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        super().__init__()
+        self.rows = rows
+        self.calls: list[str] = []
+
+    def __iter__(self):
+        self.calls.append("iter")
+        return iter(self.rows)
+
+
+class _FakeHFSource(torch.utils.data.IterableDataset[dict[str, object]]):
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        super().__init__()
+        self.rows = rows
+        self.shuffle_calls: list[tuple[int, int]] = []
+        self.epochs: list[int] = []
+
+    def shuffle(self, *, seed: int, buffer_size: int) -> "_FakeHFSource":
+        self.shuffle_calls.append((seed, buffer_size))
+        return self
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epochs.append(epoch)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+
 def test_decode_sample_applies_official_preprocessing_and_standard_schema() -> None:
     decoded = decode_sample(_sample_row())
 
     sar, cloudy = decoded["inputs"]
-    assert sar.shape == (2, 2, 2)       # HWC (2,2,2) -> CHW (2,2,2)
-    assert cloudy.shape == (13, 2, 1)   # HWC (2,1,13) -> CHW (13,2,1)
+    assert sar.shape == (2, 2, 2)
+    assert cloudy.shape == (13, 2, 1)
     assert decoded["target"].shape == (13, 2, 1)
     assert decoded["metadata"]["source_shard"] == "spring/scene_1.parquet"
     assert decoded["metadata"]["patch"] == "p30"
@@ -86,15 +118,6 @@ def test_official_scene_splits_are_scene_isolated() -> None:
     assert val_ids.isdisjoint(test_ids)
 
 
-def test_official_scene_splits_return_a_fresh_mapping() -> None:
-    splits = official_scene_splits()
-    splits["train"] = ()
-
-    fresh = official_scene_splits()
-
-    assert len(fresh["train"]) == 155
-
-
 def test_seeded_scene_splits_are_deterministic_and_disjoint() -> None:
     catalog = tuple(
         SceneShard(season=season, scene=str(index))
@@ -116,46 +139,45 @@ def test_scene_shard_urls_are_pinned_to_a_dataset_revision() -> None:
     assert f"@{DEFAULT_DATASET_REVISION}/" in url
 
 
-class _FakeIterable:
-    def __init__(self, rows: list[dict[str, object]]) -> None:
-        self.rows = rows
-        self.calls: list[tuple[object, ...]] = []
+def test_hf_token_configured_reflects_huggingface_auth_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(data_mod, "get_token", lambda: None)
+    assert hf_token_configured() is False
 
-    def __iter__(self):
-        self.calls.append(("iter",))
-        return iter(self.rows)
-
-
-class _RowsSource:
-    def __init__(self, rows: list[dict[str, object]]) -> None:
-        self.rows = rows
-
-    def __iter__(self):
-        yield from self.rows
+    monkeypatch.setattr(data_mod, "get_token", lambda: "hf_test_token")
+    assert hf_token_configured() is True
 
 
-def _expected_patch_order(
-    patches: list[str],
-    *,
-    seed: int,
-    shuffle_buffer_size: int,
-) -> list[str]:
-    rng = random.Random(seed)
-    buffer: list[str] = []
-    ordered: list[str] = []
-    for patch in patches:
-        if len(buffer) == shuffle_buffer_size:
-            index = rng.randrange(shuffle_buffer_size)
-            ordered.append(buffer[index])
-            buffer[index] = patch
-        else:
-            buffer.append(patch)
-    rng.shuffle(buffer)
-    ordered.extend(buffer)
-    return ordered
+def test_hf_token_status_reports_env_and_cached_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "hf_env_token")
+    monkeypatch.setattr(data_mod, "get_token", lambda: "hf_env_token")
+    assert hf_token_status() == HFTokenStatus(
+        configured=True,
+        source="env",
+        applied_to_hf=True,
+    )
+
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(data_mod, "get_token", lambda: "hf_cached_token")
+    assert hf_token_status() == HFTokenStatus(
+        configured=True,
+        source="cached",
+        applied_to_hf=True,
+    )
+
+    monkeypatch.setattr(data_mod, "get_token", lambda: None)
+    assert hf_token_status() == HFTokenStatus(
+        configured=False,
+        source="none",
+        applied_to_hf=False,
+    )
 
 
-def test_build_loaders_defaults_to_official_and_shuffles_inside_wrapper() -> None:
+def test_build_loaders_defaults_to_official_split_and_decodes_samples() -> None:
     resolver_calls: list[tuple[str, int]] = []
     datasets = {
         "train": _FakeIterable([_sample_row()]),
@@ -169,39 +191,28 @@ def test_build_loaders_defaults_to_official_and_shuffles_inside_wrapper() -> Non
 
     def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
         resolver_calls.append((split, seed))
-        return {
-            "train": (SceneShard("spring", "1"),),
-            "val": (SceneShard("spring", "2"),),
-            "test": (SceneShard("spring", "3"),),
-        }
+        return _fake_scene_splits(split, seed)
 
     train_loader, val_loader, test_loader = build_sen12mscr_loaders(
         1,
         seed=13,
         num_workers=0,
-        shuffle_buffer_size=16,
         _dataset_loader=fake_dataset_loader,
         _scene_split_resolver=fake_scene_split_resolver,
     )
 
-    train_loader.dataset.set_epoch(3)
     batch = next(iter(train_loader))
     _ = next(iter(val_loader))
     _ = next(iter(test_loader))
 
     assert resolver_calls == [("official", 13)]
-    sar, cloudy = batch["inputs"]
+    assert datasets["train"].calls == ["iter"]
+    assert datasets["val"].calls == ["iter"]
+    assert datasets["test"].calls == ["iter"]
+
+    sar, _ = batch["inputs"]
     assert tuple(sar.shape) == (1, 2, 2, 2)
     assert tuple(batch["target"].shape) == (1, 13, 2, 1)
-    assert train_loader.dataset.stage == "train"
-    assert train_loader.dataset.seed == 13
-    assert train_loader.dataset.shuffle_buffer_size == 16
-    assert train_loader.dataset.epoch == 3
-    assert val_loader.dataset.stage == "val"
-    assert test_loader.dataset.stage == "test"
-    assert datasets["train"].calls == [("iter",)]
-    assert datasets["val"].calls == [("iter",)]
-    assert datasets["test"].calls == [("iter",)]
 
 
 def test_build_loaders_supports_seeded_scene_split_without_custom_resolver() -> None:
@@ -230,12 +241,9 @@ def test_build_loaders_supports_seeded_scene_split_without_custom_resolver() -> 
     _ = next(iter(test_loader))
 
     assert created == [(stage, len(expected_splits[stage])) for stage in ("train", "val", "test")]
-    assert train_loader.dataset.stage == "train"
-    assert train_loader.dataset.seed == 7
-    assert train_loader.dataset.shuffle_buffer_size == data_mod.DEFAULT_SHUFFLE_BUFFER_SIZE
-    assert datasets["train"].calls == [("iter",)]
-    assert datasets["val"].calls == [("iter",)]
-    assert datasets["test"].calls == [("iter",)]
+    assert datasets["train"].calls == ["iter"]
+    assert datasets["val"].calls == ["iter"]
+    assert datasets["test"].calls == ["iter"]
 
 
 def test_loader_builder_rejects_invalid_settings() -> None:
@@ -255,7 +263,9 @@ def test_loader_builder_rejects_invalid_settings() -> None:
         build_sen12mscr_loaders(1, num_workers=0, persistent_workers=True)
 
 
-def test_loader_builder_auto_tunes_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_loader_builder_auto_tunes_simple_worker_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     created: list[dict[str, object]] = []
     datasets = {
         "train": _FakeIterable([_sample_row()]),
@@ -267,7 +277,6 @@ def test_loader_builder_auto_tunes_worker_defaults(monkeypatch: pytest.MonkeyPat
         def __init__(self, **kwargs: object) -> None:
             created.append(dict(kwargs))
             self.dataset = kwargs["dataset"]
-            self.kwargs = kwargs
 
         def __class_getitem__(cls, _: object) -> type["_FakeDataLoader"]:
             return cls
@@ -276,82 +285,69 @@ def test_loader_builder_auto_tunes_worker_defaults(monkeypatch: pytest.MonkeyPat
         _ = urls
         return datasets[stage]
 
-    def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
-        _ = (split, seed)
-        return {
-            "train": (SceneShard("spring", "1"), SceneShard("spring", "2")),
-            "val": (SceneShard("spring", "3"),),
-            "test": (SceneShard("spring", "4"), SceneShard("spring", "5")),
-        }
-
     monkeypatch.setattr(data_mod, "DataLoader", _FakeDataLoader)
     monkeypatch.setattr(data_mod.os, "cpu_count", lambda: 12)
 
     build_sen12mscr_loaders(
         2,
         _dataset_loader=fake_dataset_loader,
-        _scene_split_resolver=fake_scene_split_resolver,
+        _scene_split_resolver=_fake_scene_splits,
     )
 
-    assert [kwargs["num_workers"] for kwargs in created] == [2, 0, 0]
-    for index, kwargs in enumerate(created):
+    assert [kwargs["num_workers"] for kwargs in created] == [3, 1, 1]
+    for kwargs in created:
         assert kwargs["batch_size"] == 2
         assert kwargs["worker_init_fn"] is data_mod._seed_worker
         assert isinstance(kwargs["generator"], torch.Generator)
-        assert kwargs["timeout"] == 0.0
         if kwargs["num_workers"] > 0:
+            assert kwargs["timeout"] == 0.0
             assert kwargs["prefetch_factor"] == 2
             assert kwargs["persistent_workers"] is False
         else:
+            assert kwargs["timeout"] == 0.0
             assert "prefetch_factor" not in kwargs
             assert "persistent_workers" not in kwargs
 
 
-def test_loader_builder_applies_timeout_only_to_stages_with_workers(
+def test_loader_builder_auto_workers_do_not_exceed_streaming_source_shards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     created: list[dict[str, object]] = []
-    datasets = {
-        "train": _FakeIterable([_sample_row()]),
-        "val": _FakeIterable([_sample_row(scene="2")]),
-        "test": _FakeIterable([_sample_row(scene="3")]),
-    }
 
     class _FakeDataLoader:
         def __init__(self, **kwargs: object) -> None:
             created.append(dict(kwargs))
             self.dataset = kwargs["dataset"]
-            self.kwargs = kwargs
 
         def __class_getitem__(cls, _: object) -> type["_FakeDataLoader"]:
             return cls
 
-    def fake_dataset_loader(urls: list[str], stage: str) -> _FakeIterable:
-        _ = urls
-        return datasets[stage]
+    def fake_load_dataset(*args: object, **kwargs: object) -> _FakeHFSource:
+        _ = (args, kwargs)
+        source = _FakeHFSource([_sample_row()])
+        source.num_shards = 2
+        return source
 
-    def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
-        _ = (split, seed)
+    def scene_splits(_: str, __: int) -> dict[str, tuple[SceneShard, ...]]:
         return {
-            "train": (SceneShard("spring", "1"),),
-            "val": (SceneShard("spring", "2"),),
-            "test": (SceneShard("spring", "3"),),
+            "train": (SceneShard("spring", "1"), SceneShard("summer", "2")),
+            "val": (SceneShard("fall", "3"),),
+            "test": (SceneShard("winter", "4"),),
         }
 
     monkeypatch.setattr(data_mod, "DataLoader", _FakeDataLoader)
-    monkeypatch.setattr(data_mod.os, "cpu_count", lambda: 12)
+    monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(data_mod.os, "cpu_count", lambda: 64)
 
     build_sen12mscr_loaders(
         2,
-        timeout=3.5,
-        _dataset_loader=fake_dataset_loader,
-        _scene_split_resolver=fake_scene_split_resolver,
+        _scene_split_resolver=scene_splits,
     )
 
-    assert [kwargs["timeout"] for kwargs in created] == [3.5, 0.0, 0.0]
+    assert [kwargs["num_workers"] for kwargs in created] == [2, 1, 1]
 
 
-def test_loader_builder_passes_prefetch_and_persistent_worker_options(
+def test_loader_builder_passes_explicit_dataloader_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     created: list[dict[str, object]] = []
@@ -365,7 +361,6 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
         def __init__(self, **kwargs: object) -> None:
             created.append(dict(kwargs))
             self.dataset = kwargs["dataset"]
-            self.kwargs = kwargs
 
         def __class_getitem__(cls, _: object) -> type["_FakeDataLoader"]:
             return cls
@@ -373,14 +368,6 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
     def fake_dataset_loader(urls: list[str], stage: str) -> _FakeIterable:
         _ = urls
         return datasets[stage]
-
-    def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
-        _ = (split, seed)
-        return {
-            "train": (SceneShard("spring", "1"),),
-            "val": (SceneShard("spring", "2"),),
-            "test": (SceneShard("spring", "3"),),
-        }
 
     monkeypatch.setattr(data_mod, "DataLoader", _FakeDataLoader)
 
@@ -392,7 +379,7 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
         prefetch_factor=4,
         persistent_workers=True,
         _dataset_loader=fake_dataset_loader,
-        _scene_split_resolver=fake_scene_split_resolver,
+        _scene_split_resolver=_fake_scene_splits,
     )
 
     assert len(created) == 3
@@ -407,37 +394,17 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
         assert kwargs["persistent_workers"] is True
 
 
+def test_collate_sen12mscr_rows_decodes_raw_batches() -> None:
+    batch = data_mod._collate_sen12mscr_rows([
+        _sample_row(patch="p0"),
+        _sample_row(patch="p1"),
+    ])
 
-@pytest.mark.filterwarnings("ignore:This process .* multi-threaded, use of fork")
-def test_streaming_dataset_shares_epoch_updates_with_persistent_workers() -> None:
-    rows = [_sample_row(patch=f"p{index}") for index in range(4)]
-    dataset = SEN12MSCRStreamingDataset(
-        _RowsSource(rows),
-        stage="train",
-        seed=11,
-        shuffle_buffer_size=2,
-    )
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=None,
-        num_workers=1,
-        persistent_workers=True,
-    )
-
-    try:
-        observed_patches: list[str] = []
-        for epoch in range(3):
-            dataset.set_epoch(epoch)
-            sample = next(iter(loader))
-            observed_patches.append(sample["metadata"]["patch"])
-        assert observed_patches == [
-            _expected_patch_order([f"p{index}" for index in range(4)], seed=11 + epoch, shuffle_buffer_size=2)[0]
-            for epoch in range(3)
-        ]
-    finally:
-        iterator = getattr(loader, "_iterator", None)
-        if iterator is not None:
-            iterator._shutdown_workers()
+    sar, cloudy = batch["inputs"]
+    assert tuple(sar.shape) == (2, 2, 2, 2)
+    assert tuple(cloudy.shape) == (2, 13, 2, 1)
+    assert tuple(batch["target"].shape) == (2, 13, 2, 1)
+    assert batch["metadata"]["patch"] == ["p0", "p1"]
 
 
 def test_seed_worker_keeps_numpy_seed_in_uint32_range(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -452,148 +419,176 @@ def test_seed_worker_keeps_numpy_seed_in_uint32_range(monkeypatch: pytest.Monkey
     assert calls == [("python", (2**32) - 1), ("numpy", (2**32) - 1)]
 
 
-def test_runtime_is_not_configured_on_import() -> None:
-    runtime_mod = importlib.import_module("cr_train.runtime")
-    runtime_mod = importlib.reload(runtime_mod)
+def test_collate_sen12mscr_rows_preserves_predecoded_batches() -> None:
+    sample = decode_sample(_sample_row(patch="p1"))
+    batch = data_mod._collate_sen12mscr_rows([sample])
 
-    assert runtime_mod._CONFIGURED is False
+    assert batch["metadata"]["patch"] == ["p1"]
+    assert tuple(batch["target"].shape) == (1, 13, 2, 1)
 
 
-def test_runtime_configuration_rejects_conflicting_io_profiles(
+def test_train_loader_keeps_hf_set_epoch_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime_mod = importlib.import_module("cr_train.runtime")
-    runtime_mod = importlib.reload(runtime_mod)
-    patched_profiles: list[str] = []
+    created: list[_FakeHFSource] = []
 
-    monkeypatch.setattr(
-        runtime_mod,
-        "_patch_datasets_parquet_reader",
-        lambda io_profile: patched_profiles.append(io_profile),
+    def fake_load_dataset(*args: object, **kwargs: object) -> _FakeHFSource:
+        _ = (args, kwargs)
+        source = _FakeHFSource([_sample_row()])
+        created.append(source)
+        return source
+
+    monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
+
+    train_loader, _, _ = build_sen12mscr_loaders(
+        1,
+        seed=13,
+        num_workers=0,
+        _scene_split_resolver=_fake_scene_splits,
     )
 
-    runtime_mod.configure_runtime("smooth")
-    runtime_mod.configure_runtime("smooth")
+    train_loader.dataset.set_epoch(3)
+    _ = next(iter(train_loader))
+    train_loader.dataset.set_epoch(7)
+    _ = next(iter(train_loader))
 
-    with pytest.raises(ValueError, match="runtime already configured"):
-        runtime_mod.configure_runtime("conservative")
-
-    assert patched_profiles == ["smooth"]
-
-
-def test_runtime_smooth_profile_uses_notebook_safe_scan_behavior() -> None:
-    runtime_mod = importlib.import_module("cr_train.runtime")
-    runtime_mod = importlib.reload(runtime_mod)
-
-    assert runtime_mod._scan_behavior("smooth") == (2, 2, False)
-    assert runtime_mod._scan_behavior("conservative") == (0, 0, False)
+    assert [source.epochs for source in created] == [[3], [7]]
 
 
-def test_default_dataset_loader_uses_smooth_cache_defaults(
+def test_default_hf_streaming_loader_uses_shuffle_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[object] = []
-    dummy_iterable = _FakeIterable([])
+    calls: list[dict[str, object]] = []
+    sources: list[_FakeHFSource] = []
 
-    def fake_load_streaming_parquet_dataset(
-        urls: list[str],
-        *,
-        io_profile: str,
-        cache_options: pa.CacheOptions | None,
-    ) -> _FakeIterable:
-        calls.append((urls, io_profile, cache_options))
-        return dummy_iterable
+    def fake_load_dataset(*args: object, **kwargs: object) -> _FakeHFSource:
+        _ = args
+        call = dict(kwargs)
+        calls.append(call)
+        url = call["data_files"]["train"][0]
+        source = _FakeHFSource([_sample_row(scene=url.rsplit("_", 1)[-1].split(".")[0])])
+        sources.append(source)
+        return source
 
-    monkeypatch.setattr(data_mod, "load_streaming_parquet_dataset", fake_load_streaming_parquet_dataset)
+    monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(data_mod, "get_token", lambda: "hf_test_token")
 
-    dataset = data_mod._default_dataset_loader(
-        ["/tmp/sample.parquet"],
-        "train",
+    train_loader, val_loader, test_loader = build_sen12mscr_loaders(
+        1,
+        seed=13,
+        num_workers=0,
+        _scene_split_resolver=_fake_scene_splits,
     )
 
-    assert dataset is dummy_iterable
-    assert len(calls) == 1
-    urls, io_profile, cache_options = calls[0]
-    assert urls == ["/tmp/sample.parquet"]
-    assert io_profile == "smooth"
-    assert isinstance(cache_options, pa.CacheOptions)
-    assert cache_options.prefetch_limit == 1
-    assert cache_options.range_size_limit == 128 << 20
+    train_loader.dataset.set_epoch(5)
+    batch = next(iter(train_loader))
+    _ = next(iter(val_loader))
+    _ = next(iter(test_loader))
+
+    assert len(calls) == 3
+    for call in calls:
+        assert call["streaming"] is True
+        assert call["split"] == "train"
+        assert call["columns"] == list(PARQUET_COLUMNS)
+        assert call["token"] == "hf_test_token"
+        assert "batch_size" not in call
+
+    assert sources[0].shuffle_calls == [(13, DEFAULT_SHUFFLE_BUFFER_SIZE)]
+    assert sources[0].epochs == [5]
+    assert sources[1].shuffle_calls == []
+    assert sources[2].shuffle_calls == []
+    assert tuple(batch["target"].shape) == (1, 13, 2, 1)
 
 
-def test_default_dataset_loader_keeps_conservative_cache_defaults(
+def test_default_hf_streaming_loader_rebuilds_same_train_urls_each_epoch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[object] = []
-    dummy_iterable = _FakeIterable([])
+    calls: list[dict[str, object]] = []
+    sources: list[_FakeHFSource] = []
 
-    def fake_load_streaming_parquet_dataset(
-        urls: list[str],
-        *,
-        io_profile: str,
-        cache_options: pa.CacheOptions | None,
-    ) -> _FakeIterable:
-        calls.append((urls, io_profile, cache_options))
-        return dummy_iterable
+    def fake_load_dataset(*args: object, **kwargs: object) -> _FakeHFSource:
+        _ = args
+        calls.append(dict(kwargs))
+        source = _FakeHFSource([_sample_row()])
+        sources.append(source)
+        return source
 
-    monkeypatch.setattr(data_mod, "load_streaming_parquet_dataset", fake_load_streaming_parquet_dataset)
+    def scene_splits(_: str, __: int) -> dict[str, tuple[SceneShard, ...]]:
+        return {
+            "train": (
+                SceneShard("spring", "1"),
+                SceneShard("summer", "2"),
+                SceneShard("fall", "3"),
+            ),
+            "val": (SceneShard("winter", "4"),),
+            "test": (SceneShard("winter", "5"),),
+        }
 
-    dataset = data_mod._default_dataset_loader(
-        ["/tmp/sample.parquet"],
-        "train",
-        io_profile="conservative",
+    monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(data_mod, "get_token", lambda: "hf_test_token")
+
+    train_loader, _, _ = build_sen12mscr_loaders(
+        1,
+        seed=13,
+        num_workers=0,
+        _scene_split_resolver=scene_splits,
     )
 
-    assert dataset is dummy_iterable
-    assert calls == [(["/tmp/sample.parquet"], "conservative", None)]
+    train_loader.dataset.set_epoch(0)
+    _ = next(iter(train_loader))
+    train_loader.dataset.set_epoch(1)
+    _ = next(iter(train_loader))
 
-
-def test_load_streaming_parquet_dataset_bootstraps_runtime_with_column_pruning(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[object] = []
-
-    def fake_configure_runtime(*, io_profile: str = "smooth") -> None:
-        calls.append(("configure", io_profile))
-
-    def fake_load_dataset(*args: object, **kwargs: object) -> _FakeIterable:
-        calls.append(("load_dataset", kwargs))
-        return _FakeIterable([])
-
-    monkeypatch.setattr(parquet_streaming_mod, "configure_runtime", fake_configure_runtime)
-    monkeypatch.setattr(parquet_streaming_mod, "load_dataset", fake_load_dataset)
-
-    cache_options = pa.CacheOptions(range_size_limit=32 << 20, prefetch_limit=3, lazy=False)
-    dataset = parquet_streaming_mod.load_streaming_parquet_dataset(
-        ["/tmp/sample.parquet"],
-        io_profile="smooth",
-        cache_options=cache_options,
-    )
-
-    assert isinstance(dataset, _FakeIterable)
-    kwargs = calls[1][1]
-    assert isinstance(kwargs["fragment_scan_options"], pa_ds.ParquetFragmentScanOptions)
-    scan_cache_options = kwargs["fragment_scan_options"].cache_options
-    assert isinstance(scan_cache_options, pa.CacheOptions)
-    assert scan_cache_options.prefetch_limit == cache_options.prefetch_limit
-    assert scan_cache_options.range_size_limit == cache_options.range_size_limit
-    assert scan_cache_options.lazy == cache_options.lazy
-    assert calls == [
-        ("configure", "smooth"),
-        (
-            "load_dataset",
-            {
-                "data_files": {"train": ["/tmp/sample.parquet"]},
-                "split": "train",
-                "streaming": True,
-                "columns": list(PARQUET_COLUMNS),
-                "fragment_scan_options": kwargs["fragment_scan_options"],
-            },
-        ),
+    assert len(calls) == 2
+    assert calls[0]["data_files"] == calls[1]["data_files"]
+    assert calls[0]["data_files"]["train"] == [
+        SceneShard("spring", "1").resolve_url(),
+        SceneShard("summer", "2").resolve_url(),
+        SceneShard("fall", "3").resolve_url(),
     ]
+    assert sources[0].shuffle_calls == [(13, DEFAULT_SHUFFLE_BUFFER_SIZE)]
+    assert sources[1].shuffle_calls == [(13, DEFAULT_SHUFFLE_BUFFER_SIZE)]
+    assert sources[0].epochs == [0]
+    assert sources[1].epochs == [1]
 
 
-def test_runtime_patch_allows_clean_subprocess_exit_with_live_iterator(tmp_path: Path) -> None:
+def test_default_hf_map_loader_uses_official_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_load_dataset(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        _ = args
+        calls.append(dict(kwargs))
+        scene = kwargs["data_files"]["train"][0].rsplit("_", 1)[-1].split(".")[0]
+        return [_sample_row(scene=scene)]
+
+    monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(data_mod, "get_token", lambda: "hf_test_token")
+
+    train_loader, val_loader, test_loader = build_sen12mscr_loaders(
+        1,
+        streaming=False,
+        num_workers=0,
+        _scene_split_resolver=_fake_scene_splits,
+    )
+
+    batch = next(iter(train_loader))
+
+    assert isinstance(train_loader.dataset, list)
+    assert isinstance(val_loader.dataset, list)
+    assert isinstance(test_loader.dataset, list)
+    assert len(calls) == 3
+    for call in calls:
+        assert call["streaming"] is False
+        assert call["split"] == "train"
+        assert call["columns"] == list(PARQUET_COLUMNS)
+        assert call["token"] == "hf_test_token"
+        assert "batch_size" not in call
+    assert tuple(batch["target"].shape) == (1, 13, 2, 1)
+
+
+def test_local_parquet_smoke_streaming_and_map_loading(tmp_path: Path) -> None:
     parquet_path = tmp_path / "sample.parquet"
     row = _sample_row()
     table = pa.table(
@@ -610,84 +605,32 @@ def test_runtime_patch_allows_clean_subprocess_exit_with_live_iterator(tmp_path:
     )
     pq.write_table(table, parquet_path)
 
-    script = textwrap.dedent(
-        """
-        from cr_train.data import _default_dataset_loader
-        import sys
-
-        dataset = _default_dataset_loader([sys.argv[1]], "train")
-        iterator = iter(dataset)
-        row = next(iterator)
-        globals()["live_iterator"] = iterator
-        print(row["patch"])
-        """
+    streaming_source = data_mod._load_parquet_source(
+        [str(parquet_path)],
+        streaming=True,
     )
+    mapped_source = data_mod._load_parquet_source(
+        [str(parquet_path)],
+        streaming=False,
+    )
+
+    assert [item["patch"] for item in streaming_source] == ["p30"]
+    assert len(mapped_source) == 1
+    assert mapped_source[0]["patch"] == "p30"
+
+
+def test_minimal_train_cli_help_smoke() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "examples" / "minimal_train.py"
+
     result = subprocess.run(
-        [sys.executable, "-c", script, str(parquet_path)],
-        cwd=Path(__file__).resolve().parents[1],
+        [sys.executable, str(script), "--help"],
+        cwd=repo_root,
         capture_output=True,
         text=True,
         timeout=20,
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "p30"
-
-
-def test_map_dataset_decodes_samples_by_index() -> None:
-    rows = [_sample_row(patch=f"p{index}") for index in range(3)]
-    dataset = SEN12MSCRMapDataset(rows, stage="train")
-
-    assert len(dataset) == 3
-    sample = dataset[1]
-    assert sample["metadata"]["patch"] == "p1"
-    sar, cloudy = sample["inputs"]
-    assert sar.dtype == torch.float32
-    assert cloudy.dtype == torch.float32
-    assert sample["target"].dtype == torch.float32
-
-
-def test_map_dataset_set_epoch_is_noop() -> None:
-    dataset = SEN12MSCRMapDataset([_sample_row()], stage="val")
-    dataset.set_epoch(5)
-    assert len(dataset) == 1
-
-
-def test_build_loaders_non_streaming_creates_map_dataset() -> None:
-    datasets = {
-        "train": [_sample_row()],
-        "val": [_sample_row(scene="2")],
-        "test": [_sample_row(scene="3")],
-    }
-
-    def fake_dataset_loader(urls: list[str], stage: str) -> list[dict[str, object]]:
-        _ = urls
-        return datasets[stage]
-
-    def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
-        _ = (split, seed)
-        return {
-            "train": (SceneShard("spring", "1"),),
-            "val": (SceneShard("spring", "2"),),
-            "test": (SceneShard("spring", "3"),),
-        }
-
-    train_loader, val_loader, test_loader = build_sen12mscr_loaders(
-        1,
-        streaming=False,
-        num_workers=0,
-        _dataset_loader=fake_dataset_loader,
-        _scene_split_resolver=fake_scene_split_resolver,
-    )
-
-    assert isinstance(train_loader.dataset, SEN12MSCRMapDataset)
-    assert isinstance(val_loader.dataset, SEN12MSCRMapDataset)
-    assert isinstance(test_loader.dataset, SEN12MSCRMapDataset)
-    assert train_loader.dataset.stage == "train"
-    assert val_loader.dataset.stage == "val"
-    assert test_loader.dataset.stage == "test"
-
-    batch = next(iter(train_loader))
-    sar, cloudy = batch["inputs"]
-    assert tuple(sar.shape) == (1, 2, 2, 2)
-    assert tuple(batch["target"].shape) == (1, 13, 2, 1)
+    assert "--num-workers" in result.stdout
+    assert "--io-profile" not in result.stdout

@@ -23,6 +23,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from torch import nn
+from torch.utils.data import RandomSampler
 
 Scalar = float | int | torch.Tensor
 MetricLike = Callable[[Any, Any], Scalar]
@@ -121,16 +122,16 @@ def _loader_batch_size(dataloader: Any) -> int | None:
 
 
 def _resolve_progress_total(dataloader: Any, max_samples: int | None) -> int | None:
-    # tqdm는 batch 진행률을 보여준다. sample cap이 있더라도 batch total을 안전하게 추정할 때만 채운다.
+    # batch 진행률을 보여준다. streaming loader도 max_samples가 있으면 batch total을 추정한다.
     loader_length = _loader_length(dataloader)
-    if loader_length is None:
-        return None
     if max_samples is None:
         return loader_length
     batch_size = _loader_batch_size(dataloader)
     if batch_size is None:
-        return None
+        return loader_length
     capped_batches = (max_samples + batch_size - 1) // batch_size
+    if loader_length is None:
+        return capped_batches
     return min(loader_length, capped_batches)
 
 
@@ -159,7 +160,7 @@ class _StageProgress:
 def _determinate_progress_columns() -> tuple[Any, ...]:
     return (
         TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
+        BarColumn(bar_width=None),
         MofNCompleteColumn(),
         TextColumn("batch"),
         TimeElapsedColumn(),
@@ -228,6 +229,28 @@ def _slice_batch(batch: Any, limit: int) -> Any:
     return _slice_batch_value(batch, limit, batch_size=batch_size)
 
 
+def _close_dataloader_iterator(iterator: Any) -> None:
+    num_workers = getattr(iterator, "_num_workers", 0)
+    persistent_workers = bool(getattr(iterator, "_persistent_workers", False))
+
+    if not num_workers:
+        dataset_fetcher = getattr(iterator, "_dataset_fetcher", None)
+        dataset_iter = getattr(dataset_fetcher, "dataset_iter", None)
+        close = getattr(dataset_iter, "close", None)
+        if callable(close):
+            close()
+        return
+
+    # Persistent worker pools are reused across epochs. Force-closing their
+    # queues here breaks the next iter(dataloader) call.
+    if persistent_workers:
+        return
+
+    shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown_workers):
+        shutdown_workers()
+
+
 def _stage_samples(dataloader: Any, max_samples: int | None) -> Iterator[Any]:
     iterator = iter(dataloader)
     remaining_samples = max_samples
@@ -250,6 +273,7 @@ def _stage_samples(dataloader: Any, max_samples: int | None) -> Iterator[Any]:
         return
     finally:
         # max_samples로 조기 종료 시 prefetch된 미소비 배치와 worker 상태를 즉시 정리한다.
+        _close_dataloader_iterator(iterator)
         del iterator
 
 
@@ -346,6 +370,20 @@ def _set_loader_epoch(loader: Any, epoch: int) -> None:
     if dataset is not None and hasattr(dataset, "set_epoch"):
         # train dataset은 epoch별 shuffle 상태를 dataset 내부에서 관리한다.
         dataset.set_epoch(epoch)
+
+    sampler = getattr(loader, "sampler", None)
+    generator = getattr(loader, "generator", None)
+    if not isinstance(sampler, RandomSampler) or generator is None:
+        return
+
+    base_seed = getattr(loader, "_cr_base_seed", None)
+    if base_seed is None:
+        initial_seed = getattr(generator, "initial_seed", None)
+        if not callable(initial_seed):
+            return
+        base_seed = int(initial_seed())
+        setattr(loader, "_cr_base_seed", base_seed)
+    generator.manual_seed(base_seed + epoch)
 
 
 def _extract_inputs_target(batch: Mapping[str, Any]) -> tuple[Any, Any]:
@@ -488,7 +526,10 @@ class Trainer:
                 )
                 progress.update(1)
             progress.refresh()
-            _ensure_progress_invariant(stage, progress_total, batch_count)
+            # sized loader의 total은 정확하므로 불일치 시 오류를 낸다.
+            # streaming loader의 total은 max_samples 기반 추정치이므로 검사하지 않는다.
+            if _loader_length(dataloader) is not None:
+                _ensure_progress_invariant(stage, progress_total, batch_count)
         finally:
             progress.refresh()
             progress.close()

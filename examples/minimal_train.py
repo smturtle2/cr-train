@@ -10,7 +10,13 @@ from rich.console import Console
 from rich.table import Table
 from torch import nn
 
-from cr_train import MAE, Trainer, TrainerConfig, build_sen12mscr_loaders
+from cr_train import (
+    MAE,
+    Trainer,
+    TrainerConfig,
+    build_sen12mscr_loaders,
+    hf_token_status,
+)
 
 
 class TinyCloudRemovalNet(nn.Module):
@@ -64,6 +70,25 @@ def _print_summary(
     console.print(_metrics_table(rows))
 
 
+def _print_hf_auth_status(console: Console) -> None:
+    status = hf_token_status()
+    if status.source == "env":
+        source = "HF_TOKEN environment variable"
+    elif status.source == "cached":
+        source = "cached Hugging Face login"
+    else:
+        source = "anonymous access"
+
+    if status.applied_to_hf:
+        console.print(
+            f"[bold green]HF auth[/bold green]: {source}; token will be passed to HF datasets."
+        )
+        return
+    console.print(
+        f"[bold yellow]HF auth[/bold yellow]: {source}; HF datasets will run without a token."
+    )
+
+
 def _parse_num_workers(value: str) -> int | None:
     if value == "auto":
         return None
@@ -81,7 +106,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--train-max-samples", type=int, default=400)
     parser.add_argument("--val-max-samples", type=int, default=80)
-    parser.add_argument("--test-max-samples", type=int, default=40)
+    parser.add_argument("--test-max-samples", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--split", choices=("official", "seeded_scene"), default="official")
@@ -99,9 +124,11 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument("--io-profile", choices=("smooth", "conservative"), default="smooth")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("artifacts/checkpoints"))
     args: Any = parser.parse_args()
+    console = Console()
+
+    _print_hf_auth_status(console)
 
     # 로컬 모듈 사용 예제 기준점이 되도록 loader 옵션을 CLI에서 바로 조절할 수 있게 둔다.
     train_loader, val_loader, test_loader = build_sen12mscr_loaders(
@@ -109,16 +136,13 @@ def main() -> None:
         streaming=not args.no_streaming,
         seed=args.seed,
         split=args.split,
-        shuffle_buffer_size=64,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
         timeout=args.timeout,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
-        io_profile=args.io_profile,
     )
 
-    console = Console()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TinyCloudRemovalNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)

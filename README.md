@@ -22,7 +22,7 @@ uv add git+https://github.com/smturtle2/cr-train.git
 pip install git+https://github.com/smturtle2/cr-train.git
 ```
 
-> Hugging Face rate limits apply. Set `export HF_TOKEN=your_token` for higher throughput.
+> Hugging Face rate limits apply. Set `export HF_TOKEN=your_token` for higher throughput. You can verify auth at runtime with `from cr_train import hf_token_status`.
 
 ## Quick Start
 
@@ -155,14 +155,12 @@ Returns `(train_loader, val_loader, test_loader)`. Only train is shuffled; val/t
 | `streaming` | `bool` | `True` | `True` streams from HF Hub; `False` downloads the full dataset first |
 | `seed` | `int` | `0` | Seed for shuffle order and worker init |
 | `split` | `str` | `"official"` | `"official"` (author splits: 155/10/10 scenes) or `"seeded_scene"` (80/10/10 stratified by season) |
-| `shuffle_buffer_size` | `int` | `64` | In-memory sample shuffle buffer for training |
-| `num_workers` | `int \| None` | `None` | Auto: train gets `min(2, cpu_count//6)` workers, val/test get 0 |
+| `shuffle_buffer_size` | `int` | `16` | In-memory sample shuffle buffer for training |
+| `num_workers` | `int \| None` | `None` | Auto: train gets `max(1, cpu_count//4)` workers, limited by known streaming dataset shards; streaming val/test get 1 worker, map-style val/test get 0 |
 | `pin_memory` | `bool` | `False` | Pin tensors for faster GPU transfer |
 | `timeout` | `float` | `0.0` | Worker batch wait timeout in seconds; only applied to stages with `num_workers > 0` |
 | `prefetch_factor` | `int \| None` | `None` | Auto `2` when workers > 0 |
-| `persistent_workers` | `bool \| None` | `None` | Auto `True` when workers > 0 |
-| `io_profile` | `str` | `"smooth"` | `"smooth"` (throughput-first readahead) or `"conservative"` (fully synchronous) |
-| `cache_options` | `CacheOptions \| None` | `None` | Optional pyarrow range-cache override; when omitted, `"smooth"` installs the default cache preset |
+| `persistent_workers` | `bool \| None` | `None` | Auto `False`; enable only when you explicitly want worker reuse across epochs |
 
 ### `TrainerConfig`
 
@@ -249,10 +247,8 @@ The **official split** comes from the [authors' supplementary material](https://
 cr-train/
 ├── src/cr_train/
 │   ├── __init__.py         # public API
-│   ├── _parquet_streaming.py  # parquet loading (streaming and map-style)
 │   ├── trainer.py          # training loop, checkpointing, progress
 │   ├── data.py             # dataset (streaming + map-style), scene splits, preprocessing
-│   └── runtime.py          # parquet I/O tuning
 ├── examples/
 │   ├── minimal_train.py    # full CLI training script
 │   └── colab_quickstart.ipynb

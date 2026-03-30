@@ -4,28 +4,21 @@ from __future__ import annotations
 
 import csv
 import hashlib
-import multiprocessing as mp
 import os
 import random
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.resources import files
 from typing import Any, Literal, TypedDict, cast
 
 import numpy as np
-import pyarrow as pa
 import torch
 from datasets import Dataset as HFDataset
 from datasets import IterableDataset as HFIterableDataset
-from torch.utils.data import DataLoader, Dataset, IterableDataset
-
-from ._parquet_streaming import (
-    default_cache_options,
-    load_parquet_dataset,
-    load_streaming_parquet_dataset,
-)
-from .runtime import IOProfile, VALID_IO_PROFILES
+from datasets import load_dataset
+from huggingface_hub import get_token
+from torch.utils.data import DataLoader, IterableDataset, default_collate
 
 Stage = Literal["train", "val", "test"]
 SplitStrategy = Literal["official", "seeded_scene"]
@@ -35,19 +28,28 @@ STAGE_ORDER: tuple[Stage, Stage, Stage] = ("train", "val", "test")
 DEFAULT_DATASET_NAME = "Hermanni/sen12mscr"
 DEFAULT_DATASET_REVISION = "e2facda8700dd26cb4cbd5c5d9c82d15f10c38c6"
 DEFAULT_SPLIT = "official"
-DEFAULT_IO_PROFILE: IOProfile = "smooth"
 VALID_SPLIT_STRATEGIES: frozenset[SplitStrategy] = frozenset(("official", "seeded_scene"))
-DEFAULT_SHUFFLE_BUFFER_SIZE = 64
+DEFAULT_SHUFFLE_BUFFER_SIZE = 8
 DEFAULT_SEEDED_SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 DEFAULT_AUTO_PREFETCH_FACTOR = 2
-MAX_AUTO_TRAIN_WORKERS = 2
 MIN_AUTO_TRAIN_WORKERS = 1
+AUTO_TRAIN_WORKER_DIVISOR = 4
 OPTICAL_MIN = 0.0
 OPTICAL_MAX = 10000.0
 SAR_DB_MIN = -25.0
 SAR_DB_MAX = 0.0
 SAR_DTYPE = np.dtype("float32")
 OPTICAL_DTYPE = np.dtype("int16")
+PARQUET_COLUMNS = (
+    "sar",
+    "cloudy",
+    "target",
+    "sar_shape",
+    "opt_shape",
+    "season",
+    "scene",
+    "patch",
+)
 
 
 class SampleMetadata(TypedDict):
@@ -67,8 +69,53 @@ class SEN12MSCRSample(TypedDict):
     metadata: SampleMetadata
 
 
-DatasetLoader = Callable[[Sequence[str], Stage], HFIterableDataset | HFDataset]
+class SampleBatchMetadata(TypedDict):
+    """Batch metadata after DataLoader collation."""
+
+    season: list[str]
+    scene: list[str]
+    patch: list[str]
+    source_shard: list[str]
+
+
+class SEN12MSCRBatch(TypedDict):
+    """Standard batched sample schema consumed by the trainer."""
+
+    inputs: tuple[torch.Tensor, torch.Tensor]
+    target: torch.Tensor
+    metadata: SampleBatchMetadata
+
+
+DatasetLoader = Callable[[Sequence[str], Stage], Any]
 SceneSplitResolver = Callable[[SplitStrategy, int], Mapping[Stage, Sequence["SceneShard"]]]
+
+
+@dataclass(frozen=True)
+class HFTokenStatus:
+    configured: bool
+    source: Literal["env", "cached", "none"]
+    applied_to_hf: bool
+
+
+def _resolve_hf_token() -> str | None:
+    return get_token()
+
+
+def hf_token_status() -> HFTokenStatus:
+    """Return how Hugging Face authentication is configured for dataset access."""
+
+    env_token = os.environ.get("HF_TOKEN", "").strip()
+    if env_token:
+        return HFTokenStatus(configured=True, source="env", applied_to_hf=True)
+    if _resolve_hf_token() is not None:
+        return HFTokenStatus(configured=True, source="cached", applied_to_hf=True)
+    return HFTokenStatus(configured=False, source="none", applied_to_hf=False)
+
+
+def hf_token_configured() -> bool:
+    """Return whether Hugging Face authentication is configured."""
+
+    return hf_token_status().configured
 
 
 @dataclass(frozen=True, order=True)
@@ -107,8 +154,6 @@ class _LoaderOptions:
     timeout: float = 0.0
     prefetch_factor: int | None = None
     persistent_workers: bool | None = None
-    io_profile: IOProfile = DEFAULT_IO_PROFILE
-    cache_options: pa.CacheOptions | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -119,15 +164,12 @@ class _LoaderOptions:
             )
         if self.shuffle_buffer_size <= 0:
             raise ValueError("shuffle_buffer_size must be positive")
-        if self.io_profile not in VALID_IO_PROFILES:
-            raise ValueError(f"io_profile must be one of {sorted(VALID_IO_PROFILES)!r}")
         if self.num_workers is not None and self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
         if self.timeout < 0:
             raise ValueError("timeout must be non-negative")
         if self.prefetch_factor is not None and self.prefetch_factor <= 0:
             raise ValueError("prefetch_factor must be positive when provided")
-        # worker 프로세스가 없으면 prefetch/persistent worker 옵션도 의미가 없다.
         if self.num_workers == 0:
             if self.timeout > 0:
                 raise ValueError("timeout requires num_workers > 0")
@@ -197,11 +239,7 @@ def _allocate_counts(total: int) -> dict[Stage, int]:
     def remainder_rank(stage: Stage) -> tuple[float, int]:
         return raw[stage] - counts[stage], -STAGE_ORDER.index(stage)
 
-    ranked = sorted(
-        STAGE_ORDER,
-        key=remainder_rank,
-        reverse=True,
-    )
+    ranked = sorted(STAGE_ORDER, key=remainder_rank, reverse=True)
     for stage in ranked[:remainder]:
         counts[stage] += 1
     return counts
@@ -220,7 +258,6 @@ def seeded_scene_splits(
     """Create deterministic custom splits with fixed season-stratified 80/10/10 ratios."""
 
     catalog = tuple(scene_catalog) if scene_catalog is not None else _all_scene_shards()
-    # season별 비율을 유지한 채 seed만 바꿔도 항상 같은 split이 나오게 한다.
     by_season: dict[str, list[SceneShard]] = {season: [] for season in SEASON_ORDER}
     for shard in catalog:
         by_season[shard.season].append(shard)
@@ -311,17 +348,38 @@ def _seed_worker(worker_id: int) -> None:
     np.random.seed(worker_seed)
 
 
-def _auto_train_worker_budget() -> int:
-    cpu_count = os.cpu_count() or (MIN_AUTO_TRAIN_WORKERS * 6)
-    return min(MAX_AUTO_TRAIN_WORKERS, max(MIN_AUTO_TRAIN_WORKERS, cpu_count // 6))
+def _dataset_num_shards(dataset: Any) -> int | None:
+    source = getattr(dataset, "source", dataset)
+    num_shards = getattr(source, "num_shards", None)
+    if isinstance(num_shards, int) and num_shards > 0:
+        return num_shards
+    return None
 
 
-def _resolve_stage_num_workers(stage: Stage, options: _LoaderOptions) -> int:
+def _auto_train_worker_budget(dataset: Any) -> int:
+    cpu_count = os.cpu_count() or (MIN_AUTO_TRAIN_WORKERS * AUTO_TRAIN_WORKER_DIVISOR)
+    budget = max(MIN_AUTO_TRAIN_WORKERS, cpu_count // AUTO_TRAIN_WORKER_DIVISOR)
+    dataset_num_shards = _dataset_num_shards(dataset)
+    if dataset_num_shards is not None:
+        budget = min(budget, dataset_num_shards)
+    return budget
+
+
+def _auto_eval_worker_budget(dataset: Any, *, streaming: bool) -> int:
+    if not streaming:
+        return 0
+    dataset_num_shards = _dataset_num_shards(dataset)
+    if dataset_num_shards is not None:
+        return min(1, dataset_num_shards)
+    return 1
+
+
+def _resolve_stage_num_workers(stage: Stage, options: _LoaderOptions, dataset: Any) -> int:
     if options.num_workers is not None:
         return options.num_workers
-    if stage != "train":
-        return 0
-    return _auto_train_worker_budget()
+    if stage == "train":
+        return _auto_train_worker_budget(dataset)
+    return _auto_eval_worker_budget(dataset, streaming=options.streaming)
 
 
 def _resolve_stage_prefetch_factor(num_workers: int, options: _LoaderOptions) -> int | None:
@@ -346,109 +404,166 @@ def _resolve_stage_timeout(num_workers: int, options: _LoaderOptions) -> float:
     return float(options.timeout)
 
 
-def _default_dataset_loader(
-    urls: Sequence[str],
-    _: Stage,
+def _expected_tensor_shape(
+    rows: Sequence[Mapping[str, Any]],
     *,
-    io_profile: IOProfile = DEFAULT_IO_PROFILE,
-    cache_options: pa.CacheOptions | None = None,
-) -> HFIterableDataset:
-    resolved_cache_options = cache_options
-    if resolved_cache_options is None:
-        resolved_cache_options = default_cache_options(io_profile)
-    return load_streaming_parquet_dataset(
-        urls,
-        io_profile=io_profile,
-        cache_options=resolved_cache_options,
+    shape_key: str,
+) -> tuple[int, ...]:
+    shape = tuple(int(dim) for dim in rows[0][shape_key])
+    for row in rows[1:]:
+        candidate = tuple(int(dim) for dim in row[shape_key])
+        if candidate != shape:
+            raise ValueError(f"inconsistent {shape_key} values within a batch: {shape!r} != {candidate!r}")
+    return shape
+
+
+def _decode_tensor_batch(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    blob_key: str,
+    shape_key: str,
+    dtype: np.dtype[Any],
+) -> torch.Tensor:
+    shape = _expected_tensor_shape(rows, shape_key=shape_key)
+    output_shape = (shape[-1], *shape[:-1]) if len(shape) == 3 else shape
+    batch = np.empty((len(rows), *output_shape), dtype=dtype)
+    for index, row in enumerate(rows):
+        array = np.frombuffer(row[blob_key], dtype=dtype).reshape(shape)
+        if array.ndim == 3:
+            array = np.moveaxis(array, -1, 0)
+        batch[index] = array
+    return torch.from_numpy(batch)
+
+
+def _decode_batch(rows: Sequence[Mapping[str, Any]]) -> SEN12MSCRBatch:
+    sar = _preprocess_sar(
+        _decode_tensor_batch(rows, blob_key="sar", shape_key="sar_shape", dtype=SAR_DTYPE)
     )
+    cloudy = _preprocess_optical(
+        _decode_tensor_batch(rows, blob_key="cloudy", shape_key="opt_shape", dtype=OPTICAL_DTYPE)
+    )
+    target = _preprocess_optical(
+        _decode_tensor_batch(rows, blob_key="target", shape_key="opt_shape", dtype=OPTICAL_DTYPE)
+    )
+    metadata: SampleBatchMetadata = {
+        "season": [str(row["season"]) for row in rows],
+        "scene": [str(row["scene"]) for row in rows],
+        "patch": [str(row["patch"]) for row in rows],
+        "source_shard": [
+            f"{row['season']}/scene_{row['scene']}.parquet"
+            for row in rows
+        ],
+    }
+    return {
+        "inputs": (sar, cloudy),
+        "target": target,
+        "metadata": metadata,
+    }
 
 
-class SEN12MSCRStreamingDataset(IterableDataset[SEN12MSCRSample]):
-    """Iterable dataset that decodes and preprocesses SEN12MS-CR rows on the fly."""
+def _collate_sen12mscr_rows(rows: Sequence[Any]) -> Any:
+    if not rows:
+        raise ValueError("received an empty batch from DataLoader")
+    first = rows[0]
+    if not isinstance(first, Mapping):
+        return default_collate(rows)
+    if "inputs" in first and "target" in first:
+        return default_collate(rows)
+    return _decode_batch(cast(Sequence[Mapping[str, Any]], rows))
+
+
+class _StreamingSourceAdapter(IterableDataset[Any]):
+    """Wrap plain iterables so PyTorch treats streaming custom loaders correctly."""
+
+    def __init__(self, source: Any) -> None:
+        super().__init__()
+        self.source = source
+
+    @property
+    def num_shards(self) -> int | None:
+        value = getattr(self.source, "num_shards", None)
+        return value if isinstance(value, int) else None
+
+    def set_epoch(self, epoch: int) -> None:
+        if hasattr(self.source, "set_epoch"):
+            self.source.set_epoch(epoch)
+
+    def __iter__(self):
+        iterator = iter(self.source)
+        try:
+            yield from iterator
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+
+
+class _HFStreamingDataset(IterableDataset[Any]):
+    """Recreate the official HF streaming dataset for each iteration/epoch."""
 
     def __init__(
         self,
-        source: Any,
         *,
+        urls: Sequence[str],
         stage: Stage,
         seed: int,
         shuffle_buffer_size: int,
-        epoch: int = 0,
     ) -> None:
         super().__init__()
-        self.source = source
-        self.stage = stage
-        self.seed = seed
-        self.shuffle_buffer_size = shuffle_buffer_size
-        self._shared_epoch = mp.Value("q", epoch)
+        self._urls = tuple(urls)
+        self._stage = stage
+        self._seed = seed
+        self._shuffle_buffer_size = shuffle_buffer_size
+        self._epoch = 0
 
     @property
-    def epoch(self) -> int:
-        with self._shared_epoch.get_lock():
-            return int(self._shared_epoch.value)
+    def num_shards(self) -> int:
+        return len(self._urls)
 
     def set_epoch(self, epoch: int) -> None:
-        with self._shared_epoch.get_lock():
-            self._shared_epoch.value = epoch
+        self._epoch = epoch
 
-    def _iter_rows(self) -> Iterator[Mapping[str, Any]]:
-        for row in self.source:
-            yield cast(Mapping[str, Any], row)
-
-    def _iter_train_rows(self, epoch: int) -> Iterator[Mapping[str, Any]]:
-        rng = random.Random(self.seed + epoch)
-        buffer: list[Mapping[str, Any]] = []
-        for row in self._iter_rows():
-            if len(buffer) == self.shuffle_buffer_size:
-                index = rng.randrange(self.shuffle_buffer_size)
-                yield buffer[index]
-                buffer[index] = row
-            else:
-                buffer.append(row)
-        rng.shuffle(buffer)
-        yield from buffer
-
-    def __iter__(self) -> Iterator[SEN12MSCRSample]:
-        current_epoch = self.epoch
-        rows = (
-            self._iter_train_rows(current_epoch)
-            if self.stage == "train"
-            else self._iter_rows()
+    def _build_source(self) -> HFIterableDataset:
+        source = cast(
+            HFIterableDataset,
+            _load_parquet_source(
+                self._urls,
+                streaming=True,
+            ),
         )
-        for row in rows:
-            yield decode_sample(row)
+        if self._stage == "train":
+            source = source.shuffle(seed=self._seed, buffer_size=self._shuffle_buffer_size)
+            source.set_epoch(self._epoch)
+        return source
+
+    def __iter__(self):
+        iterator = iter(self._build_source())
+        try:
+            yield from iterator
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
 
 
-class SEN12MSCRMapDataset(Dataset[SEN12MSCRSample]):
-    """Map-style dataset for non-streaming mode with random-access decoding."""
-
-    def __init__(self, source: Any, *, stage: Stage) -> None:
-        super().__init__()
-        self.source = source
-        self.stage = stage
-
-    def __len__(self) -> int:
-        return len(self.source)
-
-    def __getitem__(self, index: int) -> SEN12MSCRSample:
-        return decode_sample(self.source[index])
-
-    def set_epoch(self, epoch: int) -> None:
-        # shuffle은 DataLoader sampler가 처리하므로 no-op.
-        pass
+def _load_parquet_source(
+    urls: Sequence[str],
+    *,
+    streaming: bool,
+) -> HFIterableDataset | HFDataset:
+    token = _resolve_hf_token()
+    return load_dataset(
+        "parquet",
+        data_files={"train": list(urls)},
+        split="train",
+        streaming=streaming,
+        columns=list(PARQUET_COLUMNS),
+        token=token,
+    )
 
 
 def _stage_urls(stage: Stage, splits: Mapping[Stage, Sequence[SceneShard]]) -> list[str]:
     return [shard.resolve_url() for shard in splits[stage]]
-
-
-def _default_map_dataset_loader(
-    urls: Sequence[str],
-    _: Stage,
-    *,
-    io_profile: IOProfile = DEFAULT_IO_PROFILE,
-) -> HFDataset:
-    return load_parquet_dataset(urls, io_profile=io_profile)
 
 
 def _build_stage_dataset(
@@ -457,32 +572,24 @@ def _build_stage_dataset(
     *,
     splits: Mapping[Stage, Sequence[SceneShard]],
     dataset_loader: DatasetLoader | None,
-) -> SEN12MSCRStreamingDataset | SEN12MSCRMapDataset:
+) -> Any:
     urls = _stage_urls(stage, splits)
-    if dataset_loader is not None:
-        source = dataset_loader(urls, stage)
-    elif options.streaming:
-        source = _default_dataset_loader(
-            urls,
-            stage,
-            io_profile=options.io_profile,
-            cache_options=options.cache_options,
-        )
-    else:
-        source = _default_map_dataset_loader(
-            urls,
-            stage,
-            io_profile=options.io_profile,
-        )
-
     if options.streaming:
-        return SEN12MSCRStreamingDataset(
-            source,
-            stage=stage,
-            seed=options.seed,
-            shuffle_buffer_size=options.shuffle_buffer_size,
-        )
-    return SEN12MSCRMapDataset(source, stage=stage)
+        if dataset_loader is None:
+            return _HFStreamingDataset(
+                urls=urls,
+                stage=stage,
+                seed=options.seed,
+                shuffle_buffer_size=options.shuffle_buffer_size,
+            )
+        source = dataset_loader(urls, stage)
+        if not isinstance(source, _StreamingSourceAdapter):
+            source = _StreamingSourceAdapter(source)
+        return source
+    return _load_parquet_source(
+        urls,
+        streaming=False,
+    )
 
 
 def _build_stage_dataloader(
@@ -498,10 +605,9 @@ def _build_stage_dataloader(
         splits=splits,
         dataset_loader=dataset_loader,
     )
-    # torch worker seed도 dataloader마다 고정해 streaming 순서를 재현 가능하게 맞춘다.
     generator = torch.Generator()
     generator.manual_seed(options.seed)
-    num_workers = _resolve_stage_num_workers(stage, options)
+    num_workers = _resolve_stage_num_workers(stage, options, dataset)
     dataloader_kwargs: dict[str, Any] = {
         "dataset": dataset,
         "batch_size": options.batch_size,
@@ -510,9 +616,9 @@ def _build_stage_dataloader(
         "timeout": _resolve_stage_timeout(num_workers, options),
         "worker_init_fn": _seed_worker,
         "generator": generator,
+        "collate_fn": _collate_sen12mscr_rows,
     }
     if not options.streaming:
-        # map-style dataset은 DataLoader sampler로 shuffle한다.
         dataloader_kwargs["shuffle"] = stage == "train"
     resolved_prefetch_factor = _resolve_stage_prefetch_factor(num_workers, options)
     resolved_persistent_workers = _resolve_stage_persistent_workers(num_workers, options)
@@ -521,9 +627,7 @@ def _build_stage_dataloader(
             dataloader_kwargs["persistent_workers"] = resolved_persistent_workers
         if resolved_prefetch_factor is not None:
             dataloader_kwargs["prefetch_factor"] = resolved_prefetch_factor
-    return DataLoader(
-        **dataloader_kwargs,
-    )
+    return DataLoader(**dataloader_kwargs)
 
 
 def build_sen12mscr_loaders(
@@ -538,19 +642,10 @@ def build_sen12mscr_loaders(
     timeout: float = 0.0,
     prefetch_factor: int | None = None,
     persistent_workers: bool | None = None,
-    io_profile: IOProfile = DEFAULT_IO_PROFILE,
-    cache_options: pa.CacheOptions | None = None,
     _dataset_loader: DatasetLoader | None = None,
     _scene_split_resolver: SceneSplitResolver | None = None,
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
-    """Build `(train_loader, val_loader, test_loader)` for SEN12MS-CR training.
-
-    When ``streaming=True`` (default), data is streamed from the Hugging Face Hub without
-    downloading to disk.  When ``streaming=False``, the full dataset is downloaded first and
-    a map-style dataset with random access is used.
-
-    The underscored keyword arguments are reserved for tests and internal integration hooks.
-    """
+    """Build `(train_loader, val_loader, test_loader)` for SEN12MS-CR training."""
 
     options = _LoaderOptions(
         batch_size=batch_size,
@@ -563,8 +658,6 @@ def build_sen12mscr_loaders(
         timeout=timeout,
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
-        io_profile=io_profile,
-        cache_options=cache_options,
     )
     splits = _resolve_scene_splits(options.split, options.seed, _scene_split_resolver)
     loaders = tuple(

@@ -73,6 +73,17 @@ class _ToyModel(nn.Module):
         return self.linear(x)
 
 
+class _RecordingModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(1))
+        self.seen_inputs: list[float] = []
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.seen_inputs.extend(float(value) for value in x.detach().cpu().reshape(-1).tolist())
+        return x * self.scale
+
+
 class _DictInputModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -516,6 +527,156 @@ def test_stage_samples_allows_clean_subprocess_exit_after_early_stop(
     assert result.stdout.strip() == "1"
 
 
+def test_stage_samples_can_reuse_persistent_workers_across_epochs() -> None:
+    script = textwrap.dedent(
+        """
+        import sys
+
+        import numpy as np
+
+        from cr_train import build_sen12mscr_loaders
+        from cr_train.data import SceneShard
+        from cr_train.trainer import _stage_samples
+
+
+        def sample_row():
+            sar = np.zeros((2, 2, 2), dtype=np.float32)
+            optical = np.zeros((2, 1, 13), dtype=np.int16)
+            return {
+                "sar": sar.tobytes(),
+                "cloudy": optical.tobytes(),
+                "target": optical.tobytes(),
+                "sar_shape": list(sar.shape),
+                "opt_shape": list(optical.shape),
+                "season": "spring",
+                "scene": "1",
+                "patch": "p0",
+            }
+
+
+        class FakeIterable:
+            def __init__(self) -> None:
+                self.rows = [sample_row() for _ in range(4)]
+
+            def __iter__(self):
+                yield from self.rows
+
+
+        def fake_dataset_loader(urls, stage):
+            _ = (urls, stage)
+            return FakeIterable()
+
+
+        def fake_scene_split_resolver(split, seed):
+            _ = (split, seed)
+            return {
+                "train": (SceneShard("spring", "1"),),
+                "val": (SceneShard("spring", "2"),),
+                "test": (SceneShard("spring", "3"),),
+            }
+
+
+        train_loader, _, _ = build_sen12mscr_loaders(
+            batch_size=1,
+            num_workers=1,
+            persistent_workers=True,
+            timeout=1.0,
+            _dataset_loader=fake_dataset_loader,
+            _scene_split_resolver=fake_scene_split_resolver,
+        )
+        first = list(_stage_samples(train_loader, 1))
+        second = list(_stage_samples(train_loader, 1))
+        print(first[0]["metadata"]["scene"][0], second[0]["metadata"]["scene"][0])
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1 1"
+
+
+def test_trainer_progress_shows_determinate_bar_for_streaming_with_max_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[dict[str, object]] = []
+
+    class _FakeProgress:
+        def __init__(self) -> None:
+            self.descriptions: list[tuple[str, bool]] = []
+            self.updates: list[int] = []
+            self.refresh_count = 0
+
+        def update(self, value: int) -> None:
+            self.updates.append(value)
+
+        def set_description_str(self, value: str, refresh: bool = True) -> None:
+            self.descriptions.append((value, refresh))
+
+        def refresh(self) -> None:
+            self.refresh_count += 1
+
+        def close(self) -> None:
+            return None
+
+    def fake_create_progress(
+        *, desc: str, total: int | None, disable: bool, leave: bool
+    ) -> _FakeProgress:
+        progress = _FakeProgress()
+        created.append({"desc": desc, "total": total})
+        return progress
+
+    monkeypatch.setattr(trainer_mod, "_create_progress", fake_create_progress)
+    monkeypatch.setattr("builtins.print", lambda *args, **kwargs: None)
+
+    train_dataset = _ToyStream(_make_rows([0.0, 1.0, 2.0, 3.0, 4.0]))
+    model = _ToyModel().to(torch.device("cpu"))
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=1, train_max_samples=3),
+        train_loader=DataLoader(train_dataset, batch_size=2),
+    )
+
+    list(trainer.step())
+
+    # ceil(3/2) = 2 batches expected
+    assert created[0]["total"] == 2
+
+
+def test_trainer_streaming_with_fewer_samples_than_max_does_not_raise() -> None:
+    train_dataset = _ToyStream(_make_rows([0.0, 1.0]))
+    model = _ToyModel().to(torch.device("cpu"))
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=1, train_max_samples=10, show_progress=False),
+        train_loader=DataLoader(train_dataset, batch_size=1),
+    )
+
+    history = list(trainer.step())
+    assert len(history) == 1
+
+
+def test_resolve_progress_total_returns_estimated_batches_for_unsized_with_max_samples() -> None:
+    class _UnsizedLoader:
+        batch_size = 4
+
+    assert trainer_mod._resolve_progress_total(_UnsizedLoader(), max_samples=10) == 3
+    assert trainer_mod._resolve_progress_total(_UnsizedLoader(), max_samples=8) == 2
+    assert trainer_mod._resolve_progress_total(_UnsizedLoader(), max_samples=None) is None
+
+
 def test_trainer_raises_when_sized_stage_ends_before_progress_total() -> None:
     model = _ToyModel().to(torch.device("cpu"))
     trainer = Trainer(
@@ -590,6 +751,55 @@ def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
 
     assert restored.state.epoch == 1
     assert restored.state.global_step == 1
+
+
+def test_trainer_checkpoint_restore_preserves_shuffled_epoch_order(tmp_path: Path) -> None:
+    def make_loader() -> DataLoader[dict[str, object]]:
+        generator = torch.Generator()
+        generator.manual_seed(17)
+        return DataLoader(
+            _ToyDataset(_make_rows([0.0, 1.0, 2.0, 3.0])),
+            batch_size=1,
+            shuffle=True,
+            generator=generator,
+        )
+
+    uninterrupted_model = _RecordingModel().to(torch.device("cpu"))
+    uninterrupted = Trainer(
+        model=uninterrupted_model,
+        optimizer=torch.optim.SGD(uninterrupted_model.parameters(), lr=0.0),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=2, show_progress=False),
+        train_loader=make_loader(),
+    )
+    list(uninterrupted.step())
+    expected_second_epoch_order = uninterrupted_model.seen_inputs[4:]
+
+    first_model = _RecordingModel().to(torch.device("cpu"))
+    first = Trainer(
+        model=first_model,
+        optimizer=torch.optim.SGD(first_model.parameters(), lr=0.0),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=1, checkpoint_dir=tmp_path, show_progress=False),
+        train_loader=make_loader(),
+    )
+    list(first.step())
+
+    restored_model = _RecordingModel().to(torch.device("cpu"))
+    restored = Trainer(
+        model=restored_model,
+        optimizer=torch.optim.SGD(restored_model.parameters(), lr=0.0),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=2, checkpoint_dir=tmp_path, show_progress=False),
+        train_loader=make_loader(),
+    )
+    restored.load_checkpoint(tmp_path / "last.pt")
+    list(restored.step())
+
+    assert restored_model.seen_inputs == expected_second_epoch_order
 
 
 def test_trainer_rejects_optimizer_from_other_model() -> None:
