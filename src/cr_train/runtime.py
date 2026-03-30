@@ -57,6 +57,16 @@ def _patch_datasets_parquet_reader(io_profile: IOProfile) -> None:
     key_cls = parquet_mod.Key
     logger = parquet_mod.logger
     batch_readahead, fragment_readahead, use_threads = _scan_behavior(io_profile)
+    # generator finalization이 interpreter shutdown과 겹쳐도 module global lookup에 덜 의존하게 한다.
+    arrow_invalid = pa.ArrowInvalid
+    filters_to_expression = pq.filters_to_expression
+    parquet_file_format_cls = pa_ds.ParquetFileFormat
+    table_from_batches = pa.Table.from_batches
+    open_binary_file = fsspec.open
+    recoverable_errors = (arrow_invalid, ValueError)
+    log_error = logger.error
+    log_warning = logger.warning
+    log_debug = logger.debug
 
     def patched_generate_tables(self, files, row_groups_list):
         if self.config.features is not None and self.config.columns is not None:
@@ -68,17 +78,17 @@ def _patch_datasets_parquet_reader(io_profile: IOProfile) -> None:
                 )
 
         filter_expr = (
-            pq.filters_to_expression(self.config.filters)
+            filters_to_expression(self.config.filters)
             if isinstance(self.config.filters, list)
             else self.config.filters
         )
-        parquet_file_format = pa_ds.ParquetFileFormat(
+        parquet_file_format = parquet_file_format_cls(
             default_fragment_scan_options=self.config.fragment_scan_options
         )
 
         for file_idx, (file, row_groups) in enumerate(zip(files, row_groups_list)):
             try:
-                with fsspec.open(file, "rb").open() as handle:
+                with open_binary_file(file, "rb").open() as handle:
                     parquet_fragment = parquet_file_format.make_fragment(handle)
                     if row_groups is not None:
                         parquet_fragment = parquet_fragment.subset(row_group_ids=row_groups)
@@ -94,18 +104,20 @@ def _patch_datasets_parquet_reader(io_profile: IOProfile) -> None:
                             use_threads=use_threads,
                         )
                         for batch_idx, record_batch in enumerate(batches):
-                            table = pa.Table.from_batches([record_batch])
+                            table = table_from_batches([record_batch])
                             yield key_cls(file_idx, batch_idx), self._cast_table(table)
-            except (pa.ArrowInvalid, ValueError) as exc:
+            except Exception as exc:
+                if not isinstance(exc, recoverable_errors):
+                    raise
                 if self.config.on_bad_files == "error":
-                    logger.error(
+                    log_error(
                         f"Failed to read file '{file}' with error {type(exc).__name__}: {exc}"
                     )
                     raise
                 if self.config.on_bad_files == "warn":
-                    logger.warning(f"Skipping bad file '{file}'. {type(exc).__name__}: {exc}")
+                    log_warning(f"Skipping bad file '{file}'. {type(exc).__name__}: {exc}")
                 else:
-                    logger.debug(f"Skipping bad file '{file}'. {type(exc).__name__}: {exc}")
+                    log_debug(f"Skipping bad file '{file}'. {type(exc).__name__}: {exc}")
 
     parquet_cls._generate_tables = patched_generate_tables
     parquet_cls._cr_train_use_threads_patch = True

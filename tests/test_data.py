@@ -228,6 +228,8 @@ def test_loader_builder_rejects_invalid_settings() -> None:
     with pytest.raises(ValueError):
         build_sen12mscr_loaders(1, num_workers=-1)
     with pytest.raises(ValueError):
+        build_sen12mscr_loaders(1, num_workers=0, timeout=1)
+    with pytest.raises(ValueError):
         build_sen12mscr_loaders(1, num_workers=2, prefetch_factor=0)
     with pytest.raises(ValueError):
         build_sen12mscr_loaders(1, num_workers=0, prefetch_factor=2)
@@ -278,12 +280,57 @@ def test_loader_builder_auto_tunes_worker_defaults(monkeypatch: pytest.MonkeyPat
         assert kwargs["batch_size"] == 2
         assert kwargs["worker_init_fn"] is data_mod._seed_worker
         assert isinstance(kwargs["generator"], torch.Generator)
+        assert kwargs["timeout"] == 0.0
         if kwargs["num_workers"] > 0:
             assert kwargs["prefetch_factor"] == 2
-            assert kwargs["persistent_workers"] is True
+            assert kwargs["persistent_workers"] is False
         else:
             assert "prefetch_factor" not in kwargs
             assert "persistent_workers" not in kwargs
+
+
+def test_loader_builder_applies_timeout_only_to_stages_with_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[dict[str, object]] = []
+    datasets = {
+        "train": _FakeIterable([_sample_row()]),
+        "val": _FakeIterable([_sample_row(scene="2")]),
+        "test": _FakeIterable([_sample_row(scene="3")]),
+    }
+
+    class _FakeDataLoader:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(dict(kwargs))
+            self.dataset = kwargs["dataset"]
+            self.kwargs = kwargs
+
+        def __class_getitem__(cls, _: object) -> type["_FakeDataLoader"]:
+            return cls
+
+    def fake_dataset_loader(urls: list[str], stage: str) -> _FakeIterable:
+        _ = urls
+        return datasets[stage]
+
+    def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
+        _ = (split, seed)
+        return {
+            "train": (SceneShard("spring", "1"),),
+            "val": (SceneShard("spring", "2"),),
+            "test": (SceneShard("spring", "3"),),
+        }
+
+    monkeypatch.setattr(data_mod, "DataLoader", _FakeDataLoader)
+    monkeypatch.setattr(data_mod.os, "cpu_count", lambda: 12)
+
+    build_sen12mscr_loaders(
+        2,
+        timeout=3.5,
+        _dataset_loader=fake_dataset_loader,
+        _scene_split_resolver=fake_scene_split_resolver,
+    )
+
+    assert [kwargs["timeout"] for kwargs in created] == [3.5, 0.0, 0.0]
 
 
 def test_loader_builder_passes_prefetch_and_persistent_worker_options(
@@ -323,6 +370,7 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
         2,
         num_workers=2,
         pin_memory=True,
+        timeout=5.5,
         prefetch_factor=4,
         persistent_workers=True,
         _dataset_loader=fake_dataset_loader,
@@ -336,6 +384,7 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
         assert kwargs["pin_memory"] is True
         assert kwargs["worker_init_fn"] is data_mod._seed_worker
         assert isinstance(kwargs["generator"], torch.Generator)
+        assert kwargs["timeout"] == 5.5
         assert kwargs["prefetch_factor"] == 4
         assert kwargs["persistent_workers"] is True
 
@@ -439,7 +488,7 @@ def test_default_dataset_loader_bootstraps_runtime(monkeypatch: pytest.MonkeyPat
     ]
 
 
-def test_runtime_patch_allows_clean_subprocess_exit(tmp_path: Path) -> None:
+def test_runtime_patch_allows_clean_subprocess_exit_with_live_iterator(tmp_path: Path) -> None:
     parquet_path = tmp_path / "sample.parquet"
     table = pa.table({"value": [1]})
     pq.write_table(table, parquet_path)
@@ -450,7 +499,9 @@ def test_runtime_patch_allows_clean_subprocess_exit(tmp_path: Path) -> None:
         import sys
 
         dataset = _default_dataset_loader([sys.argv[1]], "train")
-        row = next(iter(dataset))
+        iterator = iter(dataset)
+        row = next(iterator)
+        globals()["live_iterator"] = iterator
         print(row["value"])
         """
     )
@@ -459,6 +510,7 @@ def test_runtime_patch_allows_clean_subprocess_exit(tmp_path: Path) -> None:
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
+        timeout=20,
     )
 
     assert result.returncode == 0, result.stderr

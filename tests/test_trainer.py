@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 import torch
@@ -318,6 +321,102 @@ def test_trainer_step_does_not_prefetch_unused_batch_when_capped() -> None:
 
     assert len(history) == 1
     assert train_stream.events == ["yield:0"]
+
+
+@pytest.mark.parametrize(
+    ("num_workers", "persistent_workers"),
+    [(0, False), (1, False), (1, True)],
+)
+def test_stage_batches_allows_clean_subprocess_exit_after_early_stop(
+    num_workers: int,
+    persistent_workers: bool,
+) -> None:
+    script = textwrap.dedent(
+        """
+        import sys
+
+        import numpy as np
+
+        from cr_train import build_sen12mscr_loaders
+        from cr_train.data import SceneShard
+        from cr_train.trainer import _stage_batches
+
+
+        def sample_row():
+            sar = np.zeros((2, 2, 2), dtype=np.float32)
+            optical = np.zeros((2, 1, 13), dtype=np.int16)
+            return {
+                "sar": sar.tobytes(),
+                "cloudy": optical.tobytes(),
+                "target": optical.tobytes(),
+                "sar_shape": list(sar.shape),
+                "opt_shape": list(optical.shape),
+                "season": "spring",
+                "scene": "1",
+                "patch": "p0",
+            }
+
+
+        class FakeIterable:
+            def __init__(self) -> None:
+                self.rows = [sample_row() for _ in range(4)]
+
+            def reshard(self):
+                return self
+
+            def shuffle(self, *, seed, buffer_size):
+                _ = (seed, buffer_size)
+                return self
+
+            def set_epoch(self, epoch):
+                self.epoch = epoch
+
+            def __iter__(self):
+                yield from self.rows
+
+
+        def fake_dataset_loader(urls, stage):
+            _ = (urls, stage)
+            return FakeIterable()
+
+
+        def fake_scene_split_resolver(split, seed):
+            _ = (split, seed)
+            return {
+                "train": (SceneShard("spring", "1"),),
+                "val": (SceneShard("spring", "2"),),
+                "test": (SceneShard("spring", "3"),),
+            }
+
+
+        num_workers = int(sys.argv[1])
+        persistent_workers = sys.argv[2] == "true"
+        loader_kwargs = {
+            "batch_size": 1,
+            "num_workers": num_workers,
+            "timeout": 1.0 if num_workers > 0 else 0.0,
+            "_dataset_loader": fake_dataset_loader,
+            "_scene_split_resolver": fake_scene_split_resolver,
+        }
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = persistent_workers
+
+        train_loader, _, _ = build_sen12mscr_loaders(**loader_kwargs)
+        batches = list(_stage_batches(train_loader, 1))
+        print(batches[0]["metadata"]["scene"][0])
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(num_workers), str(persistent_workers).lower()],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1"
 
 
 def test_trainer_raises_when_sized_stage_ends_before_progress_total() -> None:

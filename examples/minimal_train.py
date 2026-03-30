@@ -87,6 +87,7 @@ def main() -> None:
     parser.add_argument("--split", choices=("official", "seeded_scene"), default="official")
     parser.add_argument("--num-workers", type=_parse_num_workers, default=None, metavar="auto|INT")
     parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--timeout", type=float, default=0.0)
     parser.add_argument("--prefetch-factor", type=int, default=None)
     parser.add_argument(
         "--persistent-workers",
@@ -105,6 +106,7 @@ def main() -> None:
         shuffle_buffer_size=16,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
+        timeout=args.timeout,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
         io_profile=args.io_profile,

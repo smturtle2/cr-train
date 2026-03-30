@@ -97,6 +97,7 @@ class _LoaderOptions:
     shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE
     num_workers: int | None = None
     pin_memory: bool = False
+    timeout: float = 0.0
     prefetch_factor: int | None = None
     persistent_workers: bool | None = None
     io_profile: IOProfile = DEFAULT_IO_PROFILE
@@ -114,10 +115,14 @@ class _LoaderOptions:
             raise ValueError(f"io_profile must be one of {sorted(VALID_IO_PROFILES)!r}")
         if self.num_workers is not None and self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
+        if self.timeout < 0:
+            raise ValueError("timeout must be non-negative")
         if self.prefetch_factor is not None and self.prefetch_factor <= 0:
             raise ValueError("prefetch_factor must be positive when provided")
         # worker 프로세스가 없으면 prefetch/persistent worker 옵션도 의미가 없다.
         if self.num_workers == 0:
+            if self.timeout > 0:
+                raise ValueError("timeout requires num_workers > 0")
             if self.prefetch_factor is not None:
                 raise ValueError("prefetch_factor requires num_workers > 0")
             if self.persistent_workers:
@@ -324,7 +329,13 @@ def _resolve_stage_persistent_workers(num_workers: int, options: _LoaderOptions)
         return None
     if options.persistent_workers is not None:
         return options.persistent_workers
-    return True
+    return False
+
+
+def _resolve_stage_timeout(num_workers: int, options: _LoaderOptions) -> float:
+    if num_workers == 0:
+        return 0.0
+    return float(options.timeout)
 
 
 def _default_dataset_loader(
@@ -400,7 +411,6 @@ def _build_stage_dataloader(
     splits: Mapping[Stage, Sequence[SceneShard]],
     dataset_loader: DatasetLoader | None,
 ) -> DataLoader[Any]:
-    urls = _stage_urls(stage, splits)
     dataset = _build_stage_dataset(
         stage,
         options,
@@ -416,6 +426,7 @@ def _build_stage_dataloader(
         "batch_size": options.batch_size,
         "num_workers": num_workers,
         "pin_memory": options.pin_memory,
+        "timeout": _resolve_stage_timeout(num_workers, options),
         "worker_init_fn": _seed_worker,
         "generator": generator,
     }
@@ -439,6 +450,7 @@ def build_sen12mscr_loaders(
     shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE,
     num_workers: int | None = None,
     pin_memory: bool = False,
+    timeout: float = 0.0,
     prefetch_factor: int | None = None,
     persistent_workers: bool | None = None,
     io_profile: IOProfile = DEFAULT_IO_PROFILE,
@@ -457,6 +469,7 @@ def build_sen12mscr_loaders(
         shuffle_buffer_size=shuffle_buffer_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        timeout=timeout,
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
         io_profile=io_profile,

@@ -154,8 +154,9 @@ Returns `(train_loader, val_loader, test_loader)`. Only train is shuffled; val/t
 | `shuffle_buffer_size` | `int` | `16` | In-memory shuffle buffer for training |
 | `num_workers` | `int \| None` | `None` | Auto: train gets `min(2, cpu_count//6)` workers, val/test get 0 |
 | `pin_memory` | `bool` | `False` | Pin tensors for faster GPU transfer |
+| `timeout` | `float` | `0.0` | Worker batch wait timeout in seconds; only applied to stages with `num_workers > 0` |
 | `prefetch_factor` | `int \| None` | `None` | Auto `2` when workers > 0 |
-| `persistent_workers` | `bool \| None` | `None` | Auto `True`; keeps workers alive between epochs to avoid reconnection overhead |
+| `persistent_workers` | `bool \| None` | `None` | Auto `False`; opt in when worker reuse is known to be stable |
 | `io_profile` | `str` | `"smooth"` | `"smooth"` (light readahead) or `"conservative"` (fully synchronous) |
 
 ### `TrainerConfig`
