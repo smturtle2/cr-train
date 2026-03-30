@@ -77,7 +77,7 @@ def _parse_num_workers(value: str) -> int | None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Minimal SEN12MS-CR streaming training example.")
+    parser = argparse.ArgumentParser(description="Minimal SEN12MS-CR training example.")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--train-max-samples", type=int, default=400)
     parser.add_argument("--val-max-samples", type=int, default=80)
@@ -85,6 +85,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--split", choices=("official", "seeded_scene"), default="official")
+    parser.add_argument(
+        "--no-streaming",
+        action="store_true",
+        help="Download the full dataset instead of streaming from Hugging Face",
+    )
     parser.add_argument("--num-workers", type=_parse_num_workers, default=None, metavar="auto|INT")
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--timeout", type=float, default=0.0)
@@ -101,6 +106,7 @@ def main() -> None:
     # 로컬 모듈 사용 예제 기준점이 되도록 loader 옵션을 CLI에서 바로 조절할 수 있게 둔다.
     train_loader, val_loader, test_loader = build_sen12mscr_loaders(
         args.batch_size,
+        streaming=not args.no_streaming,
         seed=args.seed,
         split=args.split,
         shuffle_buffer_size=64,

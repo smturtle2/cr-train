@@ -14,8 +14,6 @@ dependencies = [
     "pyarrow>=23.0.0",
     "rich>=14.0.0",
     "torch>=2.4",
-    "tqdm>=4.67",
-    "typing-extensions>=4.12",
 ]
 
 [build-system]

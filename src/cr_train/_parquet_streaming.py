@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 import pyarrow as pa
 import pyarrow.dataset as pa_ds
+from datasets import Dataset as HFDataset
 from datasets import IterableDataset as HFIterableDataset
 from datasets import load_dataset
 
@@ -55,4 +56,19 @@ def load_streaming_parquet_dataset(
         streaming=True,
         columns=list(PARQUET_COLUMNS),
         fragment_scan_options=_fragment_scan_options(cache_options),
+    )
+
+
+def load_parquet_dataset(
+    urls: Sequence[str],
+    *,
+    io_profile: IOProfile,
+) -> HFDataset:
+    configure_runtime(io_profile=io_profile)
+    return load_dataset(
+        "parquet",
+        data_files={"train": list(urls)},
+        split="train",
+        streaming=False,
+        columns=list(PARQUET_COLUMNS),
     )

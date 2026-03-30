@@ -20,6 +20,7 @@ from cr_train import build_sen12mscr_loaders
 from cr_train._parquet_streaming import PARQUET_COLUMNS
 from cr_train.data import (
     DEFAULT_DATASET_REVISION,
+    SEN12MSCRMapDataset,
     SEN12MSCRStreamingDataset,
     SceneShard,
     decode_sample,
@@ -631,3 +632,62 @@ def test_runtime_patch_allows_clean_subprocess_exit_with_live_iterator(tmp_path:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "p30"
+
+
+def test_map_dataset_decodes_samples_by_index() -> None:
+    rows = [_sample_row(patch=f"p{index}") for index in range(3)]
+    dataset = SEN12MSCRMapDataset(rows, stage="train")
+
+    assert len(dataset) == 3
+    sample = dataset[1]
+    assert sample["metadata"]["patch"] == "p1"
+    sar, cloudy = sample["inputs"]
+    assert sar.dtype == torch.float32
+    assert cloudy.dtype == torch.float32
+    assert sample["target"].dtype == torch.float32
+
+
+def test_map_dataset_set_epoch_is_noop() -> None:
+    dataset = SEN12MSCRMapDataset([_sample_row()], stage="val")
+    dataset.set_epoch(5)
+    assert len(dataset) == 1
+
+
+def test_build_loaders_non_streaming_creates_map_dataset() -> None:
+    datasets = {
+        "train": [_sample_row()],
+        "val": [_sample_row(scene="2")],
+        "test": [_sample_row(scene="3")],
+    }
+
+    def fake_dataset_loader(urls: list[str], stage: str) -> list[dict[str, object]]:
+        _ = urls
+        return datasets[stage]
+
+    def fake_scene_split_resolver(split: str, seed: int) -> dict[str, tuple[SceneShard, ...]]:
+        _ = (split, seed)
+        return {
+            "train": (SceneShard("spring", "1"),),
+            "val": (SceneShard("spring", "2"),),
+            "test": (SceneShard("spring", "3"),),
+        }
+
+    train_loader, val_loader, test_loader = build_sen12mscr_loaders(
+        1,
+        streaming=False,
+        num_workers=0,
+        _dataset_loader=fake_dataset_loader,
+        _scene_split_resolver=fake_scene_split_resolver,
+    )
+
+    assert isinstance(train_loader.dataset, SEN12MSCRMapDataset)
+    assert isinstance(val_loader.dataset, SEN12MSCRMapDataset)
+    assert isinstance(test_loader.dataset, SEN12MSCRMapDataset)
+    assert train_loader.dataset.stage == "train"
+    assert val_loader.dataset.stage == "val"
+    assert test_loader.dataset.stage == "test"
+
+    batch = next(iter(train_loader))
+    sar, cloudy = batch["inputs"]
+    assert tuple(sar.shape) == (1, 2, 2, 2)
+    assert tuple(batch["target"].shape) == (1, 13, 2, 1)

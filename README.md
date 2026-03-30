@@ -3,12 +3,12 @@
 English | [한국어](./README.ko.md)
 
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](./pyproject.toml)
-[![PyTorch](https://img.shields.io/badge/pytorch-streaming%20trainer-ee4c2c.svg)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/pytorch-trainer-ee4c2c.svg)](https://pytorch.org/)
 [![Datasets](https://img.shields.io/badge/huggingface-datasets-yellow.svg)](https://huggingface.co/datasets/Hermanni/sen12mscr)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
 A drop-in training toolkit for [SEN12MS-CR](https://patricktum.github.io/cloud_removal/sen12mscr/) cloud removal experiments.
-Bring your own PyTorch model -- cr-train handles deterministic streaming, preprocessing, checkpointing, and progress tracking.
+Bring your own PyTorch model -- cr-train handles deterministic data loading (streaming or full download), preprocessing, checkpointing, and progress tracking.
 
 ---
 
@@ -46,8 +46,11 @@ class MyModel(nn.Module):
         return self.net(torch.cat([sar, cloudy], dim=1))
 
 
-# 2. Create data loaders (streams from Hugging Face, no local download)
+# 2. Create data loaders (streams from Hugging Face by default)
 train_loader, val_loader, test_loader = build_sen12mscr_loaders(batch_size=4)
+
+# Or download the full dataset first:
+# train_loader, val_loader, test_loader = build_sen12mscr_loaders(batch_size=4, streaming=False)
 
 # 3. Train
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -86,9 +89,9 @@ For more examples: [`examples/minimal_train.py`](./examples/minimal_train.py) (C
 Hugging Face (parquet shards)
   │
   ▼
-build_sen12mscr_loaders()          ← scene-level split, streaming decode, preprocessing
+build_sen12mscr_loaders()          ← scene-level split, decode, preprocessing
   │
-  ├── train_loader                 ← file-shard streaming + sample-buffer shuffle
+  ├── train_loader                 ← streaming: sample-buffer shuffle / non-streaming: sampler shuffle
   ├── val_loader                   ← fixed order
   └── test_loader                  ← fixed order
         │
@@ -99,7 +102,7 @@ build_sen12mscr_loaders()          ← scene-level split, streaming decode, prep
     Trainer.test()                 ← final evaluation
 ```
 
-**Data pipeline.** Parquet shards are streamed directly from Hugging Face -- no local download required. Only the required parquet columns are scanned, and each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical) and normalized on the fly.
+**Data pipeline.** By default (`streaming=True`), parquet shards are streamed directly from Hugging Face -- no local download required. Set `streaming=False` to download the full dataset first and use a map-style dataset with random access. In both modes only the required parquet columns are scanned, and each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical) and normalized on the fly.
 
 **Scene isolation.** Scenes are assigned to train/val/test before any shuffling. No scene appears in multiple splits.
 
@@ -149,6 +152,7 @@ Returns `(train_loader, val_loader, test_loader)`. Only train is shuffled; val/t
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `batch_size` | `int` | required | Samples per batch |
+| `streaming` | `bool` | `True` | `True` streams from HF Hub; `False` downloads the full dataset first |
 | `seed` | `int` | `0` | Seed for shuffle order and worker init |
 | `split` | `str` | `"official"` | `"official"` (author splits: 155/10/10 scenes) or `"seeded_scene"` (80/10/10 stratified by season) |
 | `shuffle_buffer_size` | `int` | `64` | In-memory sample shuffle buffer for training |
@@ -245,9 +249,9 @@ The **official split** comes from the [authors' supplementary material](https://
 cr-train/
 ├── src/cr_train/
 │   ├── __init__.py         # public API
-│   ├── _parquet_streaming.py  # parquet column pruning and scan tuning
+│   ├── _parquet_streaming.py  # parquet loading (streaming and map-style)
 │   ├── trainer.py          # training loop, checkpointing, progress
-│   ├── data.py             # streaming dataset, scene splits, preprocessing
+│   ├── data.py             # dataset (streaming + map-style), scene splits, preprocessing
 │   └── runtime.py          # parquet I/O tuning
 ├── examples/
 │   ├── minimal_train.py    # full CLI training script

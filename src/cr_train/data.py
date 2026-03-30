@@ -1,4 +1,4 @@
-"""Streaming SEN12MS-CR datasets with built-in benchmark-style preprocessing."""
+"""SEN12MS-CR datasets with built-in benchmark-style preprocessing."""
 
 from __future__ import annotations
 
@@ -16,11 +16,13 @@ from typing import Any, Literal, TypedDict, cast
 import numpy as np
 import pyarrow as pa
 import torch
+from datasets import Dataset as HFDataset
 from datasets import IterableDataset as HFIterableDataset
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from ._parquet_streaming import (
     default_cache_options,
+    load_parquet_dataset,
     load_streaming_parquet_dataset,
 )
 from .runtime import IOProfile, VALID_IO_PROFILES
@@ -65,7 +67,7 @@ class SEN12MSCRSample(TypedDict):
     metadata: SampleMetadata
 
 
-DatasetLoader = Callable[[Sequence[str], Stage], HFIterableDataset]
+DatasetLoader = Callable[[Sequence[str], Stage], HFIterableDataset | HFDataset]
 SceneSplitResolver = Callable[[SplitStrategy, int], Mapping[Stage, Sequence["SceneShard"]]]
 
 
@@ -97,6 +99,7 @@ class SceneShard:
 class _LoaderOptions:
     batch_size: int
     seed: int = 0
+    streaming: bool = True
     split: SplitStrategy = DEFAULT_SPLIT
     shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE
     num_workers: int | None = None
@@ -416,8 +419,36 @@ class SEN12MSCRStreamingDataset(IterableDataset[SEN12MSCRSample]):
             yield decode_sample(row)
 
 
+class SEN12MSCRMapDataset(Dataset[SEN12MSCRSample]):
+    """Map-style dataset for non-streaming mode with random-access decoding."""
+
+    def __init__(self, source: Any, *, stage: Stage) -> None:
+        super().__init__()
+        self.source = source
+        self.stage = stage
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    def __getitem__(self, index: int) -> SEN12MSCRSample:
+        return decode_sample(self.source[index])
+
+    def set_epoch(self, epoch: int) -> None:
+        # shuffle은 DataLoader sampler가 처리하므로 no-op.
+        pass
+
+
 def _stage_urls(stage: Stage, splits: Mapping[Stage, Sequence[SceneShard]]) -> list[str]:
     return [shard.resolve_url() for shard in splits[stage]]
+
+
+def _default_map_dataset_loader(
+    urls: Sequence[str],
+    _: Stage,
+    *,
+    io_profile: IOProfile = DEFAULT_IO_PROFILE,
+) -> HFDataset:
+    return load_parquet_dataset(urls, io_profile=io_profile)
 
 
 def _build_stage_dataset(
@@ -426,9 +457,11 @@ def _build_stage_dataset(
     *,
     splits: Mapping[Stage, Sequence[SceneShard]],
     dataset_loader: DatasetLoader | None,
-) -> SEN12MSCRStreamingDataset:
+) -> SEN12MSCRStreamingDataset | SEN12MSCRMapDataset:
     urls = _stage_urls(stage, splits)
-    if dataset_loader is None:
+    if dataset_loader is not None:
+        source = dataset_loader(urls, stage)
+    elif options.streaming:
         source = _default_dataset_loader(
             urls,
             stage,
@@ -436,13 +469,20 @@ def _build_stage_dataset(
             cache_options=options.cache_options,
         )
     else:
-        source = dataset_loader(urls, stage)
-    return SEN12MSCRStreamingDataset(
-        source,
-        stage=stage,
-        seed=options.seed,
-        shuffle_buffer_size=options.shuffle_buffer_size,
-    )
+        source = _default_map_dataset_loader(
+            urls,
+            stage,
+            io_profile=options.io_profile,
+        )
+
+    if options.streaming:
+        return SEN12MSCRStreamingDataset(
+            source,
+            stage=stage,
+            seed=options.seed,
+            shuffle_buffer_size=options.shuffle_buffer_size,
+        )
+    return SEN12MSCRMapDataset(source, stage=stage)
 
 
 def _build_stage_dataloader(
@@ -471,6 +511,9 @@ def _build_stage_dataloader(
         "worker_init_fn": _seed_worker,
         "generator": generator,
     }
+    if not options.streaming:
+        # map-style dataset은 DataLoader sampler로 shuffle한다.
+        dataloader_kwargs["shuffle"] = stage == "train"
     resolved_prefetch_factor = _resolve_stage_prefetch_factor(num_workers, options)
     resolved_persistent_workers = _resolve_stage_persistent_workers(num_workers, options)
     if num_workers > 0:
@@ -486,6 +529,7 @@ def _build_stage_dataloader(
 def build_sen12mscr_loaders(
     batch_size: int,
     *,
+    streaming: bool = True,
     seed: int = 0,
     split: SplitStrategy = DEFAULT_SPLIT,
     shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE,
@@ -499,13 +543,18 @@ def build_sen12mscr_loaders(
     _dataset_loader: DatasetLoader | None = None,
     _scene_split_resolver: SceneSplitResolver | None = None,
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
-    """Build `(train_loader, val_loader, test_loader)` for SEN12MS-CR streaming training.
+    """Build `(train_loader, val_loader, test_loader)` for SEN12MS-CR training.
+
+    When ``streaming=True`` (default), data is streamed from the Hugging Face Hub without
+    downloading to disk.  When ``streaming=False``, the full dataset is downloaded first and
+    a map-style dataset with random access is used.
 
     The underscored keyword arguments are reserved for tests and internal integration hooks.
     """
 
     options = _LoaderOptions(
         batch_size=batch_size,
+        streaming=streaming,
         seed=seed,
         split=split,
         shuffle_buffer_size=shuffle_buffer_size,

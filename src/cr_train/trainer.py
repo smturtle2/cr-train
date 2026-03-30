@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import random
 import re
-import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,10 +12,17 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from rich.progress import SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from torch import nn
-from tqdm import TqdmExperimentalWarning
-from tqdm.rich import tqdm
 
 Scalar = float | int | torch.Tensor
 MetricLike = Callable[[Any, Any], Scalar]
@@ -128,6 +134,39 @@ def _resolve_progress_total(dataloader: Any, max_samples: int | None) -> int | N
     return min(loader_length, capped_batches)
 
 
+class _StageProgress:
+    """Thin adapter over rich.progress.Progress used by _run_stage."""
+
+    def __init__(self, progress: Progress, task_id: TaskID) -> None:
+        self._progress = progress
+        self._task_id = task_id
+
+    def set_description_str(self, desc: str, refresh: bool = True) -> None:
+        self._progress.update(self._task_id, description=desc)
+        if refresh:
+            self._progress.refresh()
+
+    def update(self, advance: int) -> None:
+        self._progress.update(self._task_id, advance=advance)
+
+    def refresh(self) -> None:
+        self._progress.refresh()
+
+    def close(self) -> None:
+        self._progress.stop()
+
+
+def _determinate_progress_columns() -> tuple[Any, ...]:
+    return (
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("batch"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    )
+
+
 def _indeterminate_progress_columns() -> tuple[Any, ...]:
     return (
         SpinnerColumn(),
@@ -137,20 +176,12 @@ def _indeterminate_progress_columns() -> tuple[Any, ...]:
     )
 
 
-def _create_progress(*, desc: str, total: int | None, disable: bool, leave: bool) -> tqdm:
-    progress_kwargs: dict[str, Any] = {
-        "total": total,
-        "desc": desc,
-        "disable": disable,
-        "leave": leave,
-        "dynamic_ncols": True,
-        "unit": "batch",
-    }
-    if total is None:
-        progress_kwargs["progress"] = _indeterminate_progress_columns()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", TqdmExperimentalWarning)
-        return tqdm(**progress_kwargs)
+def _create_progress(*, desc: str, total: int | None, disable: bool, leave: bool) -> _StageProgress:
+    columns = _indeterminate_progress_columns() if total is None else _determinate_progress_columns()
+    progress = Progress(*columns, disable=disable, transient=not leave)
+    task_id = progress.add_task(desc, total=total)
+    progress.start()
+    return _StageProgress(progress, task_id)
 
 
 def _batch_size(target: Any) -> int:

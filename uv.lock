@@ -262,8 +262,6 @@ dependencies = [
     { name = "pyarrow" },
     { name = "rich" },
     { name = "torch" },
-    { name = "tqdm" },
-    { name = "typing-extensions" },
 ]
 
 [package.dev-dependencies]
@@ -279,8 +277,6 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=23.0.0" },
     { name = "rich", specifier = ">=14.0.0" },
     { name = "torch", specifier = ">=2.4" },
-    { name = "tqdm", specifier = ">=4.67" },
-    { name = "typing-extensions", specifier = ">=4.12" },
 ]
 
 [package.metadata.requires-dev]
