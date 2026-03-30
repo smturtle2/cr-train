@@ -300,7 +300,7 @@ def test_loader_builder_auto_tunes_worker_defaults(monkeypatch: pytest.MonkeyPat
         assert kwargs["timeout"] == 0.0
         if kwargs["num_workers"] > 0:
             assert kwargs["prefetch_factor"] == 2
-            assert kwargs["persistent_workers"] is True
+            assert kwargs["persistent_workers"] is False
         else:
             assert "prefetch_factor" not in kwargs
             assert "persistent_workers" not in kwargs
@@ -404,6 +404,7 @@ def test_loader_builder_passes_prefetch_and_persistent_worker_options(
         assert kwargs["timeout"] == 5.5
         assert kwargs["prefetch_factor"] == 4
         assert kwargs["persistent_workers"] is True
+
 
 
 @pytest.mark.filterwarnings("ignore:This process .* multi-threaded, use of fork")
@@ -589,8 +590,6 @@ def test_load_streaming_parquet_dataset_bootstraps_runtime_with_column_pruning(
             },
         ),
     ]
-
-
 
 
 def test_runtime_patch_allows_clean_subprocess_exit_with_live_iterator(tmp_path: Path) -> None:

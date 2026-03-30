@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 import torch

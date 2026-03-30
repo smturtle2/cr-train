@@ -334,7 +334,7 @@ def _resolve_stage_persistent_workers(num_workers: int, options: _LoaderOptions)
         return None
     if options.persistent_workers is not None:
         return options.persistent_workers
-    return True
+    return False
 
 
 def _resolve_stage_timeout(num_workers: int, options: _LoaderOptions) -> float:
