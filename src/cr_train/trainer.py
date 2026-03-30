@@ -108,33 +108,32 @@ def _loader_length(dataloader: Any) -> int | None:
         return None
 
 
-def _dataset_length(dataloader: Any) -> int | None:
-    dataset = getattr(dataloader, "dataset", None)
-    if dataset is None:
-        return None
-    try:
-        return len(dataset)
-    except TypeError:
-        return None
+def _loader_batch_size(dataloader: Any) -> int | None:
+    batch_size = getattr(dataloader, "batch_size", None)
+    if isinstance(batch_size, int) and batch_size > 0:
+        return batch_size
+    return None
 
 
 def _resolve_progress_total(dataloader: Any, max_samples: int | None) -> int | None:
-    # sample 기준 cap을 우선 보여주되, 길이를 모르는 loader는 max_samples만 fallback으로 사용한다.
-    sample_total = _dataset_length(dataloader)
-    if sample_total is None:
-        sample_total = _loader_length(dataloader)
-    if sample_total is None:
-        return max_samples
+    # tqdm는 batch 진행률을 보여준다. sample cap이 있더라도 batch total을 안전하게 추정할 때만 채운다.
+    loader_length = _loader_length(dataloader)
+    if loader_length is None:
+        return None
     if max_samples is None:
-        return sample_total
-    return min(sample_total, max_samples)
+        return loader_length
+    batch_size = _loader_batch_size(dataloader)
+    if batch_size is None:
+        return None
+    capped_batches = (max_samples + batch_size - 1) // batch_size
+    return min(loader_length, capped_batches)
 
 
 def _indeterminate_progress_columns() -> tuple[Any, ...]:
     return (
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
-        TextColumn("{task.completed:>4.0f} samples"),
+        TextColumn("{task.completed:>4.0f} batches"),
         TimeElapsedColumn(),
     )
 
@@ -146,7 +145,7 @@ def _create_progress(*, desc: str, total: int | None, disable: bool, leave: bool
         "disable": disable,
         "leave": leave,
         "dynamic_ncols": True,
-        "unit": "sample",
+        "unit": "batch",
     }
     if total is None:
         progress_kwargs["progress"] = _indeterminate_progress_columns()
@@ -224,12 +223,12 @@ def _stage_samples(dataloader: Any, max_samples: int | None) -> Iterator[Any]:
         del iterator
 
 
-def _ensure_progress_invariant(stage: str, total: int | None, processed_samples: int) -> None:
+def _ensure_progress_invariant(stage: str, total: int | None, processed_batches: int) -> None:
     if total is None:
         return
-    if processed_samples != total:
+    if processed_batches != total:
         raise RuntimeError(
-            f"{stage} stage ended after {processed_samples} samples, expected {total} samples"
+            f"{stage} stage ended after {processed_batches} batches, expected {total} batches"
         )
 
 
@@ -410,6 +409,7 @@ class Trainer:
         # per-sample 가중 평균을 위해 metric 합산은 batch_size를 곱해서 누적한다.
         metric_totals: dict[str, float] = {}
         sample_count = 0
+        batch_count = 0
         progress_total = _resolve_progress_total(dataloader, max_samples)
 
         if training:
@@ -450,15 +450,16 @@ class Trainer:
                         metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value) * batch_size
 
                 sample_count += batch_size
+                batch_count += 1
                 averages = {name: total / sample_count for name, total in metric_totals.items()}
                 progress.set_description_str(
                     _progress_metrics_desc(stage, averages),
                     refresh=False,
                 )
-                progress.update(batch_size)
+                progress.update(1)
             if hasattr(progress, "refresh"):
                 progress.refresh()
-            _ensure_progress_invariant(stage, progress_total, sample_count)
+            _ensure_progress_invariant(stage, progress_total, batch_count)
         finally:
             if hasattr(progress, "refresh"):
                 progress.refresh()

@@ -270,7 +270,7 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
 
     assert printed == ["epoch 1/1"]
     assert [{key: value for key, value in item.items() if key != "progress"} for item in created] == [
-        {"desc": "train", "total": 4, "disable": False, "leave": True},
+        {"desc": "train", "total": 2, "disable": False, "leave": True},
         {"desc": "val", "total": 1, "disable": False, "leave": True},
         {"desc": "test", "total": 2, "disable": False, "leave": True},
     ]
@@ -288,7 +288,7 @@ def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch:
         ("train | loss=0.5000 mae=0.5000", False),
         ("train | loss=3.5000 mae=1.5000", False),
     ]
-    assert train_progress.updates == [2, 2]
+    assert train_progress.updates == [1, 1]
     assert val_progress.descriptions == [
         ("val | loading first batch...", True),
         ("val | loss=16.0000 mae=4.0000", False),
@@ -454,8 +454,31 @@ def test_trainer_raises_when_sized_stage_ends_before_progress_total() -> None:
         train_loader=_LengthMismatchLoader(_make_rows([0.0]), reported_length=2),
     )
 
-    with pytest.raises(RuntimeError, match="train stage ended after 1 samples, expected 2 samples"):
+    with pytest.raises(RuntimeError, match="train stage ended after 1 batches, expected 2 batches"):
         list(trainer.step())
+
+
+def test_trainer_accepts_drop_last_loaders_when_progress_counts_batches() -> None:
+    train_loader = DataLoader(
+        _ToyDataset(_make_rows([0.0, 1.0, 2.0, 3.0, 4.0])),
+        batch_size=2,
+        drop_last=True,
+        shuffle=False,
+    )
+    model = _ToyModel().to(torch.device("cpu"))
+    trainer = Trainer(
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        criterion=nn.MSELoss(),
+        metrics=[],
+        config=TrainerConfig(max_epochs=1, show_progress=False),
+        train_loader=train_loader,
+    )
+
+    history = list(trainer.step())
+
+    assert len(history) == 1
+    assert trainer.state.global_step == 2
 
 
 def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
