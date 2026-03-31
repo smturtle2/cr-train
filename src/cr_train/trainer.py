@@ -27,6 +27,7 @@ from torch.utils.data import RandomSampler
 
 Scalar = float | int | torch.Tensor
 MetricLike = Callable[[Any, Any], Scalar]
+_UNHANDLED = object()
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,36 @@ class TrainerState:
     global_step: int = 0
 
 
+@dataclass
+class _BatchResult:
+    outputs: Any
+    target: Any
+    batch_size: int
+    loss: torch.Tensor
+
+
+@dataclass
+class _StageAccumulator:
+    metric_totals: dict[str, float]
+    sample_count: int = 0
+    batch_count: int = 0
+
+    def record(self, batch_metrics: Mapping[str, float], *, batch_size: int) -> dict[str, float]:
+        for name, value in batch_metrics.items():
+            self.metric_totals[name] = self.metric_totals.get(name, 0.0) + value * batch_size
+        self.sample_count += batch_size
+        self.batch_count += 1
+        return self.averages()
+
+    def averages(self) -> dict[str, float]:
+        if self.sample_count == 0:
+            return {}
+        return {
+            name: total / self.sample_count
+            for name, total in self.metric_totals.items()
+        }
+
+
 class MAE(nn.Module):
     """Mean absolute error metric for regression outputs."""
 
@@ -79,16 +110,69 @@ def _validate_optional_positive(name: str, value: int | None) -> int | None:
     return value
 
 
-def _move_value_to_device(value: Any, device: torch.device) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.to(device)
-    if isinstance(value, dict):
-        return {key: _move_value_to_device(item, device) for key, item in value.items()}
+def _resolve_positive_override(name: str, override: int | None, default: int) -> int:
+    if override is None:
+        return default
+    return _validate_positive(name, override)
+
+
+def _resolve_optional_positive_override(
+    name: str,
+    override: int | None,
+    default: int | None,
+) -> int | None:
+    if override is None:
+        return default
+    return _validate_optional_positive(name, override)
+
+
+def _transform_nested_value(
+    value: Any,
+    *,
+    leaf_transform: Callable[[Any], Any],
+    sequence_transform: Callable[[Sequence[Any]], Any] | None = None,
+) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _transform_nested_value(
+                item,
+                leaf_transform=leaf_transform,
+                sequence_transform=sequence_transform,
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_move_value_to_device(item, device) for item in value]
+        transformed = _UNHANDLED if sequence_transform is None else sequence_transform(value)
+        if transformed is not _UNHANDLED:
+            return transformed
+        return [
+            _transform_nested_value(
+                item,
+                leaf_transform=leaf_transform,
+                sequence_transform=sequence_transform,
+            )
+            for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_move_value_to_device(item, device) for item in value)
-    return value
+        transformed = _UNHANDLED if sequence_transform is None else sequence_transform(value)
+        if transformed is not _UNHANDLED:
+            return transformed
+        return tuple(
+            _transform_nested_value(
+                item,
+                leaf_transform=leaf_transform,
+                sequence_transform=sequence_transform,
+            )
+            for item in value
+        )
+    return leaf_transform(value)
+
+
+def _move_value_to_device(value: Any, device: torch.device) -> Any:
+    return _transform_nested_value(
+        value,
+        leaf_transform=lambda item: item.to(device) if isinstance(item, torch.Tensor) else item,
+    )
 
 
 def _to_float(value: Scalar) -> float:
@@ -196,29 +280,31 @@ def _batch_size(target: Any) -> int:
         raise ValueError("trainer targets must be batched sequences or tensors") from exc
 
 
+def _is_flat_batched_sequence(value: Sequence[Any], *, batch_size: int) -> bool:
+    return len(value) == batch_size and all(
+        not isinstance(item, (torch.Tensor, Mapping, list, tuple))
+        for item in value
+    )
+
+
 def _slice_batch_value(value: Any, limit: int, *, batch_size: int) -> Any:
-    if isinstance(value, torch.Tensor):
-        if value.ndim == 0 or value.shape[0] != batch_size:
-            return value
-        return value[:limit]
-    if isinstance(value, Mapping):
-        return {
-            key: _slice_batch_value(item, limit, batch_size=batch_size)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        if len(value) == batch_size and all(
-            not isinstance(item, (torch.Tensor, Mapping, list, tuple)) for item in value
-        ):
-            return value[:limit]
-        return [_slice_batch_value(item, limit, batch_size=batch_size) for item in value]
-    if isinstance(value, tuple):
-        if len(value) == batch_size and all(
-            not isinstance(item, (torch.Tensor, Mapping, list, tuple)) for item in value
-        ):
-            return value[:limit]
-        return tuple(_slice_batch_value(item, limit, batch_size=batch_size) for item in value)
-    return value
+    def transform_leaf(item: Any) -> Any:
+        if not isinstance(item, torch.Tensor):
+            return item
+        if item.ndim == 0 or item.shape[0] != batch_size:
+            return item
+        return item[:limit]
+
+    def transform_sequence(items: Sequence[Any]) -> Any:
+        if _is_flat_batched_sequence(items, batch_size=batch_size):
+            return items[:limit]
+        return _UNHANDLED
+
+    return _transform_nested_value(
+        value,
+        leaf_transform=transform_leaf,
+        sequence_transform=transform_sequence,
+    )
 
 
 def _slice_batch(batch: Any, limit: int) -> Any:
@@ -361,7 +447,7 @@ def _infer_model_device(model: nn.Module) -> torch.device:
     return device
 
 
-def _forward_model(model: nn.Module, inputs: tuple[torch.Tensor, ...]) -> Any:
+def _forward_model(model: nn.Module, inputs: Any) -> Any:
     return model(*inputs)
 
 
@@ -427,6 +513,127 @@ def _prepare_metrics(metrics: Sequence[MetricLike] | None) -> list[tuple[str, Me
     return prepared
 
 
+def _resolve_step_run(
+    config: TrainerConfig,
+    *,
+    max_epochs: int | None,
+    train_max_samples: int | None,
+    val_max_samples: int | None,
+) -> tuple[int, int | None, int | None]:
+    return (
+        _resolve_positive_override("max_epochs", max_epochs, config.max_epochs),
+        _resolve_optional_positive_override(
+            "train_max_samples",
+            train_max_samples,
+            config.train_max_samples,
+        ),
+        _resolve_optional_positive_override(
+            "val_max_samples",
+            val_max_samples,
+            config.val_max_samples,
+        ),
+    )
+
+
+def _resolve_test_max_samples(config: TrainerConfig, *, max_samples: int | None) -> int | None:
+    return _resolve_optional_positive_override(
+        "max_samples",
+        max_samples,
+        config.test_max_samples,
+    )
+
+
+def _start_stage(
+    *,
+    stage: str,
+    dataloader: Any,
+    max_samples: int | None,
+    training: bool,
+    epoch: int,
+    model: nn.Module,
+    show_progress: bool,
+) -> tuple[_StageProgress, int | None]:
+    progress_total = _resolve_progress_total(dataloader, max_samples)
+    if training:
+        # val/test는 고정 순서를 유지해야 하므로 epoch 전달은 train에만 한다.
+        _set_loader_epoch(dataloader, epoch)
+    model.train(training)
+    progress = _create_progress(
+        total=progress_total,
+        desc=stage,
+        disable=not show_progress,
+        leave=True,
+    )
+    progress.set_description_str(f"{stage} | loading first batch...")
+    return progress, progress_total
+
+
+def _run_batch_step(
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    criterion: Callable[[Any, Any], torch.Tensor],
+    device: torch.device,
+    batch: Any,
+    training: bool,
+    state: TrainerState,
+) -> _BatchResult:
+    moved_batch = _move_value_to_device(batch, device)
+    inputs, target = _extract_inputs_target(moved_batch)
+    batch_size = _batch_size(target)
+
+    if training:
+        optimizer.zero_grad(set_to_none=True)
+
+    with torch.set_grad_enabled(training):
+        outputs = _forward_model(model, inputs)
+        loss = criterion(outputs, target)
+        if training:
+            loss.backward()
+            optimizer.step()
+            state.global_step += 1
+
+    return _BatchResult(
+        outputs=outputs,
+        target=target,
+        batch_size=batch_size,
+        loss=loss,
+    )
+
+
+def _batch_metric_values(
+    batch_result: _BatchResult,
+    metrics: Sequence[tuple[str, MetricLike]],
+) -> dict[str, float]:
+    metric_values = {"loss": _to_float(batch_result.loss)}
+    with torch.no_grad():
+        for name, metric in metrics:
+            metric_values[name] = _to_float(metric(batch_result.outputs, batch_result.target))
+    return metric_values
+
+
+def _build_checkpoint_payload(
+    *,
+    state: TrainerState,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any | None,
+) -> dict[str, Any]:
+    checkpoint: dict[str, Any] = {
+        "state": {"epoch": state.epoch, "global_step": state.global_step},
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "rng": _capture_rng_state(),
+    }
+    if scheduler is not None:
+        checkpoint["scheduler"] = scheduler.state_dict()
+    return checkpoint
+
+
+def _restore_trainer_state(state: Mapping[str, Any]) -> TrainerState:
+    return TrainerState(epoch=state["epoch"], global_step=state["global_step"])
+
+
 class Trainer:
     """Supervised trainer that owns the common train/val/test loop."""
 
@@ -475,51 +682,31 @@ class Trainer:
         epoch: int,
     ) -> dict[str, float]:
         # per-sample 가중 평균을 위해 metric 합산은 batch_size를 곱해서 누적한다.
-        metric_totals: dict[str, float] = {}
-        sample_count = 0
-        batch_count = 0
-        progress_total = _resolve_progress_total(dataloader, max_samples)
-
-        if training:
-            # val/test는 고정 순서를 유지해야 하므로 epoch 전달은 train에만 한다.
-            _set_loader_epoch(dataloader, epoch)
-        self.model.train(training)
-
-        progress = _create_progress(
-            total=progress_total,
-            desc=stage,
-            disable=not self.show_progress,
-            leave=True,
+        progress, progress_total = _start_stage(
+            stage=stage,
+            dataloader=dataloader,
+            max_samples=max_samples,
+            training=training,
+            epoch=epoch,
+            model=self.model,
+            show_progress=self.show_progress,
         )
+        accumulator = _StageAccumulator(metric_totals={})
         try:
-            progress.set_description_str(f"{stage} | loading first batch...")
             for batch in _stage_samples(dataloader, max_samples):
-                moved_batch = _move_value_to_device(batch, self.device)
-                inputs, target = _extract_inputs_target(moved_batch)
-                batch_size = target.shape[0]
-
-                if training:
-                    self.optimizer.zero_grad(set_to_none=True)
-
-                with torch.set_grad_enabled(training):
-                    outputs = _forward_model(self.model, inputs)
-                    loss = self.criterion(outputs, target)
-                    if training:
-                        loss.backward()
-                        self.optimizer.step()
-                        self.state.global_step += 1
-
-                # criterion/metric은 기본적으로 batch 내 평균을 반환하므로
-                # batch_size를 곱해 sample 단위 합계로 변환한다.
-                metric_totals["loss"] = metric_totals.get("loss", 0.0) + _to_float(loss) * batch_size
-                with torch.no_grad():
-                    for name, metric in self.metrics:
-                        metric_value = metric(outputs, target)
-                        metric_totals[name] = metric_totals.get(name, 0.0) + _to_float(metric_value) * batch_size
-
-                sample_count += batch_size
-                batch_count += 1
-                averages = {name: total / sample_count for name, total in metric_totals.items()}
+                batch_result = _run_batch_step(
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    criterion=self.criterion,
+                    device=self.device,
+                    batch=batch,
+                    training=training,
+                    state=self.state,
+                )
+                averages = accumulator.record(
+                    _batch_metric_values(batch_result, self.metrics),
+                    batch_size=batch_result.batch_size,
+                )
                 progress.set_description_str(
                     _progress_metrics_desc(stage, averages),
                     refresh=False,
@@ -529,14 +716,12 @@ class Trainer:
             # sized loader의 total은 정확하므로 불일치 시 오류를 낸다.
             # streaming loader의 total은 max_samples 기반 추정치이므로 검사하지 않는다.
             if _loader_length(dataloader) is not None:
-                _ensure_progress_invariant(stage, progress_total, batch_count)
+                _ensure_progress_invariant(stage, progress_total, accumulator.batch_count)
         finally:
             progress.refresh()
             progress.close()
 
-        if sample_count == 0:
-            return {}
-        return {name: total / sample_count for name, total in metric_totals.items()}
+        return accumulator.averages()
 
     def step(
         self,
@@ -547,20 +732,11 @@ class Trainer:
     ) -> Iterator[dict[str, Any]]:
         """Run epochs and yield one history record per completed epoch."""
 
-        target_epochs = (
-            self.config.max_epochs
-            if max_epochs is None
-            else _validate_positive("max_epochs", max_epochs)
-        )
-        active_train_max_samples = (
-            self.config.train_max_samples
-            if train_max_samples is None
-            else _validate_optional_positive("train_max_samples", train_max_samples)
-        )
-        active_val_max_samples = (
-            self.config.val_max_samples
-            if val_max_samples is None
-            else _validate_optional_positive("val_max_samples", val_max_samples)
+        target_epochs, active_train_max_samples, active_val_max_samples = _resolve_step_run(
+            self.config,
+            max_epochs=max_epochs,
+            train_max_samples=train_max_samples,
+            val_max_samples=val_max_samples,
         )
 
         while self.state.epoch < target_epochs:
@@ -605,11 +781,7 @@ class Trainer:
 
         if self.test_loader is None:
             raise ValueError("test_loader is required to run test()")
-        active_max_samples = (
-            self.config.test_max_samples
-            if max_samples is None
-            else _validate_optional_positive("max_samples", max_samples)
-        )
+        active_max_samples = _resolve_test_max_samples(self.config, max_samples=max_samples)
         return self._run_stage(
             "test",
             self.test_loader,
@@ -624,14 +796,12 @@ class Trainer:
         if self.checkpoint_dir is None:
             return None
         path = self.checkpoint_dir / filename
-        checkpoint: dict[str, Any] = {
-            "state": {"epoch": self.state.epoch, "global_step": self.state.global_step},
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "rng": _capture_rng_state(),
-        }
-        if self.scheduler is not None:
-            checkpoint["scheduler"] = self.scheduler.state_dict()
+        checkpoint = _build_checkpoint_payload(
+            state=self.state,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+        )
         torch.save(checkpoint, path)
         return path
 
@@ -644,6 +814,5 @@ class Trainer:
         _move_optimizer_state_to_device(self.optimizer, self.device)
         if self.scheduler is not None and "scheduler" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler"])
-        state = checkpoint["state"]
-        self.state = TrainerState(epoch=state["epoch"], global_step=state["global_step"])
+        self.state = _restore_trainer_state(checkpoint["state"])
         _restore_rng_state(checkpoint["rng"])

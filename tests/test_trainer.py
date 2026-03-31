@@ -11,7 +11,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 import cr_train.trainer as trainer_mod
-from cr_train import MAE, Trainer, TrainerConfig
+from cr_train import MAE, Trainer, TrainerConfig, build_loaders
 
 
 class _ToyDataset(Dataset[dict[str, object]]):
@@ -454,9 +454,10 @@ def test_stage_samples_allows_clean_subprocess_exit_after_early_stop(
         import sys
 
         import numpy as np
+        import torch
+        from torch.utils.data import DataLoader, IterableDataset
 
-        from cr_train import build_sen12mscr_loaders
-        from cr_train.data import SceneShard
+        from cr_train.data import _collate_sen12mscr_rows, _seed_worker
         from cr_train.trainer import _stage_samples
 
 
@@ -475,42 +476,26 @@ def test_stage_samples_allows_clean_subprocess_exit_after_early_stop(
             }
 
 
-        class FakeIterable:
-            def __init__(self) -> None:
-                self.rows = [sample_row() for _ in range(4)]
-
+        class FakeDataset(IterableDataset):
             def __iter__(self):
-                yield from self.rows
-
-
-        def fake_dataset_loader(urls, stage):
-            _ = (urls, stage)
-            return FakeIterable()
-
-
-        def fake_scene_split_resolver(split, seed):
-            _ = (split, seed)
-            return {
-                "train": (SceneShard("spring", "1"),),
-                "val": (SceneShard("spring", "2"),),
-                "test": (SceneShard("spring", "3"),),
-            }
+                for _ in range(4):
+                    yield sample_row()
 
 
         num_workers = int(sys.argv[1])
         persistent_workers = sys.argv[2] == "true"
-        loader_kwargs = {
+        kwargs = {
             "batch_size": 1,
             "num_workers": num_workers,
-            "timeout": 1.0 if num_workers > 0 else 0.0,
-            "_dataset_loader": fake_dataset_loader,
-            "_scene_split_resolver": fake_scene_split_resolver,
+            "collate_fn": _collate_sen12mscr_rows,
+            "worker_init_fn": _seed_worker,
         }
         if num_workers > 0:
-            loader_kwargs["persistent_workers"] = persistent_workers
+            kwargs["timeout"] = 1.0
+            kwargs["persistent_workers"] = persistent_workers
 
-        train_loader, _, _ = build_sen12mscr_loaders(**loader_kwargs)
-        batches = list(_stage_samples(train_loader, 1))
+        loader = DataLoader(FakeDataset(), **kwargs)
+        batches = list(_stage_samples(loader, 1))
         print(batches[0]["metadata"]["scene"][0])
         """
     )
@@ -530,12 +515,11 @@ def test_stage_samples_allows_clean_subprocess_exit_after_early_stop(
 def test_stage_samples_can_reuse_persistent_workers_across_epochs() -> None:
     script = textwrap.dedent(
         """
-        import sys
-
         import numpy as np
+        import torch
+        from torch.utils.data import DataLoader, IterableDataset
 
-        from cr_train import build_sen12mscr_loaders
-        from cr_train.data import SceneShard
+        from cr_train.data import _collate_sen12mscr_rows, _seed_worker
         from cr_train.trainer import _stage_samples
 
 
@@ -554,38 +538,23 @@ def test_stage_samples_can_reuse_persistent_workers_across_epochs() -> None:
             }
 
 
-        class FakeIterable:
-            def __init__(self) -> None:
-                self.rows = [sample_row() for _ in range(4)]
-
+        class FakeDataset(IterableDataset):
             def __iter__(self):
-                yield from self.rows
+                for _ in range(4):
+                    yield sample_row()
 
 
-        def fake_dataset_loader(urls, stage):
-            _ = (urls, stage)
-            return FakeIterable()
-
-
-        def fake_scene_split_resolver(split, seed):
-            _ = (split, seed)
-            return {
-                "train": (SceneShard("spring", "1"),),
-                "val": (SceneShard("spring", "2"),),
-                "test": (SceneShard("spring", "3"),),
-            }
-
-
-        train_loader, _, _ = build_sen12mscr_loaders(
+        loader = DataLoader(
+            FakeDataset(),
             batch_size=1,
             num_workers=1,
             persistent_workers=True,
             timeout=1.0,
-            _dataset_loader=fake_dataset_loader,
-            _scene_split_resolver=fake_scene_split_resolver,
+            collate_fn=_collate_sen12mscr_rows,
+            worker_init_fn=_seed_worker,
         )
-        first = list(_stage_samples(train_loader, 1))
-        second = list(_stage_samples(train_loader, 1))
+        first = list(_stage_samples(loader, 1))
+        second = list(_stage_samples(loader, 1))
         print(first[0]["metadata"]["scene"][0], second[0]["metadata"]["scene"][0])
         """
     )
