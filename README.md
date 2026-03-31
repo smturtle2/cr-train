@@ -102,11 +102,11 @@ build_sen12mscr_loaders()          ← scene-level split, decode, preprocessing
     Trainer.test()                 ← final evaluation
 ```
 
-**Data pipeline.** By default (`streaming=True`), parquet shards are streamed directly from Hugging Face -- no local download required. Set `streaming=False` to download the full dataset first and use a map-style dataset with random access. In both modes only the required parquet columns are scanned, and each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical) and normalized on the fly.
+**Data pipeline.** By default (`streaming=True`), parquet shards are streamed directly from Hugging Face -- no local download required. Set `streaming=False` to download the full dataset first and use a map-style dataset with random access. In both modes only the required parquet columns are scanned, and each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical) and normalized on the fly. In streaming mode, `train` keeps shard order fixed and applies sample-buffer shuffle locally per epoch; `val/test` stay fixed-order.
 
 **Scene isolation.** Scenes are assigned to train/val/test before any shuffling. No scene appears in multiple splits.
 
-**Deterministic ordering.** Given the same `seed`, batch order is fully reproducible. The trainer calls `set_epoch()` on each epoch so train-side sample-buffer shuffle changes deterministically while file-shard order stays fixed.
+**Deterministic ordering.** Given the same `seed`, batch order is fully reproducible. The trainer calls `set_epoch()` on each epoch so only the train-side sample-buffer shuffle changes deterministically while file-shard order stays fixed.
 
 **Checkpointing.** When `checkpoint_dir` is set, `last.pt` and `epoch-NNNN.pt` are saved automatically after each epoch. Checkpoints include model, optimizer, scheduler (if provided), and full RNG state for exact resumption.
 
@@ -155,7 +155,7 @@ Returns `(train_loader, val_loader, test_loader)`. Only train is shuffled; val/t
 | `streaming` | `bool` | `True` | `True` streams from HF Hub; `False` downloads the full dataset first |
 | `seed` | `int` | `0` | Seed for shuffle order and worker init |
 | `split` | `str` | `"official"` | `"official"` (author splits: 155/10/10 scenes) or `"seeded_scene"` (80/10/10 stratified by season) |
-| `shuffle_buffer_size` | `int` | `16` | In-memory sample shuffle buffer for training |
+| `shuffle_buffer_size` | `int` | `8` | In-memory sample shuffle buffer for training |
 | `num_workers` | `int \| None` | `None` | Auto: train gets `max(1, cpu_count//4)` workers, limited by known streaming dataset shards; streaming val/test get 1 worker, map-style val/test get 0 |
 | `pin_memory` | `bool` | `False` | Pin tensors for faster GPU transfer |
 | `timeout` | `float` | `0.0` | Worker batch wait timeout in seconds; only applied to stages with `num_workers > 0` |

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +15,6 @@ import cr_train.data as data_mod
 from cr_train import build_sen12mscr_loaders
 from cr_train.data import (
     DEFAULT_DATASET_REVISION,
-    DEFAULT_SHUFFLE_BUFFER_SIZE,
     HFTokenStatus,
     PARQUET_COLUMNS,
     SceneShard,
@@ -427,14 +427,15 @@ def test_collate_sen12mscr_rows_preserves_predecoded_batches() -> None:
     assert tuple(batch["target"].shape) == (1, 13, 2, 1)
 
 
-def test_train_loader_keeps_hf_set_epoch_available(
+def test_train_loader_set_epoch_reseeds_local_sample_buffer_shuffle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     created: list[_FakeHFSource] = []
+    patches = [f"p{index}" for index in range(6)]
 
     def fake_load_dataset(*args: object, **kwargs: object) -> _FakeHFSource:
         _ = (args, kwargs)
-        source = _FakeHFSource([_sample_row()])
+        source = _FakeHFSource([_sample_row(patch=patch) for patch in patches])
         created.append(source)
         return source
 
@@ -447,15 +448,29 @@ def test_train_loader_keeps_hf_set_epoch_available(
         _scene_split_resolver=_fake_scene_splits,
     )
 
-    train_loader.dataset.set_epoch(3)
-    _ = next(iter(train_loader))
-    train_loader.dataset.set_epoch(7)
-    _ = next(iter(train_loader))
+    def collect_patch_order(epoch: int) -> list[str]:
+        train_loader.dataset.set_epoch(epoch)
+        return [batch["metadata"]["patch"][0] for batch in train_loader]
 
-    assert [source.epochs for source in created] == [[3], [7]]
+    epoch0 = collect_patch_order(0)
+    repeat_epoch0 = collect_patch_order(0)
+    epoch1 = collect_patch_order(1)
+
+    expected_epoch0 = patches[:]
+    random.Random("13:0:0").shuffle(expected_epoch0)
+    expected_epoch1 = patches[:]
+    random.Random("13:1:0").shuffle(expected_epoch1)
+
+    assert epoch0 == expected_epoch0
+    assert repeat_epoch0 == expected_epoch0
+    assert epoch1 == expected_epoch1
+    assert epoch0 != epoch1
+    assert len(created) == 3
+    assert [source.shuffle_calls for source in created] == [[], [], []]
+    assert [source.epochs for source in created] == [[], [], []]
 
 
-def test_default_hf_streaming_loader_uses_shuffle_only(
+def test_default_hf_streaming_loader_uses_local_train_buffer_shuffle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, object]] = []
@@ -493,10 +508,12 @@ def test_default_hf_streaming_loader_uses_shuffle_only(
         assert call["token"] == "hf_test_token"
         assert "batch_size" not in call
 
-    assert sources[0].shuffle_calls == [(13, DEFAULT_SHUFFLE_BUFFER_SIZE)]
-    assert sources[0].epochs == [5]
+    assert sources[0].shuffle_calls == []
+    assert sources[0].epochs == []
     assert sources[1].shuffle_calls == []
+    assert sources[1].epochs == []
     assert sources[2].shuffle_calls == []
+    assert sources[2].epochs == []
     assert tuple(batch["target"].shape) == (1, 13, 2, 1)
 
 
@@ -546,10 +563,10 @@ def test_default_hf_streaming_loader_rebuilds_same_train_urls_each_epoch(
         SceneShard("summer", "2").resolve_url(),
         SceneShard("fall", "3").resolve_url(),
     ]
-    assert sources[0].shuffle_calls == [(13, DEFAULT_SHUFFLE_BUFFER_SIZE)]
-    assert sources[1].shuffle_calls == [(13, DEFAULT_SHUFFLE_BUFFER_SIZE)]
-    assert sources[0].epochs == [0]
-    assert sources[1].epochs == [1]
+    assert sources[0].shuffle_calls == []
+    assert sources[1].shuffle_calls == []
+    assert sources[0].epochs == []
+    assert sources[1].epochs == []
 
 
 def test_default_hf_map_loader_uses_official_builder(

@@ -102,7 +102,7 @@ build_sen12mscr_loaders()          ← scene 단위 분할, 디코딩, 전처리
     Trainer.test()                 ← 최종 평가
 ```
 
-**데이터 파이프라인.** 기본(`streaming=True`)으로 Parquet shard를 Hugging Face에서 직접 스트리밍합니다 -- 로컬 다운로드가 필요 없습니다. `streaming=False`로 설정하면 전체 데이터셋을 먼저 다운로드하고 random-access가 가능한 map-style dataset을 사용합니다. 두 모드 모두 필요한 parquet 컬럼만 읽은 뒤 각 sample을 CHW 텐서(2x256x256 SAR, 13x256x256 optical)로 디코딩하고 즉시 정규화합니다.
+**데이터 파이프라인.** 기본(`streaming=True`)으로 Parquet shard를 Hugging Face에서 직접 스트리밍합니다 -- 로컬 다운로드가 필요 없습니다. `streaming=False`로 설정하면 전체 데이터셋을 먼저 다운로드하고 random-access가 가능한 map-style dataset을 사용합니다. 두 모드 모두 필요한 parquet 컬럼만 읽은 뒤 각 sample을 CHW 텐서(2x256x256 SAR, 13x256x256 optical)로 디코딩하고 즉시 정규화합니다. streaming 모드에서는 `train`만 shard 순서를 고정한 채 epoch별 local sample-buffer shuffle을 적용하고, `val/test`는 고정 순서를 유지합니다.
 
 **Scene 격리.** 셔플링 전에 scene을 train/val/test에 배정합니다. 하나의 scene이 여러 split에 나타나지 않습니다.
 
@@ -155,7 +155,7 @@ build_sen12mscr_loaders()          ← scene 단위 분할, 디코딩, 전처리
 | `streaming` | `bool` | `True` | `True`면 HF Hub에서 스트리밍; `False`면 전체 데이터셋을 먼저 다운로드 |
 | `seed` | `int` | `0` | shuffle 순서 및 worker 초기화 시드 |
 | `split` | `str` | `"official"` | `"official"` (저자 split: 155/10/10 scenes) 또는 `"seeded_scene"` (season별 계층화 80/10/10) |
-| `shuffle_buffer_size` | `int` | `16` | 학습용 메모리 내 sample shuffle 버퍼 크기 |
+| `shuffle_buffer_size` | `int` | `8` | 학습용 메모리 내 sample shuffle 버퍼 크기 |
 | `num_workers` | `int \| None` | `None` | 자동: train은 `max(1, cpu_count//4)` workers를 사용하고, streaming shard 수가 알려져 있으면 그 수를 넘지 않음; streaming val/test는 1 worker, map-style val/test는 0 |
 | `pin_memory` | `bool` | `False` | 빠른 GPU 전송을 위해 텐서를 고정 메모리에 할당 |
 | `timeout` | `float` | `0.0` | worker 배치를 기다리는 시간 제한(초); `num_workers > 0`인 stage에만 적용 |

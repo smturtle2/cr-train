@@ -6,7 +6,7 @@ import csv
 import hashlib
 import os
 import random
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.resources import files
@@ -461,6 +461,25 @@ def _decode_batch(rows: Sequence[Mapping[str, Any]]) -> SEN12MSCRBatch:
     }
 
 
+def _shuffle_stream_rows(
+    rows: Iterator[Any],
+    *,
+    buffer_size: int,
+    seed: str,
+) -> Iterator[Any]:
+    rng = random.Random(seed)
+    buffer: list[Any] = []
+    for row in rows:
+        if len(buffer) == buffer_size:
+            index = rng.randrange(buffer_size)
+            yield buffer[index]
+            buffer[index] = row
+            continue
+        buffer.append(row)
+    rng.shuffle(buffer)
+    yield from buffer
+
+
 def _collate_sen12mscr_rows(rows: Sequence[Any]) -> Any:
     if not rows:
         raise ValueError("received an empty batch from DataLoader")
@@ -499,7 +518,7 @@ class _StreamingSourceAdapter(IterableDataset[Any]):
 
 
 class _HFStreamingDataset(IterableDataset[Any]):
-    """Recreate the official HF streaming dataset for each iteration/epoch."""
+    """Recreate the official HF streaming dataset and shuffle train samples locally."""
 
     def __init__(
         self,
@@ -514,32 +533,37 @@ class _HFStreamingDataset(IterableDataset[Any]):
         self._stage = stage
         self._seed = seed
         self._shuffle_buffer_size = shuffle_buffer_size
-        self._epoch = 0
+        self._epoch = torch.tensor(0).share_memory_()
 
     @property
     def num_shards(self) -> int:
         return len(self._urls)
 
     def set_epoch(self, epoch: int) -> None:
-        self._epoch = epoch
+        self._epoch.add_(int(epoch) - int(self._epoch.item()))
 
     def _build_source(self) -> HFIterableDataset:
-        source = cast(
+        return cast(
             HFIterableDataset,
             _load_parquet_source(
                 self._urls,
                 streaming=True,
             ),
         )
-        if self._stage == "train":
-            source = source.shuffle(seed=self._seed, buffer_size=self._shuffle_buffer_size)
-            source.set_epoch(self._epoch)
-        return source
 
     def __iter__(self):
         iterator = iter(self._build_source())
+        rows: Any = iterator
+        if self._stage == "train":
+            worker_info = torch.utils.data.get_worker_info()
+            worker_id = 0 if worker_info is None else worker_info.id
+            rows = _shuffle_stream_rows(
+                iterator,
+                buffer_size=self._shuffle_buffer_size,
+                seed=f"{self._seed}:{int(self._epoch.item())}:{worker_id}",
+            )
         try:
-            yield from iterator
+            yield from rows
         finally:
             close = getattr(iterator, "close", None)
             if callable(close):
