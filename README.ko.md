@@ -111,7 +111,7 @@ uv run python examples/bitmask_sampling_demo.py \
   --seed 9
 ```
 
-각 블록의 선택 확률, 랜덤 추출값, 그리고 선택(`■`) vs. 건너뜀(`□`)의 최종 비트맵을 출력합니다.
+stop block 확률표, 샘플링된 stop, prefix draw, 그리고 선택(`■`) vs. 건너뜀(`□`)의 최종 비트맵을 출력합니다.
 
 ---
 
@@ -121,7 +121,7 @@ uv run python examples/bitmask_sampling_demo.py \
 flowchart TD
     HF["HuggingFace Hub<br/><code>Hermanni/sen12mscr</code>"]
     SHUFFLE["스트리밍 셔플<br/><code>dataset_seed</code>"]
-    PLAN["블록 선택 플래너<br/><code>seed</code> · sequential additive exact-k"]
+    PLAN["블록 선택 플래너<br/><code>seed</code> · stop-biased exact-k"]
     CACHE["로컬 블록 캐시<br/>Arrow 청크 · 블록당 16행"]
     DS["CachedBlockDataset"]
     DL["DataLoader<br/>DDP 지원 · pinned memory"]
@@ -216,9 +216,9 @@ HuggingFace의 데이터는 스트리밍으로 가져와 **16행 블록**(`BLOCK
 | 시드 | 제어 대상 | 효과 |
 |------|-----------|------|
 | `dataset_seed` | 정규 셔플 스트림 | `dataset.shuffle(seed=dataset_seed, buffer_size=128)`로 split별 결정적 행 순서를 고정. |
-| `seed` | 블록 선택 | sequential additive 플래너가 `2 * required_blocks` 크기의 후보 윈도우에서 정확히 `ceil(requested_rows / 16)`개의 블록을 선택. |
+| `seed` | 블록 선택 | stop-biased exact-k 플래너가 `2 * required_blocks` 크기의 후보 윈도우 안에서 stop block을 고른 뒤, 그 prefix에서 나머지 블록을 선택. |
 
-선택 확률은 후보 윈도우가 줄어들수록 증가하여 정확한 블록 수를 보장합니다. 동일한 `seed` = 동일한 블록 선택. 다른 `seed`값은 같은 정규 스트림에서 다른 블록을 샘플링합니다.
+플래너는 항상 정확한 블록 수를 결정적으로 반환합니다. 동일한 `seed` = 동일한 블록 선택. 다른 `seed`값은 같은 정규 스트림에서 다른 블록을 샘플링합니다.
 
 ### 캐시 워밍업 생명주기
 

@@ -111,7 +111,7 @@ uv run python examples/bitmask_sampling_demo.py \
   --seed 9
 ```
 
-Output shows each block's take probability, the random draw, and a final bitmap of selected (`■`) vs. skipped (`□`) blocks.
+Output shows the stop-block probability table, the sampled stop, the prefix draws, and a final bitmap of selected (`■`) vs. skipped (`□`) blocks.
 
 ---
 
@@ -121,7 +121,7 @@ Output shows each block's take probability, the random draw, and a final bitmap 
 flowchart TD
     HF["HuggingFace Hub<br/><code>Hermanni/sen12mscr</code>"]
     SHUFFLE["Streaming Shuffle<br/><code>dataset_seed</code>"]
-    PLAN["Block Selection Planner<br/><code>seed</code> · sequential additive exact-k"]
+    PLAN["Block Selection Planner<br/><code>seed</code> · stop-biased exact-k"]
     CACHE["Local Block Cache<br/>Arrow chunks · 16 rows/block"]
     DS["CachedBlockDataset"]
     DL["DataLoader<br/>DDP-aware · pinned memory"]
@@ -216,9 +216,9 @@ The system uses two independent seeds for full reproducibility:
 | Seed | Controls | Effect |
 |------|----------|--------|
 | `dataset_seed` | Canonical shuffled stream | `dataset.shuffle(seed=dataset_seed, buffer_size=128)` fixes a deterministic row ordering per split. |
-| `seed` | Block selection | A sequential additive planner selects exactly `ceil(requested_rows / 16)` blocks from a candidate window of `2 * required_blocks`. |
+| `seed` | Block selection | A stop-biased exact-k planner samples a stop block inside a candidate window of `2 * required_blocks`, then draws the remaining blocks from its prefix. |
 
-The take probability increases as the candidate window shrinks, guaranteeing the exact block count. Same `seed` = same block selection across runs. Different `seed` values sample different blocks from the same canonical stream.
+The planner remains deterministic and always returns exactly the required block count. Same `seed` = same block selection across runs. Different `seed` values sample different blocks from the same canonical stream.
 
 ### Cache warmup lifecycle
 
