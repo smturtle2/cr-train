@@ -12,26 +12,27 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 import pyarrow.ipc
-from datasets import Dataset, disable_progress_bars, enable_progress_bars, is_progress_bar_enabled
+from datasets import disable_progress_bars, enable_progress_bars, is_progress_bar_enabled
 
 from .constants import BLOCK_SIZE, DATA_COLUMNS, DEFAULT_DATASET_SEED, LOCK_POLL_INTERVAL_SECONDS, LOCK_TIMEOUT_SECONDS, OPTICAL_CHANNELS, SAR_CHANNELS
 
 
 @dataclass(slots=True)
 class SplitBlockCacheState:
-    """블록 캐시의 영속 상태. canonical_frontier_block이 스트림 재개 위치를 추적."""
+    """블록 캐시의 영속 상태. frontier가 contiguous canonical prefix 범위를 추적."""
 
     dataset_seed: int
     shuffle_buffer_size: int
     block_size: int
     total_rows: int
     total_blocks: int
-    canonical_frontier_block: int
+    frontier_block: int
+    frontier_row: int
 
 
 @dataclass(slots=True)
 class SplitBlockCache:
-    """split 블록 캐시의 인메모리 표현. cached 비트맵으로 블록별 캐시 여부 관리."""
+    """split 블록 캐시의 인메모리 표현. cached는 항상 contiguous prefix를 이룬다."""
 
     state: SplitBlockCacheState
     cached: np.ndarray
@@ -190,11 +191,6 @@ def suppress_hf_datasets_progress_bars():
             enable_progress_bars()
 
 
-def save_dataset_without_progress(dataset: Dataset, path: Path) -> None:
-    with suppress_hf_datasets_progress_bars():
-        dataset.save_to_disk(str(path))
-
-
 def _chunk_path(chunk_root: Path, chunk_index: int) -> Path:
     return chunk_root / f"{chunk_index:08d}.arrow"
 
@@ -315,7 +311,8 @@ def load_or_init_block_cache(
                 block_size=int(payload["block_size"]),
                 total_rows=int(payload["total_rows"]),
                 total_blocks=int(payload["total_blocks"]),
-                canonical_frontier_block=int(payload["canonical_frontier_block"]),
+                frontier_block=int(payload["frontier_block"]),
+                frontier_row=int(payload["frontier_row"]),
             ),
             cached=load_numpy(paths.cached_path),
             chunk_ids=load_numpy(paths.chunk_ids_path),
@@ -330,7 +327,8 @@ def load_or_init_block_cache(
                 block_size=BLOCK_SIZE,
                 total_rows=total_rows,
                 total_blocks=total_blocks,
-                canonical_frontier_block=0,
+                frontier_block=0,
+                frontier_row=0,
             ),
             cached=np.zeros(total_blocks, dtype=np.bool_),
             chunk_ids=np.full(total_blocks, -1, dtype=np.int32),
@@ -354,6 +352,27 @@ def load_or_init_block_cache(
         or len(cache.block_row_counts) != total_blocks
     ):
         raise ValueError(f"block cache index mismatch: {paths.store_root}")
+    if state.frontier_block < 0 or state.frontier_block > total_blocks:
+        raise ValueError(f"invalid cache frontier block: {paths.store_root}")
+    if state.frontier_row < 0 or state.frontier_row > total_rows:
+        raise ValueError(f"invalid cache frontier row: {paths.store_root}")
+    if state.frontier_block > 0:
+        if not np.all(cache.cached[:state.frontier_block]):
+            raise ValueError(f"cache prefix contains gaps before frontier: {paths.store_root}")
+        if np.any(~cache.cached[:state.frontier_block]):
+            raise ValueError(f"cache prefix contains missing blocks before frontier: {paths.store_root}")
+    if state.frontier_block < total_blocks and np.any(cache.cached[state.frontier_block:]):
+        raise ValueError(f"cache contains blocks beyond frontier: {paths.store_root}")
+    if state.frontier_block > 0:
+        if np.any(cache.chunk_ids[:state.frontier_block] < 0):
+            raise ValueError(f"cache prefix is missing chunk ids: {paths.store_root}")
+        if np.any(cache.block_offsets[:state.frontier_block] < 0):
+            raise ValueError(f"cache prefix is missing block offsets: {paths.store_root}")
+        if np.any(cache.block_row_counts[:state.frontier_block] <= 0):
+            raise ValueError(f"cache prefix has invalid row counts: {paths.store_root}")
+    expected_frontier_row = int(np.sum(cache.block_row_counts[:state.frontier_block], dtype=np.int64))
+    if state.frontier_row != expected_frontier_row:
+        raise ValueError(f"cache frontier row mismatch: {paths.store_root}")
     return cache
 
 
@@ -367,7 +386,8 @@ def write_block_cache(paths: BlockCachePaths, cache: SplitBlockCache) -> None:
             "block_size": state.block_size,
             "total_rows": state.total_rows,
             "total_blocks": state.total_blocks,
-            "canonical_frontier_block": state.canonical_frontier_block,
+            "frontier_block": state.frontier_block,
+            "frontier_row": state.frontier_row,
         },
     )
     write_numpy_atomic(paths.cached_path, cache.cached)
@@ -387,6 +407,10 @@ def materialize_blocks(
     """블록을 청크로 저장하고 캐시 인덱스 갱신. (저장된 블록 수, 다음 chunk index) 반환."""
     if not blocks:
         return 0, next_chunk_index if next_chunk_index is not None else _next_chunk_index(paths.chunk_root)
+    if start_block != cache.state.frontier_block:
+        raise ValueError(
+            f"materialize_blocks must append at the frontier: {start_block} != {cache.state.frontier_block}"
+        )
 
     chunk_index = save_chunk(paths, [row for block_rows in blocks for row in block_rows], chunk_index=next_chunk_index)
     row_offset = 0
@@ -397,6 +421,8 @@ def materialize_blocks(
         cache.block_offsets[block_index] = row_offset
         cache.block_row_counts[block_index] = len(block_rows)
         row_offset += len(block_rows)
+    cache.state.frontier_block += len(blocks)
+    cache.state.frontier_row += row_offset
     return len(blocks), chunk_index + 1
 
 
@@ -416,7 +442,6 @@ __all__ = [
     "resolve_cache_root",
     "resolve_dataset_seed",
     "save_chunk",
-    "save_dataset_without_progress",
     "suppress_hf_datasets_progress_bars",
     "write_block_cache",
     "write_json_atomic",

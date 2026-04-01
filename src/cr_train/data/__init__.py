@@ -7,6 +7,7 @@ from .constants import (
     DATASET_ID,
     OPTICAL_CHANNELS,
     SAR_CHANNELS,
+    STOP_BIAS_ALPHA,
 )
 from .dataset import (
     CachedBlockDataset,
@@ -24,12 +25,14 @@ from .planning import (
     CachePlan,
     ExecutionRun,
     SamplePlan,
+    SelectionTrace,
     build_cache_plan,
     compute_base_take_probability,
+    compute_stop_probability,
     compute_take_probability,
     compress_execution_runs,
-    compress_frontier_runs,
     plan_sample,
+    trace_plan_sample,
 )
 from .runtime import WarmupProgressState, ensure_split_cache, get_rank, get_world_size, is_distributed, is_primary
 from .source import (
@@ -50,7 +53,6 @@ from .store import (
     read_json,
     remove_tree,
     resolve_cache_root,
-    save_dataset_without_progress,
     suppress_hf_datasets_progress_bars,
     write_json_atomic,
 )
@@ -68,15 +70,17 @@ __all__ = [
     "PreparedSplit",
     "SAR_CHANNELS",
     "SamplePlan",
+    "SelectionTrace",
     "SplitBlockCache",
     "SplitBlockCacheState",
+    "STOP_BIAS_ALPHA",
     "WarmupProgressState",
     "build_cache_plan",
     "build_collate_fn",
     "build_dataloader",
     "compress_execution_runs",
-    "compress_frontier_runs",
     "compute_base_take_probability",
+    "compute_stop_probability",
     "compute_take_probability",
     "decode_row",
     "emit_startup_event",
@@ -100,9 +104,9 @@ __all__ = [
     "resolve_cache_root",
     "resolve_num_workers",
     "run_startup_stage",
-    "save_dataset_without_progress",
     "seed_everything",
     "seed_worker",
     "suppress_hf_datasets_progress_bars",
+    "trace_plan_sample",
     "write_json_atomic",
 ]

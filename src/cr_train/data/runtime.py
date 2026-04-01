@@ -48,13 +48,15 @@ class WarmupSummary:
     required_blocks: int
     candidate_blocks: int
     planner_mode: str
-    base_take_prob: float
-    cached_blocks: int
-    missing_blocks: int
+    stop_bias_alpha: float
+    selected_block_count: int
+    cached_selected_blocks: int
+    selected_missing_blocks: int
+    extension_blocks: int
     cache_only: bool
-    run_count: int
-    compressed_block_count: int
-    frontier_run_count: int
+    execution_block_count: int
+    frontier_before: int
+    frontier_after: int
     resolved_blocks: int = 0
 
     @classmethod
@@ -67,13 +69,15 @@ class WarmupSummary:
             required_blocks=sample_plan.required_blocks,
             candidate_blocks=sample_plan.candidate_blocks,
             planner_mode=sample_plan.planner_mode,
-            base_take_prob=sample_plan.base_take_prob,
-            cached_blocks=cache_plan.cached_blocks,
-            missing_blocks=cache_plan.missing_blocks,
+            stop_bias_alpha=sample_plan.stop_bias_alpha,
+            selected_block_count=sample_plan.required_blocks,
+            cached_selected_blocks=cache_plan.cached_selected_blocks,
+            selected_missing_blocks=cache_plan.selected_missing_blocks,
+            extension_blocks=cache_plan.extension_blocks,
             cache_only=cache_plan.cache_only,
-            run_count=len(cache_plan.execution_runs),
-            compressed_block_count=sample_plan.execution_block_count,
-            frontier_run_count=len(cache_plan.frontier_runs),
+            execution_block_count=sample_plan.execution_block_count,
+            frontier_before=cache_plan.frontier_before,
+            frontier_after=cache_plan.frontier_after,
             resolved_blocks=resolved_blocks,
         )
 
@@ -85,13 +89,15 @@ class WarmupSummary:
             "required_blocks": self.required_blocks,
             "candidate_blocks": self.candidate_blocks,
             "planner_mode": self.planner_mode,
-            "base_take_prob": self.base_take_prob,
-            "cached_blocks": self.cached_blocks,
-            "missing_blocks": self.missing_blocks,
+            "stop_bias_alpha": self.stop_bias_alpha,
+            "selected_block_count": self.selected_block_count,
+            "cached_selected_blocks": self.cached_selected_blocks,
+            "selected_missing_blocks": self.selected_missing_blocks,
+            "extension_blocks": self.extension_blocks,
             "cache_only": self.cache_only,
-            "run_count": self.run_count,
-            "compressed_block_count": self.compressed_block_count,
-            "frontier_run_count": self.frontier_run_count,
+            "execution_block_count": self.execution_block_count,
+            "frontier_before": self.frontier_before,
+            "frontier_after": self.frontier_after,
             "resolved_blocks": self.resolved_blocks,
         }
 
@@ -194,8 +200,8 @@ def _update_warmup_progress(
     *,
     state: WarmupProgressState,
     resolved_blocks: int,
-    missing_blocks: int,
-    cached_blocks: int,
+    extension_blocks: int,
+    selected_block_count: int,
     force: bool = False,
 ) -> None:
     if getattr(progress, "disable", False):
@@ -225,8 +231,8 @@ def _update_warmup_progress(
     speed = state.ema_blocks_per_sec or 0.0
     progress.set_postfix(
         {
-            "hit": cached_blocks,
-            "miss": f"{resolved_blocks}/{missing_blocks}",
+            "sel": selected_block_count,
+            "fill": f"{resolved_blocks}/{extension_blocks}",
             "blk/s": f"{speed:.1f}" if speed < 100 else f"{speed:.0f}",
         }
     )
@@ -244,9 +250,7 @@ def _warm_missing_blocks(
     cache_plan: CachePlan,
     predecoded: bool = False,
 ) -> int:
-    total_frontier_blocks = cache_plan.stream_start_block + sum(
-        run.block_count for run in cache_plan.frontier_runs
-    )
+    total_frontier_blocks = cache_plan.frontier_after
     resolved_blocks = 0
     progress = tqdm(
         total=total_frontier_blocks,
@@ -273,42 +277,34 @@ def _warm_missing_blocks(
 
     next_chunk_index: int | None = None
     try:
-        # HF streaming은 seek 불가 — frontier 이전 블록을 순차 스킵
-        if cache_plan.stream_start_block > 0:
+        # HF streaming은 seek 불가 — 현재 contiguous prefix frontier까지 한 번에 전진
+        if cache_plan.frontier_before > 0:
             _desc("seek")
-            _skip_canonical_blocks(row_iterator, cache_plan.stream_start_block)
-            progress.update(cache_plan.stream_start_block)
-        for run in cache_plan.frontier_runs:
-            if run.kind == "skip":
-                _desc(f"skip {run.block_count}blk")
-                _skip_canonical_blocks(row_iterator, run.block_count)
-                progress.update(run.block_count)
-                # frontier 위치 갱신 (순차 처리라 항상 증가)
-                cache.state.canonical_frontier_block = run.stop_block
-                continue
-
-            _desc(f"fetch blk {run.start_block}-{run.stop_block - 1}")
-            all_blocks = _read_canonical_blocks(row_iterator, run.block_count)
+            _skip_canonical_blocks(row_iterator, cache_plan.frontier_before)
+            progress.update(cache_plan.frontier_before)
+        extension_blocks = cache_plan.frontier_after - cache_plan.frontier_before
+        if extension_blocks > 0:
+            _desc(f"fill blk {cache_plan.frontier_before}-{cache_plan.frontier_after - 1}")
+            all_blocks = _read_canonical_blocks(row_iterator, extension_blocks)
             if predecoded:
                 all_blocks = [[predecode_row(row) for row in block] for block in all_blocks]
             for chunk_start in range(0, len(all_blocks), CHUNK_TARGET_BLOCKS):
                 chunk_blocks = all_blocks[chunk_start:chunk_start + CHUNK_TARGET_BLOCKS]
                 count, next_chunk_index = materialize_blocks(
                     cache_paths,
-                    start_block=run.start_block + chunk_start,
+                    start_block=cache_plan.frontier_before + chunk_start,
                     blocks=chunk_blocks,
                     cache=cache,
                     next_chunk_index=next_chunk_index,
                 )
                 resolved_blocks += count
-            cache.state.canonical_frontier_block = run.stop_block
-            progress.update(run.block_count)
+            progress.update(extension_blocks)
             _update_warmup_progress(
                 progress,
                 state=progress_state,
                 resolved_blocks=resolved_blocks,
-                missing_blocks=cache_plan.missing_blocks,
-                cached_blocks=cache_plan.cached_blocks,
+                extension_blocks=cache_plan.extension_blocks,
+                selected_block_count=cache_plan.sample_plan.required_blocks,
             )
         # 루프 종료 후 캐시 인덱스를 한 번만 디스크에 기록
         write_block_cache(cache_paths, cache)
@@ -318,8 +314,8 @@ def _warm_missing_blocks(
             progress,
             state=progress_state,
             resolved_blocks=resolved_blocks,
-            missing_blocks=cache_plan.missing_blocks,
-            cached_blocks=cache_plan.cached_blocks,
+            extension_blocks=cache_plan.extension_blocks,
+            selected_block_count=cache_plan.sample_plan.required_blocks,
             force=True,
         )
         progress.close()
@@ -368,7 +364,7 @@ def ensure_split_cache(
     cache_plan = build_cache_plan(
         sample_plan,
         cache.cached,
-        frontier_block=cache.state.canonical_frontier_block,
+        frontier_block=cache.state.frontier_block,
     )
 
     summary = WarmupSummary.from_cache_plan(resolved_dataset_seed, cache_plan)

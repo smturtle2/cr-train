@@ -214,7 +214,7 @@ def prepare_split(
         required_blocks=sample_plan.required_blocks,
         candidate_blocks=sample_plan.candidate_blocks,
         planner_mode=sample_plan.planner_mode,
-        base_take_prob=sample_plan.base_take_prob,
+        stop_bias_alpha=sample_plan.stop_bias_alpha,
         run_count=len(execution_runs),
     )
     return PreparedSplit(dataset=dataset)
@@ -285,6 +285,15 @@ def _resolve_chw_shape(shape: Any, expected_channels: int) -> tuple[int, int, in
     raise ValueError(f"could not infer channel dimension from shape {resolved!r}")
 
 
+def _as_writable_buffer(buffer: Any) -> bytearray | memoryview:
+    """torch.frombuffer 경고를 피하기 위해 writable backing store를 보장."""
+    if isinstance(buffer, bytearray):
+        return buffer
+    if isinstance(buffer, memoryview) and not buffer.readonly:
+        return buffer
+    return bytearray(as_bytes(buffer))
+
+
 def _decode_image_into(
     dest: torch.Tensor,
     buffer: Any,
@@ -297,7 +306,7 @@ def _decode_image_into(
     scale: float = 1.0,
 ) -> None:
     """원시 바이너리를 pre-allocated CHW float32 텐서에 직접 디코딩. 중간 numpy 복사 제거."""
-    raw = torch.frombuffer(as_bytes(buffer), dtype=src_dtype)
+    raw = torch.frombuffer(_as_writable_buffer(buffer), dtype=src_dtype)
     resolved_shape = _as_shape(shape)
     expected_size = math.prod(resolved_shape)
     if raw.numel() != expected_size:
