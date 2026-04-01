@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from .constants import (
     BLOCK_SIZE,
     CANONICAL_SHUFFLE_BUFFER_SIZE,
+    CHUNK_TARGET_BLOCKS,
     DATA_COLUMNS,
     WARMUP_SPEED_EMA_ALPHA,
     WARMUP_TIMELINE_WIDTH,
@@ -22,6 +23,7 @@ from .store import (
     freeze_row,
     load_or_init_block_cache,
     materialize_blocks,
+    predecode_row,
     resolve_block_cache_paths,
     resolve_dataset_seed,
     suppress_hf_datasets_progress_bars,
@@ -240,6 +242,7 @@ def _warm_missing_blocks(
     cache_paths,
     cache: SplitBlockCache,
     cache_plan: CachePlan,
+    predecoded: bool = False,
 ) -> int:
     total_frontier_blocks = cache_plan.stream_start_block + sum(
         run.block_count for run in cache_plan.frontier_runs
@@ -268,6 +271,7 @@ def _warm_missing_blocks(
         if hasattr(progress, "set_description_str"):
             progress.set_description_str(f"cache {split} {label}", refresh=False)
 
+    next_chunk_index: int | None = None
     try:
         # HF streaming은 seek 불가 — frontier 이전 블록을 순차 스킵
         if cache_plan.stream_start_block > 0:
@@ -284,12 +288,19 @@ def _warm_missing_blocks(
                 continue
 
             _desc(f"fetch blk {run.start_block}-{run.stop_block - 1}")
-            resolved_blocks += materialize_blocks(
-                cache_paths,
-                start_block=run.start_block,
-                blocks=_read_canonical_blocks(row_iterator, run.block_count),
-                cache=cache,
-            )
+            all_blocks = _read_canonical_blocks(row_iterator, run.block_count)
+            if predecoded:
+                all_blocks = [[predecode_row(row) for row in block] for block in all_blocks]
+            for chunk_start in range(0, len(all_blocks), CHUNK_TARGET_BLOCKS):
+                chunk_blocks = all_blocks[chunk_start:chunk_start + CHUNK_TARGET_BLOCKS]
+                count, next_chunk_index = materialize_blocks(
+                    cache_paths,
+                    start_block=run.start_block + chunk_start,
+                    blocks=chunk_blocks,
+                    cache=cache,
+                    next_chunk_index=next_chunk_index,
+                )
+                resolved_blocks += count
             cache.state.canonical_frontier_block = run.stop_block
             progress.update(run.block_count)
             _update_warmup_progress(
@@ -325,6 +336,7 @@ def ensure_split_cache(
     dataset_seed: int | None,
     cache_root: Path,
     startup_callback=None,
+    predecoded: bool = False,
 ) -> Path:
     """split에 필요한 블록이 모두 캐시되었는지 확인하고, 누락된 블록은 HF에서 가져와 채운다."""
     source_root, descriptor = ensure_source_root(
@@ -338,6 +350,7 @@ def ensure_split_cache(
         split,
         resolved_dataset_seed,
         CANONICAL_SHUFFLE_BUFFER_SIZE,
+        predecoded=predecoded,
     )
     catalog = ensure_split_catalog(
         source_root=source_root,
@@ -382,6 +395,7 @@ def ensure_split_cache(
         cache_paths=cache_paths,
         cache=cache,
         cache_plan=cache_plan,
+        predecoded=predecoded,
     )
     _emit_warmup_summary(
         startup_callback, split=split, status="done",

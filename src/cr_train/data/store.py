@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.ipc
 from datasets import Dataset, disable_progress_bars, enable_progress_bars, is_progress_bar_enabled
 
-from .constants import BLOCK_SIZE, DATA_COLUMNS, DEFAULT_DATASET_SEED, LOCK_POLL_INTERVAL_SECONDS, LOCK_TIMEOUT_SECONDS
+from .constants import BLOCK_SIZE, DATA_COLUMNS, DEFAULT_DATASET_SEED, LOCK_POLL_INTERVAL_SECONDS, LOCK_TIMEOUT_SECONDS, OPTICAL_CHANNELS, SAR_CHANNELS
 
 
 @dataclass(slots=True)
@@ -71,12 +73,17 @@ def resolve_block_cache_paths(
     split: str,
     dataset_seed: int,
     shuffle_buffer_size: int,
+    *,
+    predecoded: bool = False,
 ) -> BlockCachePaths:
+    dirname = f"dataset-seed={dataset_seed}-shuffle-buffer={shuffle_buffer_size}"
+    if predecoded:
+        dirname += "-predecoded"
     store_root = (
         source_root
         / "block_store"
         / split
-        / f"dataset-seed={dataset_seed}-shuffle-buffer={shuffle_buffer_size}"
+        / dirname
     )
     store_root.mkdir(parents=True, exist_ok=True)
     chunk_root = store_root / "chunks"
@@ -183,27 +190,37 @@ def suppress_hf_datasets_progress_bars():
             enable_progress_bars()
 
 
-def _chunk_path(chunk_root: Path, chunk_index: int) -> Path:
-    return chunk_root / f"{chunk_index:08d}"
-
-
-def _next_chunk_index(chunk_root: Path) -> int:
-    existing = [int(path.name) for path in chunk_root.iterdir() if path.is_dir() and path.name.isdigit()]
-    return 0 if not existing else max(existing) + 1
-
-
 def save_dataset_without_progress(dataset: Dataset, path: Path) -> None:
     with suppress_hf_datasets_progress_bars():
         dataset.save_to_disk(str(path))
 
 
-def save_chunk(paths: BlockCachePaths, rows: list[dict[str, Any]]) -> int:
-    chunk_index = _next_chunk_index(paths.chunk_root)
-    chunk_dir = _chunk_path(paths.chunk_root, chunk_index)
-    tmp_dir = chunk_dir.with_suffix(".tmp")
-    remove_tree(tmp_dir)
-    save_dataset_without_progress(Dataset.from_list(rows), tmp_dir)
-    tmp_dir.replace(chunk_dir)
+def _chunk_path(chunk_root: Path, chunk_index: int) -> Path:
+    return chunk_root / f"{chunk_index:08d}.arrow"
+
+
+def _next_chunk_index(chunk_root: Path) -> int:
+    existing = [
+        int(path.stem)
+        for path in chunk_root.iterdir()
+        if path.is_file() and path.suffix == ".arrow" and path.stem.isdigit()
+    ]
+    return 0 if not existing else max(existing) + 1
+
+
+def save_chunk(paths: BlockCachePaths, rows: list[dict[str, Any]], *, chunk_index: int | None = None) -> int:
+    """청크를 Arrow IPC 파일로 저장. HF Datasets 우회하여 직접 pyarrow 사용."""
+    if chunk_index is None:
+        chunk_index = _next_chunk_index(paths.chunk_root)
+    chunk_file = _chunk_path(paths.chunk_root, chunk_index)
+    tmp_file = chunk_file.with_suffix(".tmp")
+    remove_tree(tmp_file)
+    table = pa.table({col: [row[col] for row in rows] for col in DATA_COLUMNS})
+    with pa.OSFile(str(tmp_file), "wb") as sink:
+        writer = pa.ipc.new_file(sink, table.schema)
+        writer.write_table(table)
+        writer.close()
+    tmp_file.replace(chunk_file)
     return chunk_index
 
 
@@ -233,6 +250,43 @@ def freeze_value(value: Any) -> Any:
 
 def freeze_row(row: dict[str, Any]) -> dict[str, Any]:
     return {key: freeze_value(value) for key, value in row.items() if key in DATA_COLUMNS}
+
+
+def _decode_chw(buffer: bytes, shape: tuple[int, ...], *, src_dtype: np.dtype, expected_channels: int) -> np.ndarray:
+    """바이너리를 float32 CHW 배열로 디코딩. predecode_row 내부 헬퍼."""
+    raw = np.frombuffer(buffer, dtype=src_dtype).reshape(shape)
+    if raw.shape[-1] == expected_channels and raw.shape[0] != expected_channels:
+        raw = np.transpose(raw, (2, 0, 1))
+    return np.ascontiguousarray(raw, dtype=np.float32)
+
+
+def predecode_row(row: dict[str, Any]) -> dict[str, Any]:
+    """frozen row에 DSen2-CR 스케일링을 적용하여 float32 CHW로 변환."""
+    # DSen2-CR SAR: VV clip[-25,0]→[0,2], VH clip[-32.5,0]→[0,2]
+    sar = _decode_chw(as_bytes(row["sar"]), tuple(row["sar_shape"]), src_dtype=np.float32, expected_channels=SAR_CHANNELS)
+    np.clip(sar[0], -25.0, 0.0, out=sar[0])
+    sar[0] += 25.0
+    sar[0] *= 2.0 / 25.0
+    np.clip(sar[1], -32.5, 0.0, out=sar[1])
+    sar[1] += 32.5
+    sar[1] *= 2.0 / 32.5
+    # DSen2-CR Optical: clip[0,10000]→/2000→[0,5]
+    cloudy = _decode_chw(as_bytes(row["cloudy"]), tuple(row["opt_shape"]), src_dtype=np.int16, expected_channels=OPTICAL_CHANNELS)
+    np.clip(cloudy, 0, 10000, out=cloudy)
+    cloudy /= 2000.0
+    target = _decode_chw(as_bytes(row["target"]), tuple(row["opt_shape"]), src_dtype=np.int16, expected_channels=OPTICAL_CHANNELS)
+    np.clip(target, 0, 10000, out=target)
+    target /= 2000.0
+    return {
+        "sar": sar.tobytes(),
+        "cloudy": cloudy.tobytes(),
+        "target": target.tobytes(),
+        "sar_shape": list(sar.shape),
+        "opt_shape": list(cloudy.shape),
+        "season": row.get("season", ""),
+        "scene": row.get("scene", ""),
+        "patch": row.get("patch", ""),
+    }
 
 
 def load_or_init_block_cache(
@@ -328,11 +382,13 @@ def materialize_blocks(
     start_block: int,
     blocks: list[list[dict[str, Any]]],
     cache: SplitBlockCache,
-) -> int:
+    next_chunk_index: int | None = None,
+) -> tuple[int, int]:
+    """블록을 청크로 저장하고 캐시 인덱스 갱신. (저장된 블록 수, 다음 chunk index) 반환."""
     if not blocks:
-        return 0
+        return 0, next_chunk_index if next_chunk_index is not None else _next_chunk_index(paths.chunk_root)
 
-    chunk_index = save_chunk(paths, [row for block_rows in blocks for row in block_rows])
+    chunk_index = save_chunk(paths, [row for block_rows in blocks for row in block_rows], chunk_index=next_chunk_index)
     row_offset = 0
     for block_offset, block_rows in enumerate(blocks):
         block_index = start_block + block_offset
@@ -341,7 +397,7 @@ def materialize_blocks(
         cache.block_offsets[block_index] = row_offset
         cache.block_row_counts[block_index] = len(block_rows)
         row_offset += len(block_rows)
-    return len(blocks)
+    return len(blocks), chunk_index + 1
 
 
 __all__ = [

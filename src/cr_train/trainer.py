@@ -58,6 +58,7 @@ class Trainer:
         dataset_seed: int | None = None,
         output_dir: str | Path = "runs/default",
         cache_dir: str | Path | None = None,
+        predecoded: bool = False,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
@@ -91,6 +92,7 @@ class Trainer:
         self.seed = seed
         self.dataset_seed = dataset_seed
 
+        self.predecoded = predecoded
         self.num_workers = resolve_num_workers("auto")
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -294,6 +296,7 @@ class Trainer:
                 dataset_seed=self.dataset_seed,
                 cache_root=self.cache_root,
                 startup_callback=self._handle_startup_event,
+                predecoded=self.predecoded,
             )
         self._cache_ready = True
 
@@ -314,6 +317,7 @@ class Trainer:
             dataset_seed=self.dataset_seed,
             cache_root=self.cache_root,
             startup_callback=self._handle_startup_event,
+            predecoded=self.predecoded,
         )
         loader = run_startup_stage(
             self._handle_startup_event,
@@ -327,6 +331,7 @@ class Trainer:
                 seed=self.seed,
                 epoch=epoch_index,
                 include_metadata=self.include_metadata,
+                predecoded=self.predecoded,
                 pin_memory=self.pin_memory,
                 persistent_workers=self.persistent_workers,
                 prefetch_factor=self.prefetch_factor,

@@ -503,3 +503,34 @@ def test_prepare_split_reads_cached_rows_in_selected_canonical_block_order(monke
 
     assert stats["load_dataset_calls"] == ["validation"]
     assert batch_scenes == [str(row["scene"]) for row in expected_rows]
+
+
+def test_predecoded_cache_produces_identical_batch_values(monkeypatch, tmp_path: Path) -> None:
+    """predecoded=True 캐시로부터 생성된 배치가 일반 캐시와 동일한 텐서 값을 갖는지 확인."""
+    rows = [_make_row(index) for index in range(2 * BLOCK_SIZE)]
+    split_rows = {"train": rows, "validation": rows, "test": rows}
+    _patch_source(monkeypatch, split_rows)
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", _FakeTqdm)
+
+    common = dict(
+        split="train", dataset_name="unit/test", revision=None,
+        max_samples=BLOCK_SIZE, seed=7, dataset_seed=3,
+    )
+
+    # 일반 캐시
+    ensure_split_cache(**common, cache_root=tmp_path / "normal")
+    normal_prepared = prepare_split(**common, cache_root=tmp_path / "normal")
+    normal_loader = build_dataloader(normal_prepared, batch_size=BLOCK_SIZE, num_workers=0, training=False, seed=7, epoch=0)
+    normal_batch = next(iter(normal_loader))
+
+    # predecoded 캐시
+    ensure_split_cache(**common, cache_root=tmp_path / "predec", predecoded=True)
+    predec_prepared = prepare_split(**common, cache_root=tmp_path / "predec", predecoded=True)
+    predec_loader = build_dataloader(predec_prepared, batch_size=BLOCK_SIZE, num_workers=0, training=False, seed=7, epoch=0, predecoded=True)
+    predec_batch = next(iter(predec_loader))
+
+    import torch
+    assert torch.allclose(normal_batch["sar"], predec_batch["sar"], atol=1e-6)
+    assert torch.allclose(normal_batch["cloudy"], predec_batch["cloudy"], atol=1e-6)
+    assert torch.allclose(normal_batch["target"], predec_batch["target"], atol=1e-6)
+    assert normal_batch["meta"]["scene"] == predec_batch["meta"]["scene"]
