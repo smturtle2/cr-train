@@ -25,5 +25,5 @@ def test_bitmask_demo_example_loads_without_running_main() -> None:
 
     assert "main" in namespace
     assert result["required_blocks"] == 3
-    assert result["candidate_blocks"] == 8
+    assert result["candidate_blocks"] == 6
     assert len(result["selected_blocks"]) == 3

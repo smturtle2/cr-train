@@ -277,8 +277,8 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert len(warmup_bars) == 3
     assert all(int(bar.total) >= 1 for bar in warmup_bars)
     assert all(sum(bar.updates) == int(bar.total) for bar in warmup_bars)
-    assert all(any("miss" in values for values in bar.postfixes) for bar in warmup_bars)
-    assert all(any("hit" in values for values in bar.postfixes) for bar in warmup_bars)
+    assert all(any("fill" in values for values in bar.postfixes) for bar in warmup_bars)
+    assert all(any("sel" in values for values in bar.postfixes) for bar in warmup_bars)
     assert all(any("blk/s" in values for values in bar.postfixes) for bar in warmup_bars)
     assert all(all("runs" not in values for values in bar.postfixes) for bar in warmup_bars)
 
@@ -300,18 +300,20 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
                 warmup_bars_by_split[split] = bar
                 break
 
-    assert [record["missing_blocks"] for record in warmup_done_records[:3]] == [2, 1, 1]
-    assert all(record["run_count"] >= 1 for record in warmup_done_records[:3])
-    assert all(record["planner_mode"] == "sequential_additive_exact_k" for record in warmup_done_records[:3])
-    assert all(record["base_take_prob"] > 0.0 for record in warmup_done_records[:3])
+    assert [record["selected_block_count"] for record in warmup_done_records[:3]] == [2, 1, 1]
+    assert all(record["planner_mode"] == "stop_biased_exact_k" for record in warmup_done_records[:3])
+    assert all(record["stop_bias_alpha"] == 8.0 for record in warmup_done_records[:3])
     assert all("timeline" in record for record in warmup_done_records[:3])
-    assert all(len(str(record["timeline"])) == int(record["compressed_block_count"]) for record in warmup_done_records[:3])
+    assert all(len(str(record["timeline"])) == int(record["execution_block_count"]) for record in warmup_done_records[:3])
     assert all(set(str(record["timeline"])) <= {"█", "░"} for record in warmup_done_records[:3])
+    assert all(record["frontier_before"] == 0 for record in warmup_done_records[:3])
+    assert all(record["frontier_after"] == record["execution_block_count"] for record in warmup_done_records[:3])
+    assert all(record["extension_blocks"] == record["execution_block_count"] for record in warmup_done_records[:3])
 
     for split, record in warmup_records_by_split.items():
         expected_summary = (
             f"{record['timeline']} cache {split} | warm | "
-            f"hit={record['cached_blocks']} miss={record['missing_blocks']} runs={record['run_count']}"
+            f"selected={record['selected_block_count']} frontier={record['frontier_before']}->{record['frontier_after']}"
         )
         assert expected_summary in FakeTqdm.writes
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from datasets import IterableDataset
 
-from cr_train.take_cache import _take_from_prefix_rows, take_rows_official, take_rows_with_prefix_cache
+from cr_train.take_cache import take_rows_official, take_rows_with_prefix_cache
 
 
 class _FakeRowGroupMetadata:
@@ -159,21 +159,6 @@ def _patch_take_source(monkeypatch, split_shards: dict[str, list[dict[str, objec
     monkeypatch.setattr("cr_train.take_cache.pq.ParquetFile", fake_parquet_file)
     monkeypatch.setattr("cr_train.take_cache.load_dataset", fake_load_dataset)
     return stats
-
-
-def test_take_from_prefix_rows_matches_official_shuffle_take() -> None:
-    buffer_size = 10
-    sample_size = 20
-    prefix_rows = [{"id": index} for index in range(buffer_size + sample_size)]
-
-    def generator():
-        for index in range(100):
-            yield {"id": index}
-
-    baseline = [row["id"] for row in IterableDataset.from_generator(generator).shuffle(seed=42, buffer_size=buffer_size).take(sample_size)]
-    replayed = [row["id"] for row in _take_from_prefix_rows(prefix_rows, seed=42, sample_size=sample_size, buffer_size=buffer_size)]
-
-    assert replayed == baseline
 
 
 def test_prefix_cache_reuses_across_seeds_and_extends_only_the_tail(monkeypatch, tmp_path: Path) -> None:

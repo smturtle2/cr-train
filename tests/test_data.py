@@ -9,11 +9,11 @@ import pytest
 from cr_train.data import (
     BLOCK_SIZE,
     CANONICAL_SHUFFLE_BUFFER_SIZE,
+    STOP_BIAS_ALPHA,
     build_collate_fn,
     build_dataloader,
     compress_execution_runs,
-    compute_base_take_probability,
-    compute_take_probability,
+    compute_stop_probability,
     decode_row,
     ensure_split_cache,
     normalize_parquet_uri,
@@ -237,33 +237,34 @@ def testplan_sample_is_block_reproducible_and_candidate_bounded() -> None:
 
     sample_a = plan_sample(catalog, seed=7, max_samples=20)
     sample_b = plan_sample(catalog, seed=7, max_samples=20)
-    sample_c = plan_sample(catalog, seed=99, max_samples=20)
+    distinct_plans = {
+        tuple(plan_sample(catalog, seed=seed, max_samples=3 * BLOCK_SIZE).selected_blocks.tolist())
+        for seed in range(64)
+    }
 
     assert sample_a.requested_rows == 20
     assert sample_a.required_blocks == 2
     assert sample_a.effective_rows == 2 * BLOCK_SIZE
     assert sample_a.total_blocks == 10
     assert sample_a.candidate_blocks == 4
-    assert sample_a.planner_mode == "sequential_additive_exact_k"
-    assert sample_a.base_take_prob == pytest.approx(0.5)
+    assert sample_a.planner_mode == "stop_biased_exact_k"
+    assert sample_a.stop_bias_alpha == pytest.approx(STOP_BIAS_ALPHA)
     assert sample_a.selected_blocks.size == sample_a.required_blocks
     assert np.array_equal(sample_a.selected_blocks, sample_b.selected_blocks)
-    assert not np.array_equal(sample_a.selected_blocks, sample_c.selected_blocks)
+    assert len(distinct_plans) > 1
     assert np.all(sample_a.selected_blocks < sample_a.candidate_blocks)
     assert sample_a.execution_block_count == int(sample_a.selected_blocks[-1]) + 1
 
 
-def test_take_probability_grows_as_candidate_suffix_shrinks() -> None:
-    base_take_prob = compute_base_take_probability(4, 16)
-    take_probs = [
-        compute_take_probability(4, 16, remaining_candidates)
-        for remaining_candidates in range(16, 3, -1)
+def test_compute_stop_probability_is_front_biased_and_normalized() -> None:
+    stop_probs = [
+        compute_stop_probability(4, 8, stop_block, stop_bias_alpha=STOP_BIAS_ALPHA)
+        for stop_block in range(3, 8)
     ]
 
-    assert base_take_prob == pytest.approx(0.25)
-    assert take_probs[0] == pytest.approx(base_take_prob)
-    assert take_probs[-1] == pytest.approx(1.0)
-    assert take_probs == sorted(take_probs)
+    assert sum(stop_probs) == pytest.approx(1.0)
+    assert stop_probs == sorted(stop_probs, reverse=True)
+    assert stop_probs[0] > stop_probs[-1]
 
 
 def test_render_warmup_timeline_maps_selected_and_skipped_blocks() -> None:
@@ -285,18 +286,14 @@ def test_compact_warmup_timeline_truncates_with_ellipsis() -> None:
     assert "…" in compact
 
 
-def testplan_sample_suffix_guard_preserves_exact_block_count(monkeypatch: pytest.MonkeyPatch) -> None:
-    class _NeverTakeRng:
-        @staticmethod
-        def random() -> float:
-            return 1.0
+def testplan_sample_front_bias_favors_earlier_stop_blocks() -> None:
+    stop_counts = np.zeros(3, dtype=np.int64)
 
-    monkeypatch.setattr("cr_train.data.planning.np.random.default_rng", lambda _seed: _NeverTakeRng())
+    for seed in range(4096):
+        sample_plan = plan_sample(_catalog(total_rows=10 * BLOCK_SIZE), seed=seed, max_samples=2 * BLOCK_SIZE)
+        stop_counts[sample_plan.execution_block_count - 2] += 1
 
-    sample_plan = plan_sample(_catalog(total_rows=10 * BLOCK_SIZE), seed=7, max_samples=2 * BLOCK_SIZE)
-
-    assert sample_plan.selected_blocks.tolist() == [2, 3]
-    assert sample_plan.selected_blocks.size == sample_plan.required_blocks
+    assert stop_counts.tolist() == sorted(stop_counts.tolist(), reverse=True)
 
 
 def testplan_sample_reduces_execution_span_vs_uniform_choice_baseline() -> None:
@@ -339,7 +336,7 @@ def testnormalize_parquet_uri_converts_hf_resolve_url() -> None:
     assert normalize_parquet_uri(url) == "hf://datasets/Hermanni/sen12mscr@refs/convert/parquet/default/train/0000.parquet"
 
 
-def test_ensure_split_cache_rewinds_for_missing_blocks_before_frontier(monkeypatch, tmp_path: Path) -> None:
+def test_ensure_split_cache_dense_prefix_reuses_previously_skipped_blocks(monkeypatch, tmp_path: Path) -> None:
     rows = [_make_row(index) for index in range(4 * BLOCK_SIZE)]
     split_rows = {
         "train": rows,
@@ -350,35 +347,32 @@ def test_ensure_split_cache_rewinds_for_missing_blocks_before_frontier(monkeypat
 
     catalog = _catalog(total_rows=len(rows))
     plans = [
-        (seed, plan_sample(catalog, seed=seed, max_samples=BLOCK_SIZE, split="train"))
-        for seed in range(512)
+        (seed, plan_sample(catalog, seed=seed, max_samples=2 * BLOCK_SIZE, split="train"))
+        for seed in range(4096)
     ]
     first_seed, first_plan = next(
         (seed, plan)
         for seed, plan in plans
-        if plan.execution_block_count >= 2
+        if plan.execution_block_count >= 3
     )
     second_seed, second_plan = next(
         (seed, plan)
         for seed, plan in plans
         if seed != first_seed
-        and any(
-            int(block) < first_plan.execution_block_count and int(block) not in first_plan.selected_blocks
-            for block in plan.selected_blocks
-        )
+        and plan.execution_block_count <= first_plan.execution_block_count
+        and any(int(block) not in first_plan.selected_blocks for block in plan.selected_blocks)
     )
-    first_block = int(first_plan.selected_blocks[-1])
     second_block = next(
         int(block)
         for block in second_plan.selected_blocks
-        if int(block) < first_plan.execution_block_count and int(block) not in first_plan.selected_blocks
+        if int(block) not in first_plan.selected_blocks
     )
 
     catalog_path = ensure_split_cache(
         split="train",
         dataset_name="unit/test",
         revision=None,
-        max_samples=BLOCK_SIZE,
+        max_samples=2 * BLOCK_SIZE,
         seed=first_seed,
         dataset_seed=11,
         cache_root=tmp_path,
@@ -387,7 +381,7 @@ def test_ensure_split_cache_rewinds_for_missing_blocks_before_frontier(monkeypat
         split="train",
         dataset_name="unit/test",
         revision=None,
-        max_samples=BLOCK_SIZE,
+        max_samples=2 * BLOCK_SIZE,
         seed=second_seed,
         dataset_seed=11,
         cache_root=tmp_path,
@@ -397,10 +391,11 @@ def test_ensure_split_cache_rewinds_for_missing_blocks_before_frontier(monkeypat
     state = np.load(store_root / "cached.npy")
     state_payload = (store_root / "state.json").read_text(encoding="utf-8")
 
-    assert stats["load_dataset_calls"] == ["train", "train"]
-    assert bool(state[first_block])
+    assert stats["load_dataset_calls"] == ["train"]
+    assert np.all(state[:first_plan.execution_block_count])
+    assert not np.any(state[first_plan.execution_block_count:])
     assert bool(state[second_block])
-    assert '"canonical_frontier_block":' in state_payload
+    assert '"frontier_block":' in state_payload
 
 
 def test_ensure_split_cache_skips_hf_open_when_selection_is_fully_cached(monkeypatch, tmp_path: Path) -> None:
@@ -450,8 +445,9 @@ def test_ensure_split_cache_skips_hf_open_when_selection_is_fully_cached(monkeyp
     assert load_calls_after_first == ["train"]
     assert stats["load_dataset_calls"] == ["train"]
     assert len(_FakeTqdm.instances) == warmup_bars_after_first
-    assert done_events[-1]["missing_blocks"] == 0
+    assert done_events[-1]["extension_blocks"] == 0
     assert done_events[-1]["cache_only"] is True
+    assert done_events[-1]["frontier_before"] == done_events[-1]["frontier_after"]
     assert stats["request_json_calls"] == request_json_calls_after_first
 
 
