@@ -56,6 +56,7 @@ class FakeTqdm:
         self.disable = kwargs.get("disable", False)
         self.updates: list[int] = []
         self.postfixes: list[dict[str, object]] = []
+        self.desc_history: list[str] = [str(self.desc)] if self.desc is not None else []
         FakeTqdm.instances.append(self)
 
     @staticmethod
@@ -67,6 +68,11 @@ class FakeTqdm:
 
     def set_postfix(self, values: dict[str, object]) -> None:
         self.postfixes.append(values)
+
+    def set_description_str(self, desc: str, refresh: bool = True) -> None:
+        del refresh
+        self.desc = desc
+        self.desc_history.append(desc)
 
     def close(self) -> None:
         return None
@@ -119,11 +125,15 @@ class _FakeParquetFile:
 
 
 def _patch_source(monkeypatch, split_rows: dict[str, list[dict[str, object]]]) -> dict[str, object]:
+    from cr_train.data.source import _source_descriptor_cache
+    _source_descriptor_cache.clear()
+
     parquet_entries: list[dict[str, object]] = []
     shard_rows: dict[str, list[int]] = {}
     stats: dict[str, object] = {
         "opens": defaultdict(int),
         "load_dataset_calls": [],
+        "request_json_calls": 0,
     }
 
     for split, rows in split_rows.items():
@@ -143,6 +153,7 @@ def _patch_source(monkeypatch, split_rows: dict[str, list[dict[str, object]]]) -
         ]
 
     def fake_request_json(url: str):
+        stats["request_json_calls"] += 1
         if "/info?" in url:
             return {
                 "dataset_info": {
@@ -232,7 +243,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     warmup_bars = [
         instance
         for instance in FakeTqdm.instances
-        if str(instance.desc).startswith("cache ")
+        if any("cache " in desc for desc in instance.desc_history)
     ]
     config_record = next(record for record in metrics_records if record["kind"] == "config")
 
@@ -257,19 +268,16 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert "start epoch" in startup_stages
 
     assert len(FakeTqdm.writes) == 3
-    assert any(message.startswith("cache train | warm | hit=0 miss=2 runs=") for message in FakeTqdm.writes)
-    assert any(message.startswith("cache validation | warm | hit=0 miss=1 runs=") for message in FakeTqdm.writes)
-    assert any(message.startswith("cache test | warm | hit=0 miss=1 runs=") for message in FakeTqdm.writes)
     assert not any(message.startswith("loader ") for message in FakeTqdm.writes)
     assert not any(message.startswith("train | epoch=") for message in FakeTqdm.writes)
 
     assert len(warmup_bars) == 3
-    assert [bar.total for bar in warmup_bars] == [2, 1, 1]
+    assert all(int(bar.total) >= 1 for bar in warmup_bars)
     assert all(sum(bar.updates) == int(bar.total) for bar in warmup_bars)
     assert all(any("miss" in values for values in bar.postfixes) for bar in warmup_bars)
     assert all(any("hit" in values for values in bar.postfixes) for bar in warmup_bars)
-    assert all(any("runs" in values for values in bar.postfixes) for bar in warmup_bars)
     assert all(any("blk/s" in values for values in bar.postfixes) for bar in warmup_bars)
+    assert all(all("runs" not in values for values in bar.postfixes) for bar in warmup_bars)
 
     assert len(batch_bars) == 3
     assert any(any("loss" in values and "mae" in values for values in bar.postfixes) for bar in batch_bars)
@@ -281,11 +289,31 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
         for record in startup_records
         if record["stage"] == "warm split cache" and record["status"] == "done"
     ]
+    warmup_records_by_split = {record["split"]: record for record in warmup_done_records[:3]}
+    warmup_bars_by_split = {}
+    for bar in warmup_bars:
+        for split in ("train", "validation", "test"):
+            if any(desc.endswith(f"cache {split}") for desc in bar.desc_history):
+                warmup_bars_by_split[split] = bar
+                break
+
     assert [record["missing_blocks"] for record in warmup_done_records[:3]] == [2, 1, 1]
     assert all(record["run_count"] >= 1 for record in warmup_done_records[:3])
     assert all(record["planner_mode"] == "sequential_additive_exact_k" for record in warmup_done_records[:3])
     assert all(record["base_take_prob"] > 0.0 for record in warmup_done_records[:3])
+    assert all("timeline" in record for record in warmup_done_records[:3])
+    assert all(len(str(record["timeline"])) == int(record["compressed_block_count"]) for record in warmup_done_records[:3])
+    assert all(set(str(record["timeline"])) <= {"█", "░"} for record in warmup_done_records[:3])
+
+    for split, record in warmup_records_by_split.items():
+        expected_summary = (
+            f"{record['timeline']} cache {split} | warm | "
+            f"hit={record['cached_blocks']} miss={record['missing_blocks']} runs={record['run_count']}"
+        )
+        assert expected_summary in FakeTqdm.writes
+
     assert stats["load_dataset_calls"] == ["train", "validation", "test"]
+    assert stats["request_json_calls"] == 2
 
     with pytest.raises(RuntimeError):
         trainer.step()

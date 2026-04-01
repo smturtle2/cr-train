@@ -160,7 +160,13 @@ def normalize_parquet_files(parquet_payload: dict[str, Any]) -> dict[str, list[d
     return normalized
 
 
+_source_descriptor_cache: dict[tuple[str, str | None], dict[str, Any]] = {}
+
+
 def load_source_descriptor(dataset_name: str, revision: str | None) -> dict[str, Any]:
+    cache_key = (dataset_name, revision)
+    if cache_key in _source_descriptor_cache:
+        return _source_descriptor_cache[cache_key]
     info_payload = request_json(datasets_server_url("info", dataset_name=dataset_name, revision=revision))
     parquet_payload = request_json(datasets_server_url("parquet", dataset_name=dataset_name, revision=revision))
     split_sizes = normalize_split_sizes(info_payload)
@@ -176,13 +182,42 @@ def load_source_descriptor(dataset_name: str, revision: str | None) -> dict[str,
         },
     }
     source_signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
-    return {
+    descriptor = {
         "dataset_name": dataset_name,
         "revision": revision,
         "source_signature": source_signature,
         "split_sizes": split_sizes,
         "parquet_files_by_split": parquet_files_by_split,
     }
+    _source_descriptor_cache[cache_key] = descriptor
+    return descriptor
+
+
+def _find_cached_source(
+    cache_root: Path,
+    dataset_name: str,
+    revision: str | None,
+) -> tuple[Path, dict[str, Any]] | None:
+    layout_root = resolve_layout_root(cache_root)
+    if not layout_root.is_dir():
+        return None
+    for entry in layout_root.iterdir():
+        if not entry.is_dir():
+            continue
+        metadata_path = resolve_source_metadata_path(entry)
+        if not metadata_path.exists():
+            continue
+        try:
+            metadata = read_json(metadata_path)
+        except Exception:
+            continue
+        if (
+            metadata.get("dataset_name") == dataset_name
+            and metadata.get("revision") == revision
+            and "parquet_files_by_split" in metadata
+        ):
+            return entry, metadata
+    return None
 
 
 def ensure_source_root(
@@ -191,6 +226,12 @@ def ensure_source_root(
     revision: str | None,
     cache_root: Path,
 ) -> tuple[Path, dict[str, Any]]:
+    cached = _find_cached_source(cache_root, dataset_name, revision)
+    if cached is not None:
+        source_root, descriptor = cached
+        _source_descriptor_cache[(dataset_name, revision)] = descriptor
+        return source_root, descriptor
+
     descriptor = load_source_descriptor(dataset_name, revision)
     source_root = resolve_source_root(cache_root, str(descriptor["source_signature"]))
     metadata_path = resolve_source_metadata_path(source_root)
@@ -199,10 +240,7 @@ def ensure_source_root(
             metadata_path,
             {
                 "cache_layout_version": CACHE_LAYOUT_VERSION,
-                "dataset_name": descriptor["dataset_name"],
-                "revision": descriptor["revision"],
-                "source_signature": descriptor["source_signature"],
-                "split_sizes": descriptor["split_sizes"],
+                **descriptor,
             },
         )
     return source_root, descriptor

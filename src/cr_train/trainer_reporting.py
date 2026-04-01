@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from .data.constants import WARMUP_TIMELINE_WIDTH
+from .data.runtime import _compact_warmup_timeline
+
 
 PRINTED_STARTUP_STAGES: dict[str, set[str]] = {
     "warm split cache": {"done"},
 }
+
+
+def _resolve_summary_timeline_width(*, split: str) -> int:
+    terminal_width = shutil.get_terminal_size(fallback=(WARMUP_TIMELINE_WIDTH + 48, 24)).columns
+    reserved_width = len(f" cache {split} | warm | hit=0 miss=0 runs=0") + 10
+    return max(12, terminal_width - reserved_width)
 
 
 def serialize_value(value: Any) -> Any:
@@ -25,12 +35,17 @@ def should_print_startup(record: dict[str, Any]) -> bool:
 
 def format_cache_summary(event: dict[str, Any]) -> str:
     split = str(event.get("split", "unknown"))
+    timeline = _compact_warmup_timeline(
+        str(event.get("timeline", "")).strip(),
+        max_chars=_resolve_summary_timeline_width(split=split),
+    )
     cached_blocks = int(event.get("cached_blocks", 0))
     missing_blocks = int(event.get("missing_blocks", 0))
     run_count = int(event.get("run_count", 0))
+    prefix = f"cache {split}" if not timeline else f"{timeline} cache {split}"
     if missing_blocks == 0:
-        return f"cache {split} | cache-hit | blocks={cached_blocks} runs={run_count}"
-    return f"cache {split} | warm | hit={cached_blocks} miss={missing_blocks} runs={run_count}"
+        return f"{prefix} | cache-hit | blocks={cached_blocks} runs={run_count}"
+    return f"{prefix} | warm | hit={cached_blocks} miss={missing_blocks} runs={run_count}"
 
 
 def format_startup_message(event: dict[str, Any]) -> str:

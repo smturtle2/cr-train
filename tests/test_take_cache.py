@@ -88,6 +88,9 @@ def _make_simple_row(index: int) -> dict[str, object]:
 
 
 def _patch_take_source(monkeypatch, split_shards: dict[str, list[dict[str, object]]]) -> dict[str, object]:
+    from cr_train.data.source import _source_descriptor_cache
+    _source_descriptor_cache.clear()
+
     parquet_entries: list[dict[str, object]] = []
     shard_map: dict[str, dict[str, object]] = {}
     split_rows: dict[str, list[dict[str, object]]] = {}

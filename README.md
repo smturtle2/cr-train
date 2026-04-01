@@ -109,5 +109,5 @@ print(trainer.test())
   directory if you want to reclaim disk space.
 - `Trainer.step()` runs exactly one training epoch and shows running-average loss
   and metrics with batch-based `tqdm`.
-- Cache warmup shows a short block-resolution `tqdm` plus one-line cache
-  summaries instead of verbose startup logs.
+- Cache warmup shows a `tqdm` progress bar during block download and prints a
+  block timeline on completion: selected `█`, skipped `░`.

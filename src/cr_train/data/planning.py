@@ -104,7 +104,8 @@ def _select_blocks_sequentially(
     return np.asarray(selected_blocks, dtype=np.int64), base_take_prob
 
 
-def plan_sample(catalog: dict[str, object], seed: int, max_samples: int | None) -> SamplePlan:
+def plan_sample(catalog: dict[str, object], seed: int, max_samples: int | None, *, split: str = "") -> SamplePlan:
+    split_seed = seed ^ (hash(split) & 0xFFFFFFFF) if split else seed
     total_rows = int(catalog["total_rows"])
     total_blocks = int(math.ceil(total_rows / BLOCK_SIZE)) if total_rows > 0 else 0
     requested_rows = total_rows if max_samples is None else min(max_samples, total_rows)
@@ -128,7 +129,7 @@ def plan_sample(catalog: dict[str, object], seed: int, max_samples: int | None) 
     selected_blocks, base_take_prob = _select_blocks_sequentially(
         required_blocks=required_blocks,
         candidate_blocks=candidate_blocks,
-        seed=seed,
+        seed=split_seed,
     )
 
     selected_bitmap = np.zeros(total_blocks, dtype=np.bool_)

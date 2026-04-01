@@ -20,6 +20,7 @@ from cr_train.data import (
     ensure_split_cache,
     prepare_split,
 )
+from cr_train.data.runtime import _compact_warmup_timeline, _render_warmup_timeline
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -47,6 +48,7 @@ class _FakeTqdm:
         self.updates: list[int] = []
         self.postfixes: list[dict[str, object]] = []
         self.desc = kwargs.get("desc")
+        self.desc_history: list[str] = [str(self.desc)] if self.desc is not None else []
         _FakeTqdm.instances.append(self)
 
     @staticmethod
@@ -58,6 +60,11 @@ class _FakeTqdm:
 
     def set_postfix(self, values: dict[str, object]) -> None:
         self.postfixes.append(values)
+
+    def set_description_str(self, desc: str, refresh: bool = True) -> None:
+        del refresh
+        self.desc = desc
+        self.desc_history.append(desc)
 
     def close(self) -> None:
         return None
@@ -110,11 +117,15 @@ class _FakeParquetFile:
 
 
 def _patch_source(monkeypatch, split_rows: dict[str, list[dict[str, object]]]) -> dict[str, object]:
+    from cr_train.data.source import _source_descriptor_cache
+    _source_descriptor_cache.clear()
+
     parquet_entries: list[dict[str, object]] = []
     shard_rows: dict[str, list[int]] = {}
     stats: dict[str, object] = {
         "load_dataset_calls": [],
         "opens": defaultdict(int),
+        "request_json_calls": 0,
     }
 
     for split, rows in split_rows.items():
@@ -134,6 +145,7 @@ def _patch_source(monkeypatch, split_rows: dict[str, list[dict[str, object]]]) -
         ]
 
     def fake_request_json(url: str):
+        stats["request_json_calls"] += 1
         if "/info?" in url:
             return {
                 "dataset_info": {
@@ -231,9 +243,9 @@ def test_plan_sample_is_block_reproducible_and_candidate_bounded() -> None:
     assert sample_a.required_blocks == 2
     assert sample_a.effective_rows == 2 * BLOCK_SIZE
     assert sample_a.total_blocks == 10
-    assert sample_a.candidate_blocks == 8
+    assert sample_a.candidate_blocks == 4
     assert sample_a.planner_mode == "sequential_additive_exact_k"
-    assert sample_a.base_take_prob == pytest.approx(0.25)
+    assert sample_a.base_take_prob == pytest.approx(0.5)
     assert sample_a.selected_blocks.size == sample_a.required_blocks
     assert np.array_equal(sample_a.selected_blocks, sample_b.selected_blocks)
     assert not np.array_equal(sample_a.selected_blocks, sample_c.selected_blocks)
@@ -254,6 +266,25 @@ def test_take_probability_grows_as_candidate_suffix_shrinks() -> None:
     assert take_probs == sorted(take_probs)
 
 
+def test_render_warmup_timeline_maps_selected_and_skipped_blocks() -> None:
+    selected = np.asarray([1, 0, 1, 0, 1], dtype=np.bool_)
+
+    assert _render_warmup_timeline(selected, stop_block=5) == "█░█░█"
+    assert _render_warmup_timeline(selected, stop_block=3) == "█░█"
+    assert _render_warmup_timeline(selected, stop_block=0) == ""
+
+
+def test_compact_warmup_timeline_truncates_with_ellipsis() -> None:
+    timeline = "█" * 20 + "░" * 20
+
+    compact = _compact_warmup_timeline(timeline, max_chars=16)
+
+    assert len(compact) == 16
+    assert compact.startswith("█")
+    assert compact.endswith("░")
+    assert "…" in compact
+
+
 def test_plan_sample_suffix_guard_preserves_exact_block_count(monkeypatch: pytest.MonkeyPatch) -> None:
     class _NeverTakeRng:
         @staticmethod
@@ -264,7 +295,7 @@ def test_plan_sample_suffix_guard_preserves_exact_block_count(monkeypatch: pytes
 
     sample_plan = _plan_sample(_catalog(total_rows=10 * BLOCK_SIZE), seed=7, max_samples=2 * BLOCK_SIZE)
 
-    assert sample_plan.selected_blocks.tolist() == [6, 7]
+    assert sample_plan.selected_blocks.tolist() == [2, 3]
     assert sample_plan.selected_blocks.size == sample_plan.required_blocks
 
 
@@ -319,13 +350,13 @@ def test_ensure_split_cache_rewinds_for_missing_blocks_before_frontier(monkeypat
 
     catalog = _catalog(total_rows=len(rows))
     plans = [
-        (seed, _plan_sample(catalog, seed=seed, max_samples=BLOCK_SIZE))
+        (seed, _plan_sample(catalog, seed=seed, max_samples=BLOCK_SIZE, split="train"))
         for seed in range(512)
     ]
     first_seed, first_plan = next(
         (seed, plan)
         for seed, plan in plans
-        if plan.execution_block_count >= 3
+        if plan.execution_block_count >= 2
     )
     second_seed, second_plan = next(
         (seed, plan)
@@ -414,11 +445,14 @@ def test_ensure_split_cache_skips_hf_open_when_selection_is_fully_cached(monkeyp
         for event in startup_events
         if event["stage"] == "warm split cache" and event["status"] == "done"
     ]
+    request_json_calls_after_first = stats["request_json_calls"]
+
     assert load_calls_after_first == ["train"]
     assert stats["load_dataset_calls"] == ["train"]
     assert len(_FakeTqdm.instances) == warmup_bars_after_first
     assert done_events[-1]["missing_blocks"] == 0
     assert done_events[-1]["cache_only"] is True
+    assert stats["request_json_calls"] == request_json_calls_after_first
 
 
 def test_prepare_split_reads_cached_rows_in_selected_canonical_block_order(monkeypatch, tmp_path: Path) -> None:
@@ -459,7 +493,7 @@ def test_prepare_split_reads_cached_rows_in_selected_canonical_block_order(monke
     )
 
     batch_scenes = [scene for batch in loader for scene in batch["meta"]["scene"]]
-    sample_plan = _plan_sample(_catalog(total_rows=len(rows)), seed=13, max_samples=2 * BLOCK_SIZE)
+    sample_plan = _plan_sample(_catalog(total_rows=len(rows)), seed=13, max_samples=2 * BLOCK_SIZE, split="validation")
     canonical_rows = _canonical_rows(rows, dataset_seed=17)
     expected_rows: list[dict[str, object]] = []
     for block_index in sample_plan.selected_blocks:

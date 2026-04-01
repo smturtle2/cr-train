@@ -143,7 +143,7 @@ def prepare_split(
         split=split,
         startup_callback=startup_callback,
     )
-    sample_plan = plan_sample(catalog, seed, max_samples)
+    sample_plan = plan_sample(catalog, seed, max_samples, split=split)
     resolved_dataset_seed = resolve_dataset_seed(dataset_seed)
     cache_paths = resolve_block_cache_paths(
         source_root,

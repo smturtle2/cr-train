@@ -124,15 +124,33 @@ def remove_tree(path: Path) -> None:
     path.rmdir()
 
 
+def _is_stale_lock(lock_path: Path) -> bool:
+    try:
+        pid = int(lock_path.read_text().strip())
+        os.kill(pid, 0)
+        return False
+    except (ValueError, ProcessLookupError):
+        return True
+    except (PermissionError, OSError):
+        return False
+
+
 @contextmanager
 def file_lock(lock_path: Path):
     started_at = time.monotonic()
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
             os.close(fd)
             break
         except FileExistsError:
+            if _is_stale_lock(lock_path):
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
             if time.monotonic() - started_at > LOCK_TIMEOUT_SECONDS:
                 raise TimeoutError(f"timed out waiting for cache lock: {lock_path}")
             time.sleep(LOCK_POLL_INTERVAL_SECONDS)

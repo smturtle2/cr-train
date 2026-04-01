@@ -8,17 +8,23 @@ from typing import Any
 from datasets import load_dataset
 from tqdm.auto import tqdm
 
-from .constants import BLOCK_SIZE, CANONICAL_SHUFFLE_BUFFER_SIZE, DATA_COLUMNS, WARMUP_SPEED_EMA_ALPHA
+from .constants import (
+    BLOCK_SIZE,
+    CANONICAL_SHUFFLE_BUFFER_SIZE,
+    DATA_COLUMNS,
+    WARMUP_SPEED_EMA_ALPHA,
+    WARMUP_TIMELINE_WIDTH,
+)
 from .planning import CachePlan, build_cache_plan, plan_sample
 from .source import emit_startup_event, ensure_source_root, ensure_split_catalog, resolve_catalog_path
 from .store import (
     SplitBlockCache,
-    file_lock,
     freeze_row,
     load_or_init_block_cache,
     materialize_blocks,
     resolve_block_cache_paths,
     resolve_dataset_seed,
+    suppress_hf_datasets_progress_bars,
     write_block_cache,
 )
 
@@ -93,6 +99,7 @@ def _emit_warmup_summary(
     status: str,
     summary: WarmupSummary,
     elapsed_sec: float | None = None,
+    timeline: str | None = None,
 ) -> None:
     event = {
         "stage": "warm split cache",
@@ -102,6 +109,8 @@ def _emit_warmup_summary(
     }
     if elapsed_sec is not None:
         event["elapsed_sec"] = elapsed_sec
+    if timeline is not None:
+        event["timeline"] = timeline
     emit_startup_event(startup_callback, **event)
 
 
@@ -113,18 +122,19 @@ def _iter_canonical_stream_rows(
     dataset_seed: int,
     cache_root: Path,
 ):
-    dataset = load_dataset(
-        dataset_name,
-        split=split,
-        revision=revision,
-        streaming=True,
-        cache_dir=str(cache_root),
-    )
-    if hasattr(dataset, "select_columns"):
-        dataset = dataset.select_columns(DATA_COLUMNS)
-    dataset = dataset.shuffle(seed=dataset_seed, buffer_size=CANONICAL_SHUFFLE_BUFFER_SIZE)
-    for row in dataset:
-        yield dict(row)
+    with suppress_hf_datasets_progress_bars():
+        dataset = load_dataset(
+            dataset_name,
+            split=split,
+            revision=revision,
+            streaming=True,
+            cache_dir=str(cache_root),
+        )
+        if hasattr(dataset, "select_columns"):
+            dataset = dataset.select_columns(DATA_COLUMNS)
+        dataset = dataset.shuffle(seed=dataset_seed, buffer_size=CANONICAL_SHUFFLE_BUFFER_SIZE)
+        for row in dataset:
+            yield dict(row)
 
 
 def _skip_canonical_blocks(row_iterator, block_count: int) -> None:
@@ -155,6 +165,26 @@ def _read_canonical_blocks(row_iterator, block_count: int) -> list[list[dict[str
     return blocks
 
 
+def _render_warmup_timeline(selected_bitmap, *, stop_block: int) -> str:
+    if stop_block <= 0:
+        return ""
+    return "".join("█" if selected_bitmap[i] else "░" for i in range(stop_block))
+
+
+def _compact_warmup_timeline(
+    timeline: str,
+    *,
+    max_chars: int = WARMUP_TIMELINE_WIDTH,
+) -> str:
+    if len(timeline) <= max_chars:
+        return timeline
+    if max_chars <= 1:
+        return timeline[:max_chars]
+    head_chars = max(1, (max_chars - 1) // 2)
+    tail_chars = max(1, max_chars - head_chars - 1)
+    return f"{timeline[:head_chars]}…{timeline[-tail_chars:]}"
+
+
 def _update_warmup_progress(
     progress: Any,
     *,
@@ -162,7 +192,6 @@ def _update_warmup_progress(
     resolved_blocks: int,
     missing_blocks: int,
     cached_blocks: int,
-    run_count: int,
     force: bool = False,
 ) -> None:
     if getattr(progress, "disable", False):
@@ -193,7 +222,6 @@ def _update_warmup_progress(
         {
             "miss": f"{resolved_blocks}/{missing_blocks}",
             "hit": cached_blocks,
-            "runs": run_count,
             "blk/s": f"{(state.ema_blocks_per_sec or 0.0):.1f}",
         }
     )
@@ -210,32 +238,47 @@ def _warm_missing_blocks(
     cache: SplitBlockCache,
     cache_plan: CachePlan,
 ) -> int:
+    total_frontier_blocks = cache_plan.stream_start_block + sum(
+        run.block_count for run in cache_plan.frontier_runs
+    )
     resolved_blocks = 0
     progress = tqdm(
-        total=cache_plan.missing_blocks,
+        total=total_frontier_blocks,
         desc=f"cache {split}",
-        unit="block",
+        unit="blk",
         disable=not is_primary(),
         dynamic_ncols=True,
         leave=False,
     )
     progress_state = WarmupProgressState()
+    row_iterator = _iter_canonical_stream_rows(
+        split=split,
+        dataset_name=dataset_name,
+        revision=revision,
+        dataset_seed=dataset_seed,
+        cache_root=cache_root,
+    )
+    def _desc(label: str) -> None:
+        if hasattr(progress, "set_description_str"):
+            progress.set_description_str(f"cache {split} {label}", refresh=False)
+
     try:
-        row_iterator = _iter_canonical_stream_rows(
-            split=split,
-            dataset_name=dataset_name,
-            revision=revision,
-            dataset_seed=dataset_seed,
-            cache_root=cache_root,
-        )
-        _skip_canonical_blocks(row_iterator, cache_plan.stream_start_block)
+        if cache_plan.stream_start_block > 0:
+            _desc("seek")
+            for _ in range(cache_plan.stream_start_block):
+                _skip_canonical_blocks(row_iterator, 1)
+                progress.update(1)
         for run in cache_plan.frontier_runs:
             if run.kind == "skip":
-                _skip_canonical_blocks(row_iterator, run.block_count)
+                _desc(f"skip {run.block_count}blk")
+                for _ in range(run.block_count):
+                    _skip_canonical_blocks(row_iterator, 1)
+                    progress.update(1)
                 cache.state.canonical_frontier_block = max(cache.state.canonical_frontier_block, run.stop_block)
                 write_block_cache(cache_paths, cache)
                 continue
 
+            _desc(f"fetch blk {run.start_block}-{run.stop_block - 1}")
             resolved_blocks += materialize_blocks(
                 cache_paths,
                 start_block=run.start_block,
@@ -251,16 +294,15 @@ def _warm_missing_blocks(
                 resolved_blocks=resolved_blocks,
                 missing_blocks=cache_plan.missing_blocks,
                 cached_blocks=cache_plan.cached_blocks,
-                run_count=len(cache_plan.execution_runs),
             )
     finally:
+        row_iterator.close()
         _update_warmup_progress(
             progress,
             state=progress_state,
             resolved_blocks=resolved_blocks,
             missing_blocks=cache_plan.missing_blocks,
             cached_blocks=cache_plan.cached_blocks,
-            run_count=len(cache_plan.execution_runs),
             force=True,
         )
         progress.close()
@@ -290,66 +332,62 @@ def ensure_split_cache(
         resolved_dataset_seed,
         CANONICAL_SHUFFLE_BUFFER_SIZE,
     )
+    catalog = ensure_split_catalog(
+        source_root=source_root,
+        descriptor=descriptor,
+        split=split,
+        startup_callback=startup_callback,
+    )
+    sample_plan = plan_sample(catalog, seed, max_samples, split=split)
+    cache = load_or_init_block_cache(
+        cache_paths,
+        dataset_seed=resolved_dataset_seed,
+        shuffle_buffer_size=CANONICAL_SHUFFLE_BUFFER_SIZE,
+        total_rows=int(catalog["total_rows"]),
+    )
+    cache_plan = build_cache_plan(
+        sample_plan,
+        cache.cached,
+        frontier_block=cache.state.canonical_frontier_block,
+    )
 
-    with file_lock(cache_paths.lock_path):
-        catalog = ensure_split_catalog(
-            source_root=source_root,
-            descriptor=descriptor,
-            split=split,
-            startup_callback=startup_callback,
-        )
-        sample_plan = plan_sample(catalog, seed, max_samples)
-        cache = load_or_init_block_cache(
-            cache_paths,
-            dataset_seed=resolved_dataset_seed,
-            shuffle_buffer_size=CANONICAL_SHUFFLE_BUFFER_SIZE,
-            total_rows=int(catalog["total_rows"]),
-        )
-        cache_plan = build_cache_plan(
-            sample_plan,
-            cache.cached,
-            frontier_block=cache.state.canonical_frontier_block,
-        )
-        summary = WarmupSummary.from_cache_plan(resolved_dataset_seed, cache_plan)
-        _emit_warmup_summary(
-            startup_callback,
-            split=split,
-            status="start",
-            summary=summary,
-        )
-        if cache_plan.cache_only:
-            _emit_warmup_summary(
-                startup_callback,
-                split=split,
-                status="done",
-                summary=summary,
-                elapsed_sec=0.0,
-            )
-            return resolve_catalog_path(source_root, split)
+    summary = WarmupSummary.from_cache_plan(resolved_dataset_seed, cache_plan)
+    _emit_warmup_summary(startup_callback, split=split, status="start", summary=summary)
 
-        started_at = time.perf_counter()
-        resolved_blocks = _warm_missing_blocks(
-            split=split,
-            dataset_name=dataset_name,
-            revision=revision,
-            dataset_seed=resolved_dataset_seed,
-            cache_root=cache_root,
-            cache_paths=cache_paths,
-            cache=cache,
-            cache_plan=cache_plan,
+    if cache_plan.cache_only:
+        timeline = _render_warmup_timeline(
+            cache_plan.sample_plan.selected_bitmap,
+            stop_block=cache_plan.sample_plan.execution_block_count,
         )
         _emit_warmup_summary(
-            startup_callback,
-            split=split,
-            status="done",
-            summary=WarmupSummary.from_cache_plan(
-                resolved_dataset_seed,
-                cache_plan,
-                resolved_blocks=resolved_blocks,
-            ),
-            elapsed_sec=time.perf_counter() - started_at,
+            startup_callback, split=split, status="done",
+            summary=summary, elapsed_sec=0.0, timeline=timeline,
         )
         return resolve_catalog_path(source_root, split)
+
+    started_at = time.perf_counter()
+    resolved_blocks = _warm_missing_blocks(
+        split=split,
+        dataset_name=dataset_name,
+        revision=revision,
+        dataset_seed=resolved_dataset_seed,
+        cache_root=cache_root,
+        cache_paths=cache_paths,
+        cache=cache,
+        cache_plan=cache_plan,
+    )
+    _emit_warmup_summary(
+        startup_callback, split=split, status="done",
+        summary=WarmupSummary.from_cache_plan(
+            resolved_dataset_seed, cache_plan, resolved_blocks=resolved_blocks,
+        ),
+        elapsed_sec=time.perf_counter() - started_at,
+        timeline=_render_warmup_timeline(
+            cache_plan.sample_plan.selected_bitmap,
+            stop_block=cache_plan.sample_plan.execution_block_count,
+        ),
+    )
+    return resolve_catalog_path(source_root, split)
 
 
 try:
