@@ -1,3 +1,20 @@
+"""Block-selection bitmask algorithm visualization.
+
+Demonstrates how the sequential additive exact-k planner selects blocks
+from a candidate window. The take probability increases as the remaining
+window shrinks, guaranteeing the exact required block count.
+
+Usage:
+    uv run python examples/bitmask_sampling_demo.py
+    uv run python examples/bitmask_sampling_demo.py --total-rows 107072 --requested-rows 2048 --seed 9
+
+Output:
+    - Configuration summary (block size, total/required/candidate blocks)
+    - Per-block trace: remaining candidates, take probability, random draw, decision
+    - Final selection bitmap (selected vs. skipped)
+    - Selection efficiency statistics
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -51,7 +68,8 @@ def build_selection_trace(
             suffix = list(range(block_index, candidate_blocks))
             selected_blocks.extend(suffix)
             trace_lines.append(
-                f"block={block_index:02d} guard take suffix={suffix}"
+                f"  block {block_index:>4d}  remaining={remaining_candidates:>4d}  "
+                f"** guard take ** suffix={suffix}"
             )
             break
 
@@ -64,9 +82,11 @@ def build_selection_trace(
         take = sampled < take_prob
         if take:
             selected_blocks.append(block_index)
+
+        marker = ">>>" if take else "   "
         trace_lines.append(
-            f"block={block_index:02d} remaining={remaining_candidates:02d} "
-            f"p={take_prob:.4f} u={sampled:.4f} take={str(take).lower()}"
+            f"  block {block_index:>4d}  remaining={remaining_candidates:>4d}  "
+            f"p={take_prob:.4f}  u={sampled:.4f}  {marker} {'TAKE' if take else 'skip'}"
         )
 
     selected_bitmap = np.zeros(total_blocks, dtype=np.bool_)
@@ -92,23 +112,58 @@ def main() -> None:
         seed=args.seed,
     )
 
-    print(f"block_size={BLOCK_SIZE}")
-    print(f"total_blocks={result['total_blocks']}")
-    print(f"required_blocks={result['required_blocks']}")
-    print(f"candidate_blocks={result['candidate_blocks']}")
-    print(f"base_take_prob={result['base_take_prob']:.4f}")
+    # --- Configuration ---
+    print("=" * 60)
+    print("  Block Selection Bitmask Demo")
+    print("=" * 60)
+    print()
+    print(f"  block_size          = {BLOCK_SIZE}")
+    print(f"  total_rows          = {args.total_rows}")
+    print(f"  requested_rows      = {args.requested_rows}")
+    print(f"  seed                = {args.seed}")
+    print()
+    print(f"  total_blocks        = {result['total_blocks']}")
+    print(f"  required_blocks     = {result['required_blocks']}")
+    print(f"  candidate_blocks    = {result['candidate_blocks']}")
+    print(f"  base_take_prob      = {result['base_take_prob']:.4f}")
+    print()
+
+    # --- Per-block trace ---
+    print("-" * 60)
+    print("  Per-block sampling trace")
+    print("-" * 60)
     print()
     for line in result["trace_lines"]:
         print(line)
     print()
-    print(f"selected_blocks={result['selected_blocks']}")
-    print(
-        "selected_bitmap="
-        + _render_bitmask(
-            result["selected_bitmap"],
-            width=int(result["total_blocks"]),
-        )
-    )
+
+    # --- Selection bitmap ---
+    print("-" * 60)
+    print("  Selection bitmap (first N blocks)")
+    print("  ■ = selected    □ = skipped")
+    print("-" * 60)
+    print()
+    bitmap_width = min(int(result["candidate_blocks"]), 80)
+    print(f"  {_render_bitmask(result['selected_bitmap'], width=bitmap_width)}")
+    print()
+
+    # --- Summary statistics ---
+    selected = result["selected_blocks"]
+    required = int(result["required_blocks"])
+    candidate = int(result["candidate_blocks"])
+    total = int(result["total_blocks"])
+    span = (max(selected) - min(selected) + 1) if selected else 0
+
+    print("-" * 60)
+    print("  Summary")
+    print("-" * 60)
+    print()
+    print(f"  selected_blocks     = {len(selected)} / {required} required")
+    print(f"  candidate_window    = {candidate} / {total} total blocks")
+    print(f"  selection_span      = {span} blocks (contiguous range covering all selected)")
+    print(f"  selection_density   = {len(selected) / max(span, 1):.2%} within span")
+    print(f"  effective_rows      = {len(selected) * BLOCK_SIZE}")
+    print()
 
 
 if __name__ == "__main__":

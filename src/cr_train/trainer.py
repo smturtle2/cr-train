@@ -24,7 +24,7 @@ from .data import (
     run_startup_stage,
     seed_everything,
 )
-from .trainer_reporting import format_startup_message, serialize_value, should_print_startup
+from .trainer_reporting import format_config_banner, format_epoch_summary, format_startup_message, format_test_summary, serialize_value, should_print_startup
 from .trainer_runtime import MetricAccumulator, compute_loss, compute_metric_values, finalize_summary, prime_iterator, update_progress_bar
 
 import torch.distributed as dist
@@ -160,12 +160,15 @@ class Trainer:
             )
 
         self.current_epoch += 1
-        return {
+        result = {
             "epoch": epoch_index + 1,
             "train": train_summary,
             "val": validation_summary,
             "checkpoint_path": str(checkpoint_path),
         }
+        if is_primary():
+            tqdm.write(format_epoch_summary(result, epochs=self.epochs))
+        return result
 
     def test(self) -> dict[str, Any]:
         """Run the test split with the current model state."""
@@ -186,7 +189,10 @@ class Trainer:
                 }
             )
 
-        return {"epoch": self.current_epoch, **test_summary}
+        result = {"epoch": self.current_epoch, **test_summary}
+        if is_primary():
+            tqdm.write(format_test_summary(result))
+        return result
 
     @staticmethod
     def _validate_max_samples(name: str, value: int | None) -> None:
@@ -243,6 +249,17 @@ class Trainer:
                 "num_workers": self.num_workers,
             }
         )
+        tqdm.write(format_config_banner(
+            dataset_name=DATASET_ID,
+            max_train_samples=self.max_train_samples,
+            max_val_samples=self.max_val_samples,
+            max_test_samples=self.max_test_samples,
+            batch_size=self.batch_size,
+            epochs=self.epochs,
+            seed=self.seed,
+            dataset_seed=self.dataset_seed,
+            device=self.device,
+        ))
 
     def _wrap_model_for_ddp_if_needed(self) -> None:
         if not is_distributed() or isinstance(self.model, DDP):
@@ -351,7 +368,7 @@ class Trainer:
             for batch in batch_iterator:
                 moved_batch = move_batch_to_device(batch, self.device)
                 self.optimizer.zero_grad(set_to_none=True)
-                model_output = self.model(moved_batch)
+                model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
                 loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
                 loss.backward()
                 self.optimizer.step()
@@ -405,7 +422,7 @@ class Trainer:
             with torch.no_grad():
                 for batch in batch_iterator:
                     moved_batch = move_batch_to_device(batch, self.device)
-                    model_output = self.model(moved_batch)
+                    model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
                     loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
                     batch_size = int(moved_batch["sar"].shape[0])
 
@@ -433,7 +450,17 @@ class Trainer:
         return summary
 
     def _create_progress_bar(self, *, total: int | None, description: str):
-        return tqdm(total=total, desc=description, disable=not is_primary(), dynamic_ncols=True, leave=False)
+        is_training = description.startswith("train ")
+        return tqdm(
+            total=total,
+            desc=description,
+            disable=not is_primary(),
+            dynamic_ncols=True,
+            leave=False,
+            colour="#4caf50" if is_training else "#00bcd4",
+            smoothing=0.1,
+            mininterval=0.1,
+        )
 
     def _set_sampler_epoch(self, loader: Any, epoch_index: int) -> None:
         sampler = getattr(loader, "sampler", None)

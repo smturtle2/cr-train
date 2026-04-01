@@ -33,9 +33,8 @@ class TinyModel(torch.nn.Module):
         super().__init__()
         self.body = torch.nn.Conv2d(15, 13, kernel_size=1)
 
-    def forward(self, batch):
-        fused = torch.cat([batch["sar"], batch["cloudy"]], dim=1)
-        return self.body(fused)
+    def forward(self, sar, cloudy):
+        return self.body(torch.cat([sar, cloudy], dim=1))
 
 
 def loss_fn(prediction: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -267,9 +266,13 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert "wait first batch" in startup_stages
     assert "start epoch" in startup_stages
 
-    assert len(FakeTqdm.writes) == 3
+    # writes: 1 config banner + 3 cache summaries + 1 epoch summary + 1 test summary = 6
+    assert len(FakeTqdm.writes) == 6
     assert not any(message.startswith("loader ") for message in FakeTqdm.writes)
     assert not any(message.startswith("train | epoch=") for message in FakeTqdm.writes)
+    assert any("cr-train" in message for message in FakeTqdm.writes)
+    assert any("Epoch 1/" in message for message in FakeTqdm.writes)
+    assert any("Test" in message for message in FakeTqdm.writes)
 
     assert len(warmup_bars) == 3
     assert all(int(bar.total) >= 1 for bar in warmup_bars)

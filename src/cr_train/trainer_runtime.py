@@ -53,14 +53,29 @@ def compute_metric_values(metric_fns: Mapping[str, Callable[[Any, Mapping[str, A
     }
 
 
+def _format_metric(value: float) -> str:
+    """메트릭 값을 크기에 맞게 포맷. 작은 값은 자릿수를 늘려 정보 손실을 방지."""
+    abs_value = abs(value)
+    if abs_value == 0.0:
+        return "0"
+    if abs_value < 0.0001:
+        return f"{value:.2e}"
+    if abs_value < 0.01:
+        return f"{value:.5f}"
+    if abs_value < 10:
+        return f"{value:.4f}"
+    return f"{value:.2f}"
+
+
 def update_progress_bar(progress: Any, *, accumulator: MetricAccumulator, start_time: float | None) -> None:
     if getattr(progress, "disable", False):
         return
     progress.update(1)
-    postfix = {key: f"{value:.4f}" for key, value in accumulator.averages().items()}
+    postfix = {key: _format_metric(value) for key, value in accumulator.averages().items()}
     if start_time is not None and accumulator.total_batches > 0:
         elapsed = max(time.perf_counter() - start_time, 1e-9)
-        postfix["batches/s"] = f"{accumulator.total_batches / elapsed:.2f}"
+        speed = accumulator.total_batches / elapsed
+        postfix["batches/s"] = f"{speed:.1f}" if speed < 100 else f"{speed:.0f}"
     progress.set_postfix(postfix)
 
 

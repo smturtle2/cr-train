@@ -14,6 +14,13 @@ PRINTED_STARTUP_STAGES: dict[str, set[str]] = {
     "warm split cache": {"done"},
 }
 
+_DIM = "\033[2m"
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+_GREEN = "\033[32m"
+_CYAN = "\033[36m"
+_YELLOW = "\033[33m"
+
 
 def _resolve_summary_timeline_width(*, split: str) -> int:
     terminal_width = shutil.get_terminal_size(fallback=(WARMUP_TIMELINE_WIDTH + 48, 24)).columns
@@ -44,7 +51,7 @@ def format_cache_summary(event: dict[str, Any]) -> str:
     run_count = int(event.get("run_count", 0))
     prefix = f"cache {split}" if not timeline else f"{timeline} cache {split}"
     if missing_blocks == 0:
-        return f"{prefix} | cache-hit | blocks={cached_blocks} runs={run_count}"
+        return f"{prefix} | cache-hit | blocks={cached_blocks}"
     return f"{prefix} | warm | hit={cached_blocks} miss={missing_blocks} runs={run_count}"
 
 
@@ -77,3 +84,84 @@ def format_startup_message(event: dict[str, Any]) -> str:
     if event.get("status") == "error" and event.get("error"):
         parts.append(f"error={event['error']}")
     return " | ".join(parts)
+
+
+def _fmt(value: float) -> str:
+    if value == 0.0:
+        return "0"
+    if abs(value) < 0.0001:
+        return f"{value:.2e}"
+    if abs(value) < 10:
+        return f"{value:.4f}"
+    return f"{value:.2f}"
+
+
+def _samples_label(n: int | None) -> str:
+    if n is None:
+        return "full"
+    return f"{n:,}"
+
+
+def format_config_banner(
+    *,
+    dataset_name: str,
+    max_train_samples: int | None,
+    max_val_samples: int | None,
+    max_test_samples: int | None,
+    batch_size: int,
+    epochs: int,
+    seed: int,
+    dataset_seed: int | None,
+    device: torch.device,
+) -> str:
+    sep = f"{_DIM}│{_RESET}"
+    header = f"{_BOLD}cr-train{_RESET} {_DIM}── {dataset_name} ── {device}{_RESET}"
+    splits = (
+        f"  {_DIM}splits{_RESET}  "
+        f"train {_BOLD}{_samples_label(max_train_samples)}{_RESET}  "
+        f"val {_BOLD}{_samples_label(max_val_samples)}{_RESET}  "
+        f"test {_BOLD}{_samples_label(max_test_samples)}{_RESET}"
+    )
+    config_parts = [f"batch {batch_size}", f"epochs {epochs}", f"seed {seed}"]
+    if dataset_seed is not None:
+        config_parts.append(f"dataset_seed {dataset_seed}")
+    config = f"  {_DIM}config{_RESET}  " + f"  {sep}  ".join(config_parts)
+    return f"{header}\n{splits}\n{config}"
+
+
+def format_epoch_summary(result: dict[str, Any], *, epochs: int) -> str:
+    epoch = result["epoch"]
+    train = result["train"]
+    val = result["val"]
+    sep = f" {_DIM}│{_RESET} "
+
+    parts = [f"{_BOLD}Epoch {epoch}/{epochs}{_RESET}"]
+
+    train_parts = [f"{_GREEN}train{_RESET} loss {_fmt(train['loss'])}"]
+    for name, value in train.get("metrics", {}).items():
+        train_parts.append(f"{name} {_fmt(value)}")
+    parts.append(" ".join(train_parts))
+
+    val_parts = [f"{_CYAN}val{_RESET} loss {_fmt(val['loss'])}"]
+    for name, value in val.get("metrics", {}).items():
+        val_parts.append(f"{name} {_fmt(value)}")
+    parts.append(" ".join(val_parts))
+
+    if "samples_per_sec" in train:
+        speed = train["samples_per_sec"]
+        parts.append(f"{_DIM}{speed:.1f} samples/s{_RESET}")
+
+    return sep.join(parts)
+
+
+def format_test_summary(result: dict[str, Any]) -> str:
+    sep = f" {_DIM}│{_RESET} "
+    parts = [f"{_BOLD}Test{_RESET}"]
+
+    metric_parts = [f"loss {_fmt(result.get('loss', 0.0))}"]
+    for name, value in result.get("metrics", {}).items():
+        metric_parts.append(f"{name} {_fmt(value)}")
+    parts.append(" ".join(metric_parts))
+
+    parts.append(f"{_DIM}{result.get('num_samples', 0):,} samples{_RESET}")
+    return sep.join(parts)

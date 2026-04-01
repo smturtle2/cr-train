@@ -1,7 +1,25 @@
+"""SEN12MS-CR training example with the canonical block cache.
+
+Trains a small FusionBaseline CNN that fuses SAR (2ch) and cloudy optical (13ch)
+inputs to reconstruct cloud-free optical images (13ch) using L1 loss.
+
+Usage:
+    uv run python examples/train_sen12mscr.py \\
+      --max-train-samples 2048 \\
+      --max-val-samples 256 \\
+      --batch-size 4 \\
+      --epochs 2 \\
+      --output-dir runs/sen12mscr-example
+
+Output:
+    Each epoch prints a human-readable summary (loss, metrics, throughput)
+    and writes structured JSON to stdout for pipeline consumption.
+    Checkpoints are saved to <output-dir>/epoch-NNNN.pt.
+"""
+
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import torch
@@ -11,8 +29,16 @@ from torch.nn import functional as F
 from cr_train import Trainer
 
 
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
 class FusionBaseline(nn.Module):
-    """Small baseline for SAR + cloudy optical to target optical regression."""
+    """Small baseline CNN for SAR + cloudy optical -> target optical regression.
+
+    Input channels:  2 (SAR) + 13 (cloudy optical) = 15
+    Output channels: 13 (cloud-free optical)
+    """
 
     def __init__(self, hidden_channels: int = 64) -> None:
         super().__init__()
@@ -28,10 +54,13 @@ class FusionBaseline(nn.Module):
             nn.Conv2d(hidden_channels, 13, kernel_size=1),
         )
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        fused = torch.cat([batch["sar"], batch["cloudy"]], dim=1)
-        return self.head(self.stem(fused))
+    def forward(self, sar: torch.Tensor, cloudy: torch.Tensor) -> torch.Tensor:
+        return self.head(self.stem(torch.cat([sar, cloudy], dim=1)))
 
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
 
 def parse_max_samples(value: str) -> int | None:
     lowered = value.strip().lower()
@@ -79,6 +108,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Loss and metrics
+# ---------------------------------------------------------------------------
+
 def resolve_device(device_name: str | None) -> torch.device:
     if device_name is not None:
         return torch.device(device_name)
@@ -94,6 +127,10 @@ def reconstruction_loss(prediction: torch.Tensor, batch: dict[str, torch.Tensor]
 def mean_absolute_error(prediction: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     return torch.mean(torch.abs(prediction - batch["target"]))
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()
@@ -120,10 +157,12 @@ def main() -> None:
         cache_dir=args.cache_dir,
     )
 
+    # Training loop — Trainer prints epoch summaries automatically
     for _ in range(args.epochs):
-        print(json.dumps(trainer.step(), ensure_ascii=True))
+        trainer.step()
 
-    print(json.dumps({"test": trainer.test()}, ensure_ascii=True))
+    # Test evaluation — Trainer prints test summary automatically
+    trainer.test()
 
 
 if __name__ == "__main__":

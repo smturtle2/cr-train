@@ -220,11 +220,12 @@ def _update_warmup_progress(
         elif force and state.ema_blocks_per_sec is None:
             state.ema_blocks_per_sec = 0.0
 
+    speed = state.ema_blocks_per_sec or 0.0
     progress.set_postfix(
         {
-            "miss": f"{resolved_blocks}/{missing_blocks}",
             "hit": cached_blocks,
-            "blk/s": f"{(state.ema_blocks_per_sec or 0.0):.1f}",
+            "miss": f"{resolved_blocks}/{missing_blocks}",
+            "blk/s": f"{speed:.1f}" if speed < 100 else f"{speed:.0f}",
         }
     )
 
@@ -251,6 +252,9 @@ def _warm_missing_blocks(
         disable=not is_primary(),
         dynamic_ncols=True,
         leave=False,
+        colour="#ff9800",
+        smoothing=0.3,
+        mininterval=0.3,
     )
     progress_state = WarmupProgressState()
     row_iterator = _iter_canonical_stream_rows(
