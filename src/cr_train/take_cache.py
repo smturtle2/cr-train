@@ -8,22 +8,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pyarrow.parquet as pq
-from datasets import Dataset, IterableDataset, load_dataset, load_from_disk
+from datasets import IterableDataset, load_dataset
 
 from .data.constants import DATA_COLUMNS, DATASET_ID
-from .data.source import ensure_source_root, ensure_split_catalog
+from .data.source import ensure_source_root, ensure_split_catalog, resolve_source_root
 from .data.store import (
     file_lock,
     freeze_row,
     read_json,
     remove_tree,
     resolve_cache_root,
-    save_dataset_without_progress,
     write_json_atomic,
 )
 
-PREFIX_CACHE_LAYOUT_VERSION = 1
 PREFIX_CACHE_CHUNK_ROWS = 128
 
 
@@ -56,54 +55,46 @@ class SampleResult:
     cache_stats: PrefixCacheStats | None
 
 
-def _resolve_take_cache_root(cache_root: Path) -> Path:
-    path = cache_root / f"take-prototype-v{PREFIX_CACHE_LAYOUT_VERSION}"
+def _resolve_take_root(source_root: Path) -> Path:
+    path = source_root / "prefix_store"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _resolve_take_source_root(cache_root: Path, source_signature: str) -> Path:
-    path = _resolve_take_cache_root(cache_root) / source_signature
+def _resolve_take_split_root(source_root: Path, split: str) -> Path:
+    path = _resolve_take_root(source_root) / split
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _resolve_take_split_root(cache_root: Path, source_signature: str, split: str) -> Path:
-    path = _resolve_take_source_root(cache_root, source_signature) / split
+def _resolve_take_lock_path(source_root: Path, split: str) -> Path:
+    return _resolve_take_split_root(source_root, split) / ".lock"
+
+
+def _resolve_take_chunks_root(source_root: Path, split: str) -> Path:
+    path = _resolve_take_split_root(source_root, split) / "chunks"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _resolve_take_lock_path(cache_root: Path, source_signature: str, split: str) -> Path:
-    return _resolve_take_split_root(cache_root, source_signature, split) / ".lock"
-
-
-def _resolve_take_chunks_root(cache_root: Path, source_signature: str, split: str) -> Path:
-    path = _resolve_take_split_root(cache_root, source_signature, split) / "chunks"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _resolve_take_state_path(cache_root: Path, source_signature: str, split: str) -> Path:
-    return _resolve_take_split_root(cache_root, source_signature, split) / "prefix.json"
+def _resolve_take_state_path(source_root: Path, split: str) -> Path:
+    return _resolve_take_split_root(source_root, split) / "prefix.json"
 
 
 def _chunk_path(chunks_root: Path, chunk_index: int) -> Path:
-    return chunks_root / f"{chunk_index:08d}"
+    return chunks_root / f"{chunk_index:08d}.arrow"
 
 
 def _load_or_init_prefix_state(
     *,
-    cache_root: Path,
-    source_signature: str,
+    source_root: Path,
     split: str,
 ) -> PrefixCacheState:
-    state_path = _resolve_take_state_path(cache_root, source_signature, split)
+    state_path = _resolve_take_state_path(source_root, split)
     if not state_path.exists():
         state = PrefixCacheState(prefix_rows=0, chunk_row_counts=[])
         _write_prefix_state(
-            cache_root=cache_root,
-            source_signature=source_signature,
+            source_root=source_root,
             split=split,
             state=state,
         )
@@ -118,13 +109,12 @@ def _load_or_init_prefix_state(
 
 def _write_prefix_state(
     *,
-    cache_root: Path,
-    source_signature: str,
+    source_root: Path,
     split: str,
     state: PrefixCacheState,
 ) -> None:
     write_json_atomic(
-        _resolve_take_state_path(cache_root, source_signature, split),
+        _resolve_take_state_path(source_root, split),
         {
             "prefix_rows": state.prefix_rows,
             "chunk_row_counts": state.chunk_row_counts,
@@ -134,19 +124,21 @@ def _write_prefix_state(
 
 def _save_chunk(
     *,
-    cache_root: Path,
-    source_signature: str,
+    source_root: Path,
     split: str,
     chunk_index: int,
     rows: list[dict[str, Any]],
 ) -> int:
-    chunks_root = _resolve_take_chunks_root(cache_root, source_signature, split)
-    chunk_dir = _chunk_path(chunks_root, chunk_index)
-    tmp_dir = chunk_dir.with_suffix(".tmp")
-    remove_tree(tmp_dir)
-    dataset = Dataset.from_list(rows)
-    save_dataset_without_progress(dataset, tmp_dir)
-    tmp_dir.replace(chunk_dir)
+    chunks_root = _resolve_take_chunks_root(source_root, split)
+    chunk_file = _chunk_path(chunks_root, chunk_index)
+    tmp_file = chunk_file.with_suffix(".tmp")
+    remove_tree(tmp_file)
+    table = pa.table({col: [row[col] for row in rows] for col in DATA_COLUMNS})
+    with pa.OSFile(str(tmp_file), "wb") as sink:
+        writer = pa.ipc.new_file(sink, table.schema)
+        writer.write_table(table)
+        writer.close()
+    tmp_file.replace(chunk_file)
     return len(rows)
 
 
@@ -207,8 +199,7 @@ def _iter_rows_from_prefix_range(
 
 def _append_prefix_rows(
     *,
-    cache_root: Path,
-    source_signature: str,
+    source_root: Path,
     split: str,
     rows: Iterator[dict[str, Any]],
     state: PrefixCacheState,
@@ -221,8 +212,7 @@ def _append_prefix_rows(
         if len(pending_rows) < PREFIX_CACHE_CHUNK_ROWS:
             continue
         written = _save_chunk(
-            cache_root=cache_root,
-            source_signature=source_signature,
+            source_root=source_root,
             split=split,
             chunk_index=chunk_index,
             rows=pending_rows,
@@ -235,8 +225,7 @@ def _append_prefix_rows(
 
     if pending_rows:
         written = _save_chunk(
-            cache_root=cache_root,
-            source_signature=source_signature,
+            source_root=source_root,
             split=split,
             chunk_index=chunk_index,
             rows=pending_rows,
@@ -263,7 +252,7 @@ def _ensure_prefix_cache(
         cache_root=cache_root,
     )
     source_signature = str(descriptor["source_signature"])
-    with file_lock(_resolve_take_lock_path(cache_root, source_signature, split)):
+    with file_lock(_resolve_take_lock_path(source_root, split)):
         catalog = ensure_split_catalog(
             source_root=source_root,
             descriptor=descriptor,
@@ -273,15 +262,13 @@ def _ensure_prefix_cache(
         total_rows = int(catalog["total_rows"])
         capped_prefix_rows = min(required_prefix_rows, total_rows)
         state = _load_or_init_prefix_state(
-            cache_root=cache_root,
-            source_signature=source_signature,
+            source_root=source_root,
             split=split,
         )
         before = state.prefix_rows
         if state.prefix_rows < capped_prefix_rows:
             _append_prefix_rows(
-                cache_root=cache_root,
-                source_signature=source_signature,
+                source_root=source_root,
                 split=split,
                 rows=_iter_rows_from_prefix_range(
                     catalog,
@@ -291,8 +278,7 @@ def _ensure_prefix_cache(
                 state=state,
             )
             _write_prefix_state(
-                cache_root=cache_root,
-                source_signature=source_signature,
+                source_root=source_root,
                 split=split,
                 state=state,
             )
@@ -324,44 +310,24 @@ def _iter_cached_prefix_rows(
     split: str,
     limit: int,
 ) -> Iterator[dict[str, Any]]:
+    source_root = resolve_source_root(cache_root, source_signature)
     state = _load_or_init_prefix_state(
-        cache_root=cache_root,
-        source_signature=source_signature,
+        source_root=source_root,
         split=split,
     )
     if limit > state.prefix_rows:
         raise ValueError(f"requested prefix {limit} exceeds cached prefix {state.prefix_rows}")
 
-    chunks_root = _resolve_take_chunks_root(cache_root, source_signature, split)
+    chunks_root = _resolve_take_chunks_root(source_root, split)
     consumed = 0
     for chunk_index, chunk_row_count in enumerate(state.chunk_row_counts):
         if consumed >= limit:
             break
-        dataset = load_from_disk(str(_chunk_path(chunks_root, chunk_index)))
+        table = pa.ipc.open_file(pa.memory_map(str(_chunk_path(chunks_root, chunk_index)), "r")).read_all()
         take_rows = min(int(chunk_row_count), limit - consumed)
         for row_index in range(take_rows):
-            row = dataset[row_index]
-            yield {key: row[key] for key in DATA_COLUMNS}
+            yield {col: table.column(col)[row_index].as_py() for col in DATA_COLUMNS}
         consumed += take_rows
-
-
-def _take_from_prefix_rows(
-    rows: Iterator[Mapping[str, Any]] | list[Mapping[str, Any]],
-    *,
-    seed: int,
-    sample_size: int | None,
-    buffer_size: int,
-) -> list[dict[str, Any]]:
-    # iterator → list 물화: from_generator가 재진입 가능해야 함
-    frozen_rows = [dict(row) for row in rows]
-
-    def generator() -> Iterator[dict[str, Any]]:
-        yield from frozen_rows
-
-    dataset = IterableDataset.from_generator(generator)
-    if sample_size is None:
-        return list(dataset.shuffle(seed=seed, buffer_size=buffer_size))
-    return list(dataset.shuffle(seed=seed, buffer_size=buffer_size).take(sample_size))
 
 
 def _take_from_cached_prefix(

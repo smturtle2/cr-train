@@ -24,7 +24,7 @@ _YELLOW = "\033[33m"
 
 def _resolve_summary_timeline_width(*, split: str) -> int:
     terminal_width = shutil.get_terminal_size(fallback=(WARMUP_TIMELINE_WIDTH + 48, 24)).columns
-    reserved_width = len(f" cache {split} | warm | hit=0 miss=0 runs=0") + 10
+    reserved_width = len(f" cache {split} | warm | selected=0 frontier=0->0") + 10
     return max(12, terminal_width - reserved_width)
 
 
@@ -46,13 +46,13 @@ def format_cache_summary(event: dict[str, Any]) -> str:
         str(event.get("timeline", "")).strip(),
         max_chars=_resolve_summary_timeline_width(split=split),
     )
-    cached_blocks = int(event.get("cached_blocks", 0))
-    missing_blocks = int(event.get("missing_blocks", 0))
-    run_count = int(event.get("run_count", 0))
+    selected_block_count = int(event.get("selected_block_count", 0))
+    frontier_before = int(event.get("frontier_before", 0))
+    frontier_after = int(event.get("frontier_after", 0))
     prefix = f"cache {split}" if not timeline else f"{timeline} cache {split}"
-    if missing_blocks == 0:
-        return f"{prefix} | cache-hit | blocks={cached_blocks}"
-    return f"{prefix} | warm | hit={cached_blocks} miss={missing_blocks} runs={run_count}"
+    if int(event.get("extension_blocks", 0)) == 0:
+        return f"{prefix} | cache-hit | selected={selected_block_count} frontier={frontier_after}"
+    return f"{prefix} | warm | selected={selected_block_count} frontier={frontier_before}->{frontier_after}"
 
 
 def format_startup_message(event: dict[str, Any]) -> str:
@@ -70,9 +70,14 @@ def format_startup_message(event: dict[str, Any]) -> str:
         "required_blocks",
         "candidate_blocks",
         "planner_mode",
-        "base_take_prob",
-        "cached_blocks",
-        "missing_blocks",
+        "stop_bias_alpha",
+        "selected_block_count",
+        "cached_selected_blocks",
+        "selected_missing_blocks",
+        "extension_blocks",
+        "execution_block_count",
+        "frontier_before",
+        "frontier_after",
         "run_count",
         "resolved_blocks",
         "epoch",

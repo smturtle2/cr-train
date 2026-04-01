@@ -1,8 +1,8 @@
 """Block-selection bitmask algorithm visualization.
 
-Demonstrates how the sequential additive exact-k planner selects blocks
-from a candidate window. The take probability increases as the remaining
-window shrinks, guaranteeing the exact required block count.
+Demonstrates how the current stop-biased exact-k planner selects blocks
+from a candidate window by first sampling a stop block and then drawing
+the remaining blocks from its prefix.
 
 Usage:
     uv run python examples/bitmask_sampling_demo.py
@@ -10,7 +10,8 @@ Usage:
 
 Output:
     - Configuration summary (block size, total/required/candidate blocks)
-    - Per-block trace: remaining candidates, take probability, random draw, decision
+    - Stop-block probability table and sampled stop
+    - Prefix draw summary from the sampled stop block
     - Final selection bitmap (selected vs. skipped)
     - Selection efficiency statistics
 """
@@ -18,14 +19,10 @@ Output:
 from __future__ import annotations
 
 import argparse
-import math
 
 import numpy as np
 
-from cr_train.data import BLOCK_SIZE, compute_base_take_probability, compute_take_probability
-
-
-CANDIDATE_WINDOW_FACTOR = 4
+from cr_train.data import BLOCK_SIZE, trace_plan_sample
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,64 +40,91 @@ def _render_bitmask(bitmask: np.ndarray, *, width: int) -> str:
     return "".join("■" if bool(value) else "□" for value in bitmask[:width])
 
 
+def _compact_text(text: str, *, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 1:
+        return text[:max_chars]
+    head = max(1, (max_chars - 1) // 2)
+    tail = max(1, max_chars - head - 1)
+    return f"{text[:head]}…{text[-tail:]}"
+
+
+def _format_index_ranges(values: list[int], *, max_ranges: int = 12) -> str:
+    if not values:
+        return "[]"
+    ranges: list[str] = []
+    start = prev = values[0]
+    for value in values[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = value
+    ranges.append(str(start) if start == prev else f"{start}-{prev}")
+    if len(ranges) <= max_ranges:
+        return "[" + ", ".join(ranges) + "]"
+    head = max(1, max_ranges // 2)
+    tail = max(1, max_ranges - head)
+    compact = ranges[:head] + ["..."] + ranges[-tail:]
+    return "[" + ", ".join(compact) + "]"
+
+
+def _build_stop_trace_lines(
+    stop_candidates: list[int],
+    stop_probabilities: list[float],
+    *,
+    sampled_stop_block: int | None,
+    head: int = 12,
+    tail: int = 4,
+) -> list[str]:
+    total = len(stop_candidates)
+    if total <= head + tail + 1:
+        display_indices = list(range(total))
+    else:
+        display_indices = list(range(head)) + list(range(total - tail, total))
+        if sampled_stop_block is not None:
+            sampled_index = stop_candidates.index(sampled_stop_block)
+            display_indices.append(sampled_index)
+        display_indices = sorted(set(display_indices))
+
+    lines: list[str] = []
+    previous_index: int | None = None
+    for index in display_indices:
+        if previous_index is not None and index != previous_index + 1:
+            lines.append("  ...")
+        stop_block = stop_candidates[index]
+        probability = stop_probabilities[index]
+        suffix = "  <<< sampled stop" if sampled_stop_block == stop_block else ""
+        lines.append(f"  stop {stop_block:>4d}  p={probability:.4f}{suffix}")
+        previous_index = index
+    return lines
+
+
 def build_selection_trace(
     *,
     total_rows: int,
     requested_rows: int,
     seed: int,
 ) -> dict[str, object]:
-    total_blocks = int(math.ceil(total_rows / BLOCK_SIZE)) if total_rows > 0 else 0
-    required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE))) if total_blocks > 0 else 0
-    candidate_blocks = min(total_blocks, CANDIDATE_WINDOW_FACTOR * required_blocks)
-    base_take_prob = compute_base_take_probability(required_blocks, candidate_blocks)
-
-    selected_blocks: list[int] = []
-    trace_lines: list[str] = []
-    rng = np.random.default_rng(seed)
-
-    for block_index in range(candidate_blocks):
-        if len(selected_blocks) >= required_blocks:
-            break
-
-        remaining_candidates = candidate_blocks - block_index
-        remaining_needed = required_blocks - len(selected_blocks)
-        if remaining_candidates == remaining_needed:
-            suffix = list(range(block_index, candidate_blocks))
-            selected_blocks.extend(suffix)
-            trace_lines.append(
-                f"  block {block_index:>4d}  remaining={remaining_candidates:>4d}  "
-                f"** guard take ** suffix={suffix}"
-            )
-            break
-
-        take_prob = compute_take_probability(
-            required_blocks,
-            candidate_blocks,
-            remaining_candidates,
-        )
-        sampled = float(rng.random())
-        take = sampled < take_prob
-        if take:
-            selected_blocks.append(block_index)
-
-        marker = ">>>" if take else "   "
-        trace_lines.append(
-            f"  block {block_index:>4d}  remaining={remaining_candidates:>4d}  "
-            f"p={take_prob:.4f}  u={sampled:.4f}  {marker} {'TAKE' if take else 'skip'}"
-        )
-
-    selected_bitmap = np.zeros(total_blocks, dtype=np.bool_)
-    if selected_blocks:
-        selected_bitmap[np.asarray(selected_blocks, dtype=np.int64)] = True
-
+    trace = trace_plan_sample({"total_rows": total_rows}, seed=seed, max_samples=requested_rows)
+    stop_trace_lines = _build_stop_trace_lines(
+        trace.stop_candidates.tolist(),
+        trace.stop_probabilities.tolist(),
+        sampled_stop_block=trace.sampled_stop_block,
+    )
     return {
-        "total_blocks": total_blocks,
-        "required_blocks": required_blocks,
-        "candidate_blocks": candidate_blocks,
-        "base_take_prob": base_take_prob,
-        "selected_blocks": selected_blocks,
-        "selected_bitmap": selected_bitmap,
-        "trace_lines": trace_lines,
+        "total_blocks": trace.total_blocks,
+        "required_blocks": trace.required_blocks,
+        "candidate_blocks": trace.candidate_blocks,
+        "planner_mode": trace.planner_mode,
+        "stop_bias_alpha": trace.stop_bias_alpha,
+        "sampled_stop_block": trace.sampled_stop_block,
+        "prefix_draws": trace.prefix_draws.tolist(),
+        "prefix_draw_summary": _format_index_ranges(trace.prefix_draws.tolist()),
+        "selected_blocks": trace.selected_blocks.tolist(),
+        "selected_bitmap": trace.selected_bitmap,
+        "trace_lines": stop_trace_lines,
     }
 
 
@@ -125,16 +149,20 @@ def main() -> None:
     print(f"  total_blocks        = {result['total_blocks']}")
     print(f"  required_blocks     = {result['required_blocks']}")
     print(f"  candidate_blocks    = {result['candidate_blocks']}")
-    print(f"  base_take_prob      = {result['base_take_prob']:.4f}")
+    print(f"  planner_mode        = {result['planner_mode']}")
+    print(f"  stop_bias_alpha     = {result['stop_bias_alpha']:.4f}")
+    print(f"  sampled_stop_block  = {result['sampled_stop_block']}")
     print()
 
-    # --- Per-block trace ---
+    # --- Stop distribution trace ---
     print("-" * 60)
-    print("  Per-block sampling trace")
+    print("  Stop-block probability trace")
     print("-" * 60)
     print()
     for line in result["trace_lines"]:
         print(line)
+    print()
+    print(f"  prefix_draws        = {result['prefix_draw_summary']}")
     print()
 
     # --- Selection bitmap ---
@@ -144,11 +172,12 @@ def main() -> None:
     print("-" * 60)
     print()
     bitmap_width = min(int(result["candidate_blocks"]), 80)
-    print(f"  {_render_bitmask(result['selected_bitmap'], width=bitmap_width)}")
+    bitmap = _render_bitmask(result["selected_bitmap"], width=int(result["candidate_blocks"]))
+    print(f"  {_compact_text(bitmap, max_chars=bitmap_width)}")
     print()
 
     # --- Summary statistics ---
-    selected = result["selected_blocks"]
+    selected = list(result["selected_blocks"])
     required = int(result["required_blocks"])
     candidate = int(result["candidate_blocks"])
     total = int(result["total_blocks"])
