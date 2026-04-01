@@ -1,7 +1,7 @@
 [project]
 name = "cr-train"
 version = "0.1.0"
-description = "Streaming SEN12MS-CR training module with deterministic scene splits."
+description = "HF-first SEN12MS-CR training module with deterministic sampling."
 readme = "README.md"
 authors = [
     { name = "dongju", email = "smturtle2@kakao.com" }
@@ -9,11 +9,10 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "datasets>=4.6.0",
-    "fsspec>=2026.2.0",
     "numpy>=1.26",
-    "pyarrow>=23.0.0",
-    "rich>=14.0.0",
+    "pyarrow>=23",
     "torch>=2.4",
+    "tqdm>=4.66",
 ]
 
 [build-system]
