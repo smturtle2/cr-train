@@ -14,17 +14,20 @@ from torch.utils.data import DataLoader, Dataset as TorchDataset, DistributedSam
 
 from .constants import CANONICAL_SHUFFLE_BUFFER_SIZE, DATA_COLUMNS, OPTICAL_CHANNELS, SAR_CHANNELS
 from .planning import compress_execution_runs, plan_sample
-from .runtime import get_world_size, is_distributed
+from .runtime import get_rank, get_world_size, is_distributed
 from .source import ensure_source_root, ensure_split_catalog, run_startup_stage
 from .store import SplitBlockCache, as_bytes, load_or_init_block_cache, resolve_block_cache_paths, resolve_dataset_seed
 
 
 @dataclass(slots=True)
 class PreparedSplit:
+    """캐시된 블록 데이터로 구성된 DataLoader-ready split."""
+
     dataset: TorchDataset[dict[str, Any]]
 
 
 def resolve_num_workers(num_workers: int | str) -> int:
+    """DataLoader 워커 수 결정. 정수 또는 ``'auto'`` (CPU 코어 기반 자동 산출)."""
     if isinstance(num_workers, int):
         return max(0, num_workers)
     if num_workers != "auto":
@@ -34,6 +37,7 @@ def resolve_num_workers(num_workers: int | str) -> int:
 
 
 def seed_everything(seed: int, deterministic: bool) -> None:
+    """모든 RNG를 고정하여 재현성 보장. ``deterministic=True`` 시 CuDNN도 결정적 모드."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -58,21 +62,22 @@ def _build_cached_row_refs(
     row_chunk_refs: list[np.ndarray] = []
     row_offset_refs: list[np.ndarray] = []
 
+    # 연속 블록을 단일 청크 범위로 병합
     for run in execution_runs:
         if run.kind != "take_cached":
             continue
         block_index = run.start_block
         while block_index < run.stop_block:
-            chunk_id = int(cache.chunk_ids[block_index])
+            chunk_id = cache.chunk_ids[block_index]
             if chunk_id < 0:
                 raise KeyError(f"cached run references an uncached block: {block_index}")
-            start_offset = int(cache.block_offsets[block_index])
-            stop_offset = start_offset + int(cache.block_row_counts[block_index])
+            start_offset = cache.block_offsets[block_index]
+            stop_offset = start_offset + cache.block_row_counts[block_index]
             next_block = block_index + 1
             while next_block < run.stop_block:
-                next_chunk_id = int(cache.chunk_ids[next_block])
-                next_offset = int(cache.block_offsets[next_block])
-                next_stop = next_offset + int(cache.block_row_counts[next_block])
+                next_chunk_id = cache.chunk_ids[next_block]
+                next_offset = cache.block_offsets[next_block]
+                next_stop = next_offset + cache.block_row_counts[next_block]
                 if next_chunk_id != chunk_id or next_offset != stop_offset:
                     break
                 stop_offset = next_stop
@@ -96,8 +101,8 @@ class CachedBlockDataset(TorchDataset[dict[str, Any]]):
         row_offsets: np.ndarray,
     ) -> None:
         self.chunk_root = chunk_root
-        self.row_chunk_ids = np.asarray(row_chunk_ids, dtype=np.int32)
-        self.row_offsets = np.asarray(row_offsets, dtype=np.int32)
+        self.row_chunk_ids = row_chunk_ids
+        self.row_offsets = row_offsets
         self._chunk_cache: dict[int, Dataset] = {}
 
     def __len__(self) -> int:
@@ -132,6 +137,7 @@ def prepare_split(
     cache_root: Path,
     startup_callback=None,
 ) -> PreparedSplit:
+    """캐시된 블록에서 sample plan에 따라 PreparedSplit 구성. 캐시 미스 시 FileNotFoundError."""
     source_root, descriptor = ensure_source_root(
         dataset_name=dataset_name,
         revision=revision,
@@ -206,15 +212,12 @@ def _decode_image(buffer: Any, shape: Any, *, dtype: np.dtype[Any], expected_cha
     if raw.size != expected_size:
         raise ValueError(f"buffer size mismatch for shape {resolved_shape}: expected {expected_size}, got {raw.size}")
 
+    # CHW/HWC 자동 감지 — 채널 수로 축 판별
     image = raw.reshape(resolved_shape)
-    if image.shape[0] == expected_channels and image.shape[-1] != expected_channels:
-        chw = image
-    elif image.shape[-1] == expected_channels and image.shape[0] != expected_channels:
+    if image.shape[-1] == expected_channels and image.shape[0] != expected_channels:
         chw = np.transpose(image, (2, 0, 1))
     elif image.shape[0] == expected_channels:
         chw = image
-    elif image.shape[-1] == expected_channels:
-        chw = np.transpose(image, (2, 0, 1))
     else:
         raise ValueError(f"could not infer channel dimension from shape {image.shape!r}")
 
@@ -222,6 +225,7 @@ def _decode_image(buffer: Any, shape: Any, *, dtype: np.dtype[Any], expected_cha
 
 
 def decode_row(row: dict[str, Any], *, include_metadata: bool = True) -> dict[str, Any]:
+    """원시 바이너리 행을 CHW float32 numpy 배열로 디코딩. ``include_metadata=True`` 시 메타데이터 포함."""
     sar = _decode_image(row["sar"], row["sar_shape"], dtype=np.float32, expected_channels=SAR_CHANNELS)
     cloudy = _decode_image(row["cloudy"], row["opt_shape"], dtype=np.int16, expected_channels=OPTICAL_CHANNELS) / 10000.0
     target = _decode_image(row["target"], row["opt_shape"], dtype=np.int16, expected_channels=OPTICAL_CHANNELS) / 10000.0
@@ -236,6 +240,8 @@ def decode_row(row: dict[str, Any], *, include_metadata: bool = True) -> dict[st
 
 
 def build_collate_fn(*, include_metadata: bool = True):
+    """행 리스트를 디코딩하여 배치 텐서로 묶는 collate 함수 생성."""
+
     def collate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if not rows:
             raise ValueError("cannot collate an empty batch")
@@ -280,6 +286,7 @@ def build_dataloader(
     prefetch_factor: int = 2,
     drop_last: bool = False,
 ) -> DataLoader:
+    """PreparedSplit에서 DataLoader를 생성. 분산 환경 시 DistributedSampler 자동 적용."""
     dataloader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
         "collate_fn": build_collate_fn(include_metadata=include_metadata),
@@ -314,6 +321,7 @@ def build_dataloader(
 
 
 def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    """배치 dict 내 텐서를 대상 디바이스로 non-blocking 전송."""
     moved: dict[str, Any] = {}
     for key, value in batch.items():
         moved[key] = value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value

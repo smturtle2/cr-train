@@ -10,6 +10,8 @@ import torch
 
 @dataclass(slots=True)
 class MetricAccumulator:
+    """배치별 메트릭의 가중 합 누적기. averages()로 샘플 가중 평균 산출."""
+
     weighted_sums: dict[str, float] = field(default_factory=dict)
     total_examples: int = 0
     total_batches: int = 0
@@ -27,17 +29,18 @@ class MetricAccumulator:
 
 
 def compute_loss(loss_fn: Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int], model_output: Any, batch: Mapping[str, Any], device: torch.device) -> torch.Tensor:
+    """loss_fn 실행 결과를 텐서로 변환. float/int 반환도 허용."""
     loss_value = loss_fn(model_output, batch)
     if not isinstance(loss_value, torch.Tensor):
         return torch.as_tensor(loss_value, dtype=torch.float32, device=device)
-    return loss_value.to(device) if loss_value.device != device else loss_value
+    return loss_value
 
 
 def _to_float(value: Any, name: str) -> float:
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
             raise ValueError(f"{name} must return a scalar tensor")
-        return float(value.detach().cpu().item())
+        return float(value.item())
     if isinstance(value, (float, int)):
         return float(value)
     raise TypeError(f"{name} must return a scalar tensor, float, or int")

@@ -13,6 +13,8 @@ SELECTION_PLANNER_MODE = "sequential_additive_exact_k"
 
 @dataclass(slots=True)
 class SamplePlan:
+    """블록 단위 샘플 선택 결과. selected_bitmap이 어떤 블록을 사용할지 결정."""
+
     requested_rows: int
     effective_rows: int
     required_blocks: int
@@ -27,6 +29,8 @@ class SamplePlan:
 
 @dataclass(slots=True)
 class ExecutionRun:
+    """동일한 실행 종류(skip/take_cached/take_remote/materialize)의 연속 블록 범위."""
+
     kind: str
     start_block: int
     stop_block: int
@@ -36,6 +40,8 @@ class ExecutionRun:
 
 @dataclass(slots=True)
 class CachePlan:
+    """sample plan과 현재 캐시 상태를 결합한 warmup 실행 계획."""
+
     sample_plan: SamplePlan
     hit_bitmap: np.ndarray
     missing_bitmap: np.ndarray
@@ -48,6 +54,7 @@ class CachePlan:
 
 
 def compute_base_take_probability(required_blocks: int, candidate_blocks: int) -> float:
+    """블록 선택 기본 확률: required / candidate."""
     if required_blocks <= 0 or candidate_blocks <= 0:
         return 0.0
     return min(1.0, required_blocks / candidate_blocks)
@@ -58,6 +65,7 @@ def compute_take_probability(
     candidate_blocks: int,
     remaining_candidates: int,
 ) -> float:
+    """후보 소진에 따라 증가하는 동적 선택 확률. 정확한 블록 수 보장을 위한 보정 포함."""
     if required_blocks <= 0 or candidate_blocks <= 0 or remaining_candidates <= 0:
         return 0.0
     base_take_prob = compute_base_take_probability(required_blocks, candidate_blocks)
@@ -77,6 +85,7 @@ def _select_blocks_sequentially(
     if required_blocks >= candidate_blocks:
         return np.arange(candidate_blocks, dtype=np.int64), base_take_prob
 
+    # split별 독립 시드로 블록 선택 재현성 보장
     rng = np.random.default_rng(seed)
     selected_blocks: list[int] = []
     for block_index in range(candidate_blocks):
@@ -85,6 +94,7 @@ def _select_blocks_sequentially(
 
         remaining_candidates = candidate_blocks - block_index
         remaining_needed = required_blocks - len(selected_blocks)
+        # 남은 후보 == 남은 필요 → 나머지 전부 선택 (suffix guard)
         if remaining_candidates == remaining_needed:
             selected_blocks.extend(range(block_index, candidate_blocks))
             break
@@ -105,6 +115,7 @@ def _select_blocks_sequentially(
 
 
 def plan_sample(catalog: dict[str, object], seed: int, max_samples: int | None, *, split: str = "") -> SamplePlan:
+    """순차 가산 샘플링으로 블록을 선택. 결정적이며 정확히 required_blocks개를 보장."""
     split_seed = seed ^ (hash(split) & 0xFFFFFFFF) if split else seed
     total_rows = int(catalog["total_rows"])
     total_blocks = int(math.ceil(total_rows / BLOCK_SIZE)) if total_rows > 0 else 0
@@ -205,6 +216,7 @@ def compress_execution_runs(
     *,
     stop_block: int,
 ) -> list[ExecutionRun]:
+    """인접한 동일 종류 블록을 연속 실행 구간으로 병합."""
     if stop_block <= 0:
         return []
 
@@ -223,6 +235,7 @@ def build_cache_plan(
     *,
     frontier_block: int,
 ) -> CachePlan:
+    """sample plan과 캐시 상태로부터 warmup 실행 계획 생성. 캐시 히트 시 frontier_runs 비어 있음."""
     selected_bitmap = sample_plan.selected_bitmap
     selected_blocks = sample_plan.selected_blocks
     hit_bitmap = np.logical_and(selected_bitmap, cached_bitmap)

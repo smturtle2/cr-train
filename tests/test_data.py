@@ -9,15 +9,15 @@ import pytest
 from cr_train.data import (
     BLOCK_SIZE,
     CANONICAL_SHUFFLE_BUFFER_SIZE,
-    _compress_execution_runs,
-    _compute_base_take_probability,
-    _compute_take_probability,
-    _normalize_parquet_uri,
-    _plan_sample,
     build_collate_fn,
     build_dataloader,
+    compress_execution_runs,
+    compute_base_take_probability,
+    compute_take_probability,
     decode_row,
     ensure_split_cache,
+    normalize_parquet_uri,
+    plan_sample,
     prepare_split,
 )
 from cr_train.data.runtime import _compact_warmup_timeline, _render_warmup_timeline
@@ -232,12 +232,12 @@ def test_build_collate_fn_batches_rows() -> None:
     assert batch["meta"]["patch"] == ["p000", "p001"]
 
 
-def test_plan_sample_is_block_reproducible_and_candidate_bounded() -> None:
+def testplan_sample_is_block_reproducible_and_candidate_bounded() -> None:
     catalog = _catalog(total_rows=10 * BLOCK_SIZE)
 
-    sample_a = _plan_sample(catalog, seed=7, max_samples=20)
-    sample_b = _plan_sample(catalog, seed=7, max_samples=20)
-    sample_c = _plan_sample(catalog, seed=99, max_samples=20)
+    sample_a = plan_sample(catalog, seed=7, max_samples=20)
+    sample_b = plan_sample(catalog, seed=7, max_samples=20)
+    sample_c = plan_sample(catalog, seed=99, max_samples=20)
 
     assert sample_a.requested_rows == 20
     assert sample_a.required_blocks == 2
@@ -254,9 +254,9 @@ def test_plan_sample_is_block_reproducible_and_candidate_bounded() -> None:
 
 
 def test_take_probability_grows_as_candidate_suffix_shrinks() -> None:
-    base_take_prob = _compute_base_take_probability(4, 16)
+    base_take_prob = compute_base_take_probability(4, 16)
     take_probs = [
-        _compute_take_probability(4, 16, remaining_candidates)
+        compute_take_probability(4, 16, remaining_candidates)
         for remaining_candidates in range(16, 3, -1)
     ]
 
@@ -285,7 +285,7 @@ def test_compact_warmup_timeline_truncates_with_ellipsis() -> None:
     assert "…" in compact
 
 
-def test_plan_sample_suffix_guard_preserves_exact_block_count(monkeypatch: pytest.MonkeyPatch) -> None:
+def testplan_sample_suffix_guard_preserves_exact_block_count(monkeypatch: pytest.MonkeyPatch) -> None:
     class _NeverTakeRng:
         @staticmethod
         def random() -> float:
@@ -293,19 +293,19 @@ def test_plan_sample_suffix_guard_preserves_exact_block_count(monkeypatch: pytes
 
     monkeypatch.setattr("cr_train.data.planning.np.random.default_rng", lambda _seed: _NeverTakeRng())
 
-    sample_plan = _plan_sample(_catalog(total_rows=10 * BLOCK_SIZE), seed=7, max_samples=2 * BLOCK_SIZE)
+    sample_plan = plan_sample(_catalog(total_rows=10 * BLOCK_SIZE), seed=7, max_samples=2 * BLOCK_SIZE)
 
     assert sample_plan.selected_blocks.tolist() == [2, 3]
     assert sample_plan.selected_blocks.size == sample_plan.required_blocks
 
 
-def test_plan_sample_reduces_execution_span_vs_uniform_choice_baseline() -> None:
+def testplan_sample_reduces_execution_span_vs_uniform_choice_baseline() -> None:
     catalog = _catalog(total_rows=64 * BLOCK_SIZE)
     sequential_counts = []
     uniform_counts = []
 
     for seed in range(256):
-        sample_plan = _plan_sample(catalog, seed=seed, max_samples=16 * BLOCK_SIZE)
+        sample_plan = plan_sample(catalog, seed=seed, max_samples=16 * BLOCK_SIZE)
         sequential_counts.append(sample_plan.execution_block_count)
         uniform_counts.append(
             _uniform_execution_block_count(
@@ -318,11 +318,11 @@ def test_plan_sample_reduces_execution_span_vs_uniform_choice_baseline() -> None
     assert float(np.mean(sequential_counts)) < float(np.mean(uniform_counts))
 
 
-def test_compress_execution_runs_merges_adjacent_block_spans() -> None:
+def testcompress_execution_runs_merges_adjacent_block_spans() -> None:
     selected = np.asarray([0, 0, 1, 1, 1, 1, 0, 0, 1], dtype=np.bool_)
     cached = np.asarray([0, 0, 1, 1, 0, 0, 0, 0, 1], dtype=np.bool_)
 
-    runs = _compress_execution_runs(selected, cached, stop_block=9)
+    runs = compress_execution_runs(selected, cached, stop_block=9)
 
     assert [(run.kind, run.total_rows) for run in runs] == [
         ("skip", 2 * BLOCK_SIZE),
@@ -333,10 +333,10 @@ def test_compress_execution_runs_merges_adjacent_block_spans() -> None:
     ]
 
 
-def test_normalize_parquet_uri_converts_hf_resolve_url() -> None:
+def testnormalize_parquet_uri_converts_hf_resolve_url() -> None:
     url = "https://huggingface.co/datasets/Hermanni/sen12mscr/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
 
-    assert _normalize_parquet_uri(url) == "hf://datasets/Hermanni/sen12mscr@refs/convert/parquet/default/train/0000.parquet"
+    assert normalize_parquet_uri(url) == "hf://datasets/Hermanni/sen12mscr@refs/convert/parquet/default/train/0000.parquet"
 
 
 def test_ensure_split_cache_rewinds_for_missing_blocks_before_frontier(monkeypatch, tmp_path: Path) -> None:
@@ -350,7 +350,7 @@ def test_ensure_split_cache_rewinds_for_missing_blocks_before_frontier(monkeypat
 
     catalog = _catalog(total_rows=len(rows))
     plans = [
-        (seed, _plan_sample(catalog, seed=seed, max_samples=BLOCK_SIZE, split="train"))
+        (seed, plan_sample(catalog, seed=seed, max_samples=BLOCK_SIZE, split="train"))
         for seed in range(512)
     ]
     first_seed, first_plan = next(
@@ -493,7 +493,7 @@ def test_prepare_split_reads_cached_rows_in_selected_canonical_block_order(monke
     )
 
     batch_scenes = [scene for batch in loader for scene in batch["meta"]["scene"]]
-    sample_plan = _plan_sample(_catalog(total_rows=len(rows)), seed=13, max_samples=2 * BLOCK_SIZE, split="validation")
+    sample_plan = plan_sample(_catalog(total_rows=len(rows)), seed=13, max_samples=2 * BLOCK_SIZE, split="validation")
     canonical_rows = _canonical_rows(rows, dataset_seed=17)
     expected_rows: list[dict[str, object]] = []
     for block_index in sample_plan.selected_blocks:

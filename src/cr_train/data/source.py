@@ -27,6 +27,7 @@ def run_startup_stage(
     operation,
     **fields: Any,
 ):
+    """operation 실행을 startup 이벤트(start/done/error)와 타이밍으로 감싸는 래퍼."""
     import time
 
     emit_startup_event(startup_callback, stage=stage, split=split, status="start", **fields)
@@ -226,6 +227,7 @@ def ensure_source_root(
     revision: str | None,
     cache_root: Path,
 ) -> tuple[Path, dict[str, Any]]:
+    """소스 메타데이터가 로컬에 캐시되었는지 확인. 없으면 HF에서 가져와 저장."""
     cached = _find_cached_source(cache_root, dataset_name, revision)
     if cached is not None:
         source_root, descriptor = cached
@@ -320,6 +322,7 @@ def ensure_split_catalog(
     split: str,
     startup_callback: StartupCallback | None,
 ) -> dict[str, Any]:
+    """split 카탈로그가 디스크에 존재하는지 확인. 없으면 parquet 메타데이터에서 빌드."""
     catalog_path = resolve_catalog_path(source_root, split)
     if catalog_path.exists():
         return read_json(catalog_path)

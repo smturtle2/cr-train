@@ -27,15 +27,8 @@ from .data import (
 from .trainer_reporting import format_startup_message, serialize_value, should_print_startup
 from .trainer_runtime import MetricAccumulator, compute_loss, compute_metric_values, finalize_summary, prime_iterator, update_progress_bar
 
-try:
-    import torch.distributed as dist
-except Exception:  # pragma: no cover - torch without distributed support
-    dist = None
-
-try:
-    from torch.nn.parallel import DistributedDataParallel as DDP
-except Exception:  # pragma: no cover - torch without distributed support
-    DDP = None
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 LossFn = Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int]
@@ -115,8 +108,7 @@ class Trainer:
         self._config_written = False
         self._cache_ready = False
 
-        # The model already owns the device. Trainer follows it instead of moving it.
-        self.device = self._infer_module_device(self.model)
+        # DDP 래핑 후 원본 모듈에서 device 추론
         self._wrap_model_for_ddp_if_needed()
         self.device = self._infer_module_device(self._model_state_owner())
 
@@ -253,7 +245,7 @@ class Trainer:
         )
 
     def _wrap_model_for_ddp_if_needed(self) -> None:
-        if not is_distributed() or DDP is None or isinstance(self.model, DDP):
+        if not is_distributed() or isinstance(self.model, DDP):
             return
         if self.device.type == "cuda":
             device_index = self.device.index if self.device.index is not None else torch.cuda.current_device()
@@ -262,7 +254,7 @@ class Trainer:
         self.model = DDP(self.model)
 
     def _model_state_owner(self) -> nn.Module:
-        if DDP is not None and isinstance(self.model, DDP):
+        if isinstance(self.model, DDP):
             return self.model.module
         return self.model
 
@@ -368,7 +360,7 @@ class Trainer:
                 self.global_step += 1
 
                 metric_values = compute_metric_values(self.metric_fns, model_output, moved_batch)
-                batch_values = {"loss": float(loss.detach().cpu().item()), **metric_values}
+                batch_values = {"loss": loss.item(), **metric_values}
                 accumulator.update(batch_values, batch_size)
                 update_progress_bar(
                     progress,
@@ -418,7 +410,7 @@ class Trainer:
                     batch_size = int(moved_batch["sar"].shape[0])
 
                     metric_values = compute_metric_values(self.metric_fns, model_output, moved_batch)
-                    batch_values = {"loss": float(loss.detach().cpu().item()), **metric_values}
+                    batch_values = {"loss": loss.item(), **metric_values}
                     accumulator.update(batch_values, batch_size)
                     update_progress_bar(
                         progress,

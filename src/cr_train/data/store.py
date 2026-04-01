@@ -17,6 +17,8 @@ from .constants import BLOCK_SIZE, DATA_COLUMNS, DEFAULT_DATASET_SEED, LOCK_POLL
 
 @dataclass(slots=True)
 class SplitBlockCacheState:
+    """블록 캐시의 영속 상태. canonical_frontier_block이 스트림 재개 위치를 추적."""
+
     dataset_seed: int
     shuffle_buffer_size: int
     block_size: int
@@ -27,6 +29,8 @@ class SplitBlockCacheState:
 
 @dataclass(slots=True)
 class SplitBlockCache:
+    """split 블록 캐시의 인메모리 표현. cached 비트맵으로 블록별 캐시 여부 관리."""
+
     state: SplitBlockCacheState
     cached: np.ndarray
     chunk_ids: np.ndarray
@@ -36,6 +40,8 @@ class SplitBlockCache:
 
 @dataclass(frozen=True, slots=True)
 class BlockCachePaths:
+    """블록 캐시의 파일시스템 경로 집합."""
+
     store_root: Path
     chunk_root: Path
     lock_path: Path
@@ -47,6 +53,7 @@ class BlockCachePaths:
 
 
 def resolve_cache_root(cache_dir: str | os.PathLike[str] | None) -> Path:
+    """캐시 루트 디렉토리 결정. None이면 ``~/.cache/cr-train`` 사용."""
     if cache_dir is not None:
         root = Path(cache_dir)
     else:

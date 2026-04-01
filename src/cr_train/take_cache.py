@@ -11,18 +11,16 @@ from typing import Any
 import pyarrow.parquet as pq
 from datasets import Dataset, IterableDataset, load_dataset, load_from_disk
 
-from .data import (
-    DATA_COLUMNS,
-    DATASET_ID,
-    _ensure_source_root,
-    _ensure_split_catalog,
-    _file_lock,
-    _freeze_row,
-    _remove_tree,
-    _read_json,
-    _save_dataset_without_progress,
-    _write_json_atomic,
+from .data.constants import DATA_COLUMNS, DATASET_ID
+from .data.source import ensure_source_root, ensure_split_catalog
+from .data.store import (
+    file_lock,
+    freeze_row,
+    read_json,
+    remove_tree,
     resolve_cache_root,
+    save_dataset_without_progress,
+    write_json_atomic,
 )
 
 PREFIX_CACHE_LAYOUT_VERSION = 1
@@ -37,6 +35,8 @@ class PrefixCacheState:
 
 @dataclass(slots=True)
 class PrefixCacheStats:
+    """prefix 캐시 보장 작업의 통계 (캐시 히트/미스, 소요 시간 등)."""
+
     source_signature: str
     required_prefix_rows: int
     cached_prefix_rows_before: int
@@ -48,6 +48,8 @@ class PrefixCacheStats:
 
 @dataclass(slots=True)
 class SampleResult:
+    """행 샘플링 결과. digest로 결정적 재현성 검증 가능."""
+
     rows: list[dict[str, Any]]
     digest: str
     elapsed_sec: float
@@ -107,7 +109,7 @@ def _load_or_init_prefix_state(
         )
         return state
 
-    payload = _read_json(state_path)
+    payload = read_json(state_path)
     return PrefixCacheState(
         prefix_rows=int(payload["prefix_rows"]),
         chunk_row_counts=[int(value) for value in payload["chunk_row_counts"]],
@@ -121,7 +123,7 @@ def _write_prefix_state(
     split: str,
     state: PrefixCacheState,
 ) -> None:
-    _write_json_atomic(
+    write_json_atomic(
         _resolve_take_state_path(cache_root, source_signature, split),
         {
             "prefix_rows": state.prefix_rows,
@@ -141,9 +143,9 @@ def _save_chunk(
     chunks_root = _resolve_take_chunks_root(cache_root, source_signature, split)
     chunk_dir = _chunk_path(chunks_root, chunk_index)
     tmp_dir = chunk_dir.with_suffix(".tmp")
-    _remove_tree(tmp_dir)
+    remove_tree(tmp_dir)
     dataset = Dataset.from_list(rows)
-    _save_dataset_without_progress(dataset, tmp_dir)
+    save_dataset_without_progress(dataset, tmp_dir)
     tmp_dir.replace(chunk_dir)
     return len(rows)
 
@@ -194,7 +196,7 @@ def _iter_rows_from_prefix_range(
             slice_stop = min(rows_to_skip + rows_to_take, batch_stop)
             if slice_start < slice_stop:
                 for row in batch_rows[slice_start - batch_start:slice_stop - batch_start]:
-                    yield _freeze_row(row)
+                    yield freeze_row(row)
                     rows_taken += 1
                     if rows_taken >= rows_to_take:
                         break
@@ -255,14 +257,14 @@ def _ensure_prefix_cache(
     cache_root: Path,
 ) -> PrefixCacheStats:
     started_at = time.perf_counter()
-    source_root, descriptor = _ensure_source_root(
+    source_root, descriptor = ensure_source_root(
         dataset_name=dataset_name,
         revision=revision,
         cache_root=cache_root,
     )
     source_signature = str(descriptor["source_signature"])
-    with _file_lock(_resolve_take_lock_path(cache_root, source_signature, split)):
-        catalog = _ensure_split_catalog(
+    with file_lock(_resolve_take_lock_path(cache_root, source_signature, split)):
+        catalog = ensure_split_catalog(
             source_root=source_root,
             descriptor=descriptor,
             split=split,
@@ -350,19 +352,16 @@ def _take_from_prefix_rows(
     sample_size: int | None,
     buffer_size: int,
 ) -> list[dict[str, Any]]:
+    # iterator → list 물화: from_generator가 재진입 가능해야 함
     frozen_rows = [dict(row) for row in rows]
 
     def generator() -> Iterator[dict[str, Any]]:
-        for row in frozen_rows:
-            yield dict(row)
+        yield from frozen_rows
 
     dataset = IterableDataset.from_generator(generator)
     if sample_size is None:
-        sampled = dataset.shuffle(seed=seed, buffer_size=buffer_size)
-        return [dict(row) for row in sampled]
-
-    sampled = dataset.shuffle(seed=seed, buffer_size=buffer_size).take(sample_size)
-    return [dict(row) for row in sampled]
+        return list(dataset.shuffle(seed=seed, buffer_size=buffer_size))
+    return list(dataset.shuffle(seed=seed, buffer_size=buffer_size).take(sample_size))
 
 
 def _take_from_cached_prefix(
@@ -397,8 +396,7 @@ def _take_from_cached_prefix(
             "prefix_limit": limit,
         },
     )
-    sampled = dataset.shuffle(seed=seed, buffer_size=buffer_size).take(sample_size)
-    return [dict(row) for row in sampled]
+    return list(dataset.shuffle(seed=seed, buffer_size=buffer_size).take(sample_size))
 
 
 def digest_rows(rows: list[Mapping[str, Any]]) -> str:
@@ -427,6 +425,7 @@ def take_rows_official(
     revision: str | None = None,
     cache_dir: str | Path | None = None,
 ) -> SampleResult:
+    """HF 공식 streaming shuffle-take 파이프라인으로 행 샘플링."""
     started_at = time.perf_counter()
     cache_root = resolve_cache_root(cache_dir)
     dataset = load_dataset(
@@ -455,6 +454,7 @@ def take_rows_with_prefix_cache(
     revision: str | None = None,
     cache_dir: str | Path | None = None,
 ) -> SampleResult:
+    """로컬 prefix 캐시를 활용한 결정적 행 샘플링. 캐시 미스 시 자동으로 prefix를 확장."""
     started_at = time.perf_counter()
     cache_root = resolve_cache_root(cache_dir)
     required_prefix_rows = buffer_size + sample_size

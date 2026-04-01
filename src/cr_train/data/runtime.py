@@ -31,6 +31,8 @@ from .store import (
 
 @dataclass(slots=True)
 class WarmupProgressState:
+    """EMA 기반 블록 처리 속도 추적 상태."""
+
     ema_blocks_per_sec: float | None = None
     last_update_at: float | None = None
     last_resolved_blocks: int = 0
@@ -263,19 +265,18 @@ def _warm_missing_blocks(
             progress.set_description_str(f"cache {split} {label}", refresh=False)
 
     try:
+        # HF streaming은 seek 불가 — frontier 이전 블록을 순차 스킵
         if cache_plan.stream_start_block > 0:
             _desc("seek")
-            for _ in range(cache_plan.stream_start_block):
-                _skip_canonical_blocks(row_iterator, 1)
-                progress.update(1)
+            _skip_canonical_blocks(row_iterator, cache_plan.stream_start_block)
+            progress.update(cache_plan.stream_start_block)
         for run in cache_plan.frontier_runs:
             if run.kind == "skip":
                 _desc(f"skip {run.block_count}blk")
-                for _ in range(run.block_count):
-                    _skip_canonical_blocks(row_iterator, 1)
-                    progress.update(1)
-                cache.state.canonical_frontier_block = max(cache.state.canonical_frontier_block, run.stop_block)
-                write_block_cache(cache_paths, cache)
+                _skip_canonical_blocks(row_iterator, run.block_count)
+                progress.update(run.block_count)
+                # frontier 위치 갱신 (순차 처리라 항상 증가)
+                cache.state.canonical_frontier_block = run.stop_block
                 continue
 
             _desc(f"fetch blk {run.start_block}-{run.stop_block - 1}")
@@ -285,8 +286,7 @@ def _warm_missing_blocks(
                 blocks=_read_canonical_blocks(row_iterator, run.block_count),
                 cache=cache,
             )
-            cache.state.canonical_frontier_block = max(cache.state.canonical_frontier_block, run.stop_block)
-            write_block_cache(cache_paths, cache)
+            cache.state.canonical_frontier_block = run.stop_block
             progress.update(run.block_count)
             _update_warmup_progress(
                 progress,
@@ -295,6 +295,8 @@ def _warm_missing_blocks(
                 missing_blocks=cache_plan.missing_blocks,
                 cached_blocks=cache_plan.cached_blocks,
             )
+        # 루프 종료 후 캐시 인덱스를 한 번만 디스크에 기록
+        write_block_cache(cache_paths, cache)
     finally:
         row_iterator.close()
         _update_warmup_progress(
@@ -320,6 +322,7 @@ def ensure_split_cache(
     cache_root: Path,
     startup_callback=None,
 ) -> Path:
+    """split에 필요한 블록이 모두 캐시되었는지 확인하고, 누락된 블록은 HF에서 가져와 채운다."""
     source_root, descriptor = ensure_source_root(
         dataset_name=dataset_name,
         revision=revision,
@@ -390,14 +393,11 @@ def ensure_split_cache(
     return resolve_catalog_path(source_root, split)
 
 
-try:
-    import torch.distributed as dist
-except Exception:  # pragma: no cover - torch without distributed support
-    dist = None
+import torch.distributed as dist
 
 
 def is_distributed() -> bool:
-    return bool(dist and dist.is_available() and dist.is_initialized())
+    return dist.is_available() and dist.is_initialized()
 
 
 def get_rank() -> int:
