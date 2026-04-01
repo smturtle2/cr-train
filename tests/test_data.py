@@ -1,236 +1,471 @@
 from __future__ import annotations
 
-import subprocess
-import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
-import torch
 
-import cr_train.data as data_mod
-from cr_train import build_loaders
-from cr_train.data import PARQUET_COLUMNS
+from cr_train.data import (
+    BLOCK_SIZE,
+    CANONICAL_SHUFFLE_BUFFER_SIZE,
+    _compress_execution_runs,
+    _compute_base_take_probability,
+    _compute_take_probability,
+    _normalize_parquet_uri,
+    _plan_sample,
+    build_collate_fn,
+    build_dataloader,
+    decode_row,
+    ensure_split_cache,
+    prepare_split,
+)
 
 
-def _sample_row(*, season: str = "spring", scene: str = "1", patch: str = "p30") -> dict[str, object]:
-    sar = np.array(
-        [
-            [[-30.0, -5.0], [-12.5, 1.0]],
-            [[-25.0, -7.5], [0.0, -20.0]],
-        ],
-        dtype=np.float32,
-    )
-    optical = np.arange(13 * 2 * 1, dtype=np.int16).reshape(2, 1, 13) * 800 - 10
+def _make_row(index: int) -> dict[str, object]:
+    sar = (np.arange(256 * 256 * 2, dtype=np.float32) + index).reshape(256, 256, 2)
+    cloudy = (np.arange(256 * 256 * 13, dtype=np.int16) + index).reshape(256, 256, 13)
+    target = (np.arange(256 * 256 * 13, dtype=np.int16) + index + 10).reshape(256, 256, 13)
     return {
         "sar": sar.tobytes(),
-        "cloudy": optical.tobytes(),
-        "target": (optical + 100).tobytes(),
-        "sar_shape": list(sar.shape),
-        "opt_shape": list(optical.shape),
-        "season": season,
-        "scene": scene,
-        "patch": patch,
+        "cloudy": cloudy.tobytes(),
+        "target": target.tobytes(),
+        "sar_shape": [256, 256, 2],
+        "opt_shape": [256, 256, 13],
+        "season": "spring",
+        "scene": str(index),
+        "patch": f"p{index:03d}",
     }
 
 
-# ---------------------------------------------------------------------------
-# Batch decode / collate
-# ---------------------------------------------------------------------------
+class _FakeTqdm:
+    instances: list["_FakeTqdm"] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.total = kwargs.get("total")
+        self.disable = kwargs.get("disable", False)
+        self.updates: list[int] = []
+        self.postfixes: list[dict[str, object]] = []
+        self.desc = kwargs.get("desc")
+        _FakeTqdm.instances.append(self)
+
+    @staticmethod
+    def write(_message: str) -> None:
+        return None
+
+    def update(self, value: int) -> None:
+        self.updates.append(value)
+
+    def set_postfix(self, values: dict[str, object]) -> None:
+        self.postfixes.append(values)
+
+    def close(self) -> None:
+        return None
 
 
-def test_collate_decodes_raw_parquet_rows() -> None:
-    rows = [_sample_row(), _sample_row(scene="2")]
-    batch = data_mod._collate_sen12mscr_rows(rows)
+class _FakeStreamingDataset:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = [dict(row) for row in rows]
 
-    assert "inputs" in batch and "target" in batch
-    sar, cloudy = batch["inputs"]
-    assert sar.shape[0] == 2
-    assert cloudy.shape[0] == 2
-    assert batch["target"].shape[0] == 2
-    assert batch["metadata"]["scene"] == ["1", "2"]
+    def select_columns(self, columns: list[str]):
+        return _FakeStreamingDataset(
+            [{column: row[column] for column in columns} for row in self._rows]
+        )
+
+    def shuffle(self, *, seed: int, buffer_size: int):
+        del buffer_size
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(len(self._rows))
+        return _FakeStreamingDataset([self._rows[int(index)] for index in order])
+
+    def __iter__(self):
+        for row in self._rows:
+            yield dict(row)
 
 
-def test_collate_passes_through_pre_decoded_batch() -> None:
-    pre_decoded = [
-        {"inputs": (torch.zeros(2, 2, 2), torch.zeros(13, 2, 1)), "target": torch.zeros(13, 2, 1)}
+class _FakeRowGroupMetadata:
+    def __init__(self, num_rows: int) -> None:
+        self.num_rows = num_rows
+
+
+class _FakeParquetMetadata:
+    def __init__(self, row_group_rows: list[int]) -> None:
+        self.num_rows = sum(row_group_rows)
+        self.num_row_groups = len(row_group_rows)
+        self._row_group_rows = row_group_rows
+
+    def row_group(self, index: int) -> _FakeRowGroupMetadata:
+        return _FakeRowGroupMetadata(self._row_group_rows[index])
+
+
+class _FakeParquetFile:
+    def __init__(
+        self,
+        url: str,
+        row_group_rows: list[int],
+        stats: dict[str, object],
+    ) -> None:
+        self.metadata = _FakeParquetMetadata(row_group_rows)
+        stats["opens"][url] += 1
+
+
+def _patch_source(monkeypatch, split_rows: dict[str, list[dict[str, object]]]) -> dict[str, object]:
+    parquet_entries: list[dict[str, object]] = []
+    shard_rows: dict[str, list[int]] = {}
+    stats: dict[str, object] = {
+        "load_dataset_calls": [],
+        "opens": defaultdict(int),
+    }
+
+    for split, rows in split_rows.items():
+        url = f"hf://datasets/unit/test@refs/convert/parquet/default/{split}/0000.parquet"
+        parquet_entries.append(
+            {
+                "dataset": "unit/test",
+                "config": "default",
+                "split": split,
+                "url": url,
+                "filename": "0000.parquet",
+            }
+        )
+        shard_rows[url] = [
+            min(BLOCK_SIZE, len(rows) - start)
+            for start in range(0, len(rows), BLOCK_SIZE)
+        ]
+
+    def fake_request_json(url: str):
+        if "/info?" in url:
+            return {
+                "dataset_info": {
+                    "default": {
+                        "splits": {
+                            split: {"num_examples": len(rows)}
+                            for split, rows in split_rows.items()
+                        }
+                    }
+                }
+            }
+        if "/parquet?" in url:
+            return {"parquet_files": parquet_entries}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def fake_parquet_file(url: str):
+        return _FakeParquetFile(
+            str(url),
+            row_group_rows=list(shard_rows[str(url)]),
+            stats=stats,
+        )
+
+    def fake_load_dataset(path: str, *args, split: str | None = None, streaming: bool = False, **kwargs):
+        del args, kwargs
+        assert path == "unit/test"
+        assert streaming is True
+        assert split is not None
+        stats["load_dataset_calls"].append(str(split))
+        return _FakeStreamingDataset(list(split_rows[str(split)]))
+
+    monkeypatch.setattr("cr_train.data.source.request_json", fake_request_json)
+    monkeypatch.setattr("cr_train.data.source.pq.ParquetFile", fake_parquet_file)
+    monkeypatch.setattr("cr_train.data.runtime.load_dataset", fake_load_dataset)
+    return stats
+
+
+def _catalog(total_rows: int) -> dict[str, object]:
+    return {"total_rows": total_rows}
+
+
+def _uniform_execution_block_count(seed: int, *, required_blocks: int, candidate_blocks: int) -> int:
+    rng = np.random.default_rng(seed)
+    selected_blocks = np.sort(
+        rng.choice(candidate_blocks, size=required_blocks, replace=False).astype(np.int64)
+    )
+    return int(selected_blocks[-1]) + 1
+
+
+def _cache_store_root(catalog_path: Path, split: str, dataset_seed: int) -> Path:
+    source_root = catalog_path.parent.parent
+    return (
+        source_root
+        / "block_store"
+        / split
+        / f"dataset-seed={dataset_seed}-shuffle-buffer={CANONICAL_SHUFFLE_BUFFER_SIZE}"
+    )
+
+
+def _canonical_rows(rows: list[dict[str, object]], dataset_seed: int) -> list[dict[str, object]]:
+    rng = np.random.default_rng(dataset_seed)
+    order = rng.permutation(len(rows))
+    return [rows[int(index)] for index in order]
+
+
+def test_decode_row_converts_to_chw_and_normalizes() -> None:
+    decoded = decode_row(_make_row(3))
+
+    assert decoded["sar"].shape == (2, 256, 256)
+    assert decoded["cloudy"].shape == (13, 256, 256)
+    assert decoded["target"].shape == (13, 256, 256)
+    assert decoded["sar"].dtype == np.float32
+    assert decoded["cloudy"].dtype == np.float32
+    assert decoded["target"].dtype == np.float32
+    assert decoded["meta"]["scene"] == "3"
+
+
+def test_build_collate_fn_batches_rows() -> None:
+    collate = build_collate_fn()
+    batch = collate([_make_row(0), _make_row(1)])
+
+    assert batch["sar"].shape == (2, 2, 256, 256)
+    assert batch["cloudy"].shape == (2, 13, 256, 256)
+    assert batch["target"].shape == (2, 13, 256, 256)
+    assert batch["meta"]["patch"] == ["p000", "p001"]
+
+
+def test_plan_sample_is_block_reproducible_and_candidate_bounded() -> None:
+    catalog = _catalog(total_rows=10 * BLOCK_SIZE)
+
+    sample_a = _plan_sample(catalog, seed=7, max_samples=20)
+    sample_b = _plan_sample(catalog, seed=7, max_samples=20)
+    sample_c = _plan_sample(catalog, seed=99, max_samples=20)
+
+    assert sample_a.requested_rows == 20
+    assert sample_a.required_blocks == 2
+    assert sample_a.effective_rows == 2 * BLOCK_SIZE
+    assert sample_a.total_blocks == 10
+    assert sample_a.candidate_blocks == 8
+    assert sample_a.planner_mode == "sequential_additive_exact_k"
+    assert sample_a.base_take_prob == pytest.approx(0.25)
+    assert sample_a.selected_blocks.size == sample_a.required_blocks
+    assert np.array_equal(sample_a.selected_blocks, sample_b.selected_blocks)
+    assert not np.array_equal(sample_a.selected_blocks, sample_c.selected_blocks)
+    assert np.all(sample_a.selected_blocks < sample_a.candidate_blocks)
+    assert sample_a.execution_block_count == int(sample_a.selected_blocks[-1]) + 1
+
+
+def test_take_probability_grows_as_candidate_suffix_shrinks() -> None:
+    base_take_prob = _compute_base_take_probability(4, 16)
+    take_probs = [
+        _compute_take_probability(4, 16, remaining_candidates)
+        for remaining_candidates in range(16, 3, -1)
     ]
-    batch = data_mod._collate_sen12mscr_rows(pre_decoded)
-    assert "inputs" in batch
+
+    assert base_take_prob == pytest.approx(0.25)
+    assert take_probs[0] == pytest.approx(base_take_prob)
+    assert take_probs[-1] == pytest.approx(1.0)
+    assert take_probs == sorted(take_probs)
 
 
-def test_collate_rejects_empty_batch() -> None:
-    with pytest.raises(ValueError, match="empty batch"):
-        data_mod._collate_sen12mscr_rows([])
+def test_plan_sample_suffix_guard_preserves_exact_block_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _NeverTakeRng:
+        @staticmethod
+        def random() -> float:
+            return 1.0
+
+    monkeypatch.setattr("cr_train.data.planning.np.random.default_rng", lambda _seed: _NeverTakeRng())
+
+    sample_plan = _plan_sample(_catalog(total_rows=10 * BLOCK_SIZE), seed=7, max_samples=2 * BLOCK_SIZE)
+
+    assert sample_plan.selected_blocks.tolist() == [6, 7]
+    assert sample_plan.selected_blocks.size == sample_plan.required_blocks
 
 
-def test_sar_preprocessing_clamps_and_normalizes() -> None:
-    tensor = torch.tensor([-50.0, -25.0, -12.5, 0.0, 10.0])
-    result = data_mod._preprocess_sar(tensor)
-    assert result.min() >= 0.0
-    assert result.max() <= 1.0
-    assert result[0].item() == pytest.approx(0.0)
-    assert result[-1].item() == pytest.approx(1.0)
+def test_plan_sample_reduces_execution_span_vs_uniform_choice_baseline() -> None:
+    catalog = _catalog(total_rows=64 * BLOCK_SIZE)
+    sequential_counts = []
+    uniform_counts = []
+
+    for seed in range(256):
+        sample_plan = _plan_sample(catalog, seed=seed, max_samples=16 * BLOCK_SIZE)
+        sequential_counts.append(sample_plan.execution_block_count)
+        uniform_counts.append(
+            _uniform_execution_block_count(
+                seed,
+                required_blocks=sample_plan.required_blocks,
+                candidate_blocks=sample_plan.candidate_blocks,
+            )
+        )
+
+    assert float(np.mean(sequential_counts)) < float(np.mean(uniform_counts))
 
 
-def test_optical_preprocessing_clamps_and_normalizes() -> None:
-    tensor = torch.tensor([-100.0, 0.0, 5000.0, 10000.0, 20000.0])
-    result = data_mod._preprocess_optical(tensor)
-    assert result.min() >= 0.0
-    assert result.max() <= 1.0
+def test_compress_execution_runs_merges_adjacent_block_spans() -> None:
+    selected = np.asarray([0, 0, 1, 1, 1, 1, 0, 0, 1], dtype=np.bool_)
+    cached = np.asarray([0, 0, 1, 1, 0, 0, 0, 0, 1], dtype=np.bool_)
+
+    runs = _compress_execution_runs(selected, cached, stop_block=9)
+
+    assert [(run.kind, run.total_rows) for run in runs] == [
+        ("skip", 2 * BLOCK_SIZE),
+        ("take_cached", 2 * BLOCK_SIZE),
+        ("take_remote", 2 * BLOCK_SIZE),
+        ("skip", 2 * BLOCK_SIZE),
+        ("take_cached", BLOCK_SIZE),
+    ]
 
 
-# ---------------------------------------------------------------------------
-# build_loaders
-# ---------------------------------------------------------------------------
+def test_normalize_parquet_uri_converts_hf_resolve_url() -> None:
+    url = "https://huggingface.co/datasets/Hermanni/sen12mscr/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
+
+    assert _normalize_parquet_uri(url) == "hf://datasets/Hermanni/sen12mscr@refs/convert/parquet/default/train/0000.parquet"
 
 
-def test_build_loaders_creates_three_dataloaders(monkeypatch: pytest.MonkeyPatch) -> None:
-    created: list[dict[str, object]] = []
+def test_ensure_split_cache_rewinds_for_missing_blocks_before_frontier(monkeypatch, tmp_path: Path) -> None:
+    rows = [_make_row(index) for index in range(4 * BLOCK_SIZE)]
+    split_rows = {
+        "train": rows,
+        "validation": rows[: 2 * BLOCK_SIZE],
+        "test": rows[: 2 * BLOCK_SIZE],
+    }
+    stats = _patch_source(monkeypatch, split_rows)
 
-    class _FakeDataLoader:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            created.append(dict(kwargs))
-
-    class _FakeHFDS:
-        def __init__(self):
-            self.shuffled = False
-
-        def shuffle(self, **kwargs):
-            self.shuffled = True
-            return self
-
-        def __iter__(self):
-            yield from []
-
-    datasets_created: list[dict] = []
-
-    def fake_load_dataset(*args, **kwargs):
-        datasets_created.append(kwargs)
-        return _FakeHFDS()
-
-    monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
-    monkeypatch.setattr(data_mod, "get_token", lambda: "tok")
-    monkeypatch.setattr(data_mod, "DataLoader", _FakeDataLoader)
-
-    build_loaders(4, seed=42)
-
-    assert len(created) == 3
-    assert len(datasets_created) == 3
-
-    splits = [d["split"] for d in datasets_created]
-    assert splits == ["train", "validation", "test"]
-
-    for d in datasets_created:
-        assert d["streaming"] is True
-        assert d["columns"] == list(PARQUET_COLUMNS)
-        assert d["token"] == "tok"
-
-    for kw in created:
-        assert kw["batch_size"] == 4
-        assert kw["num_workers"] == 0
-        assert kw["collate_fn"] is data_mod._collate_sen12mscr_rows
-
-
-def test_build_loaders_shuffles_train_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    hf_datasets: list = []
-
-    class _FakeHFDS:
-        def __init__(self):
-            self.shuffled = False
-
-        def shuffle(self, **kwargs):
-            self.shuffled = True
-            return self
-
-        def __iter__(self):
-            yield from []
-
-    def fake_load_dataset(*args, **kwargs):
-        ds = _FakeHFDS()
-        hf_datasets.append(ds)
-        return ds
-
-    monkeypatch.setattr(data_mod, "load_dataset", fake_load_dataset)
-    monkeypatch.setattr(data_mod, "get_token", lambda: None)
-    monkeypatch.setattr(data_mod, "DataLoader", lambda *a, **kw: kw)
-
-    build_loaders(2, num_workers=0)
-
-    assert hf_datasets[0].shuffled is True   # train
-    assert hf_datasets[1].shuffled is False   # val
-    assert hf_datasets[2].shuffled is False   # test
-
-
-def test_build_loaders_rejects_non_positive_batch_size() -> None:
-    with pytest.raises(ValueError, match="batch_size must be positive"):
-        build_loaders(0)
-
-
-# ---------------------------------------------------------------------------
-# Worker seeding
-# ---------------------------------------------------------------------------
-
-
-def test_seed_worker_seeds_rng(monkeypatch: pytest.MonkeyPatch) -> None:
-    seeds: dict[str, int] = {}
-    monkeypatch.setattr(data_mod.torch, "initial_seed", lambda: 123456)
-    monkeypatch.setattr(data_mod.random, "seed", lambda s: seeds.update(random=s))
-    monkeypatch.setattr(data_mod.np.random, "seed", lambda s: seeds.update(numpy=s))
-
-    data_mod._seed_worker(0)
-    assert seeds["random"] == seeds["numpy"] == 123456 % (2**32)
-
-
-# ---------------------------------------------------------------------------
-# Local parquet smoke test
-# ---------------------------------------------------------------------------
-
-
-def test_local_parquet_collate(tmp_path: Path) -> None:
-    parquet_path = tmp_path / "sample.parquet"
-    row = _sample_row()
-    table = pa.table(
-        {
-            "sar": [row["sar"]],
-            "cloudy": [row["cloudy"]],
-            "target": [row["target"]],
-            "sar_shape": [row["sar_shape"]],
-            "opt_shape": [row["opt_shape"]],
-            "season": [row["season"]],
-            "scene": [row["scene"]],
-            "patch": [row["patch"]],
-        }
+    catalog = _catalog(total_rows=len(rows))
+    plans = [
+        (seed, _plan_sample(catalog, seed=seed, max_samples=BLOCK_SIZE))
+        for seed in range(512)
+    ]
+    first_seed, first_plan = next(
+        (seed, plan)
+        for seed, plan in plans
+        if plan.execution_block_count >= 3
     )
-    pq.write_table(table, parquet_path)
-
-    from datasets import load_dataset
-
-    ds = load_dataset("parquet", data_files=str(parquet_path), split="train", streaming=True)
-    rows = list(ds)
-    batch = data_mod._collate_sen12mscr_rows(rows)
-    assert tuple(batch["target"].shape) == (1, 13, 2, 1)
-    assert batch["metadata"]["season"] == ["spring"]
-
-
-# ---------------------------------------------------------------------------
-# CLI smoke test
-# ---------------------------------------------------------------------------
-
-
-def test_minimal_train_cli_help_smoke() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    script = repo_root / "examples" / "minimal_train.py"
-
-    result = subprocess.run(
-        [sys.executable, str(script), "--help"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        timeout=20,
+    second_seed, second_plan = next(
+        (seed, plan)
+        for seed, plan in plans
+        if seed != first_seed
+        and any(
+            int(block) < first_plan.execution_block_count and int(block) not in first_plan.selected_blocks
+            for block in plan.selected_blocks
+        )
+    )
+    first_block = int(first_plan.selected_blocks[-1])
+    second_block = next(
+        int(block)
+        for block in second_plan.selected_blocks
+        if int(block) < first_plan.execution_block_count and int(block) not in first_plan.selected_blocks
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "--num-workers" in result.stdout
+    catalog_path = ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=BLOCK_SIZE,
+        seed=first_seed,
+        dataset_seed=11,
+        cache_root=tmp_path,
+    )
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=BLOCK_SIZE,
+        seed=second_seed,
+        dataset_seed=11,
+        cache_root=tmp_path,
+    )
+
+    store_root = _cache_store_root(catalog_path, "train", 11)
+    state = np.load(store_root / "cached.npy")
+    state_payload = (store_root / "state.json").read_text(encoding="utf-8")
+
+    assert stats["load_dataset_calls"] == ["train", "train"]
+    assert bool(state[first_block])
+    assert bool(state[second_block])
+    assert '"canonical_frontier_block":' in state_payload
+
+
+def test_ensure_split_cache_skips_hf_open_when_selection_is_fully_cached(monkeypatch, tmp_path: Path) -> None:
+    rows = [_make_row(index) for index in range(4 * BLOCK_SIZE)]
+    split_rows = {
+        "train": rows,
+        "validation": rows[: BLOCK_SIZE],
+        "test": rows[: BLOCK_SIZE],
+    }
+    startup_events: list[dict[str, object]] = []
+
+    _FakeTqdm.instances.clear()
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", _FakeTqdm)
+    stats = _patch_source(monkeypatch, split_rows)
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=None,
+        seed=3,
+        dataset_seed=5,
+        cache_root=tmp_path,
+        startup_callback=lambda event: startup_events.append(dict(event)),
+    )
+    load_calls_after_first = list(stats["load_dataset_calls"])
+    warmup_bars_after_first = len(_FakeTqdm.instances)
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=BLOCK_SIZE,
+        seed=99,
+        dataset_seed=5,
+        cache_root=tmp_path,
+        startup_callback=lambda event: startup_events.append(dict(event)),
+    )
+
+    done_events = [
+        event
+        for event in startup_events
+        if event["stage"] == "warm split cache" and event["status"] == "done"
+    ]
+    assert load_calls_after_first == ["train"]
+    assert stats["load_dataset_calls"] == ["train"]
+    assert len(_FakeTqdm.instances) == warmup_bars_after_first
+    assert done_events[-1]["missing_blocks"] == 0
+    assert done_events[-1]["cache_only"] is True
+
+
+def test_prepare_split_reads_cached_rows_in_selected_canonical_block_order(monkeypatch, tmp_path: Path) -> None:
+    rows = [_make_row(index) for index in range(4 * BLOCK_SIZE)]
+    split_rows = {
+        "train": rows,
+        "validation": rows,
+        "test": rows,
+    }
+    stats = _patch_source(monkeypatch, split_rows)
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", _FakeTqdm)
+
+    ensure_split_cache(
+        split="validation",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=2 * BLOCK_SIZE,
+        seed=13,
+        dataset_seed=17,
+        cache_root=tmp_path,
+    )
+    prepared = prepare_split(
+        split="validation",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=2 * BLOCK_SIZE,
+        seed=13,
+        dataset_seed=17,
+        cache_root=tmp_path,
+    )
+    loader = build_dataloader(
+        prepared,
+        batch_size=8,
+        num_workers=0,
+        training=False,
+        seed=13,
+        epoch=0,
+    )
+
+    batch_scenes = [scene for batch in loader for scene in batch["meta"]["scene"]]
+    sample_plan = _plan_sample(_catalog(total_rows=len(rows)), seed=13, max_samples=2 * BLOCK_SIZE)
+    canonical_rows = _canonical_rows(rows, dataset_seed=17)
+    expected_rows: list[dict[str, object]] = []
+    for block_index in sample_plan.selected_blocks:
+        start = int(block_index) * BLOCK_SIZE
+        stop = start + BLOCK_SIZE
+        expected_rows.extend(canonical_rows[start:stop])
+
+    assert stats["load_dataset_calls"] == ["validation"]
+    assert batch_scenes == [str(row["scene"]) for row in expected_rows]

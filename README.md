@@ -1,251 +1,113 @@
 # cr-train
 
-English | [한국어](./README.ko.md)
+HF-first SEN12MS-CR training module built around the Hugging Face dataset
+[`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr).
 
-[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](./pyproject.toml)
-[![PyTorch](https://img.shields.io/badge/pytorch-trainer-ee4c2c.svg)](https://pytorch.org/)
-[![Datasets](https://img.shields.io/badge/huggingface-datasets-yellow.svg)](https://huggingface.co/datasets/Hermanni/sen12mscr)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-
-A drop-in training toolkit for [SEN12MS-CR](https://patricktum.github.io/cloud_removal/sen12mscr/) cloud removal experiments.
-Bring your own PyTorch model -- cr-train handles streaming data loading, preprocessing, checkpointing, and progress tracking.
-
----
-
-## Installation
+## Install
 
 ```bash
-# Recommended
-uv add git+https://github.com/smturtle2/cr-train.git
-
-# Or with pip
-pip install git+https://github.com/smturtle2/cr-train.git
+uv add git+https://github.com/your-org/cr-train
 ```
 
-> Hugging Face rate limits apply. Set `export HF_TOKEN=your_token` for higher throughput. `build_loaders()` forwards the cached token from `huggingface_hub.get_token()` when available.
+## Usage
 
-## Quick Start
+Run the standalone example to launch an actual training job:
+
+```bash
+uv run python examples/train_sen12mscr.py \
+  --max-train-samples 2048 \
+  --max-val-samples 256 \
+  --max-test-samples 256 \
+  --batch-size 4 \
+  --epochs 1 \
+  --output-dir runs/sen12mscr-example
+```
+
+Prototype the `shuffle(buffer).take(N)` cache idea separately:
+
+```bash
+uv run python examples/benchmark_take_cache.py \
+  --split train \
+  --sample-sizes 64,256 \
+  --buffer-sizes 256,1024 \
+  --cache-dir runs/take-cache-bench \
+  --clear-cache
+```
+
+The package API stays minimal:
 
 ```python
+from cr_train import Trainer
 import torch
 from torch import nn
-from cr_train import MAE, Trainer, TrainerConfig, build_loaders
+from torch.nn import functional as F
 
 
-# 1. Define your model -- receives (sar, cloudy) as positional args
-class MyModel(nn.Module):
-    def __init__(self):
+class FusionBaseline(nn.Module):
+    def __init__(self) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(15, 64, 3, padding=1), nn.GELU(),
-            nn.Conv2d(64, 32, 3, padding=1), nn.GELU(),
-            nn.Conv2d(32, 13, 1),
+        self.body = nn.Sequential(
+            nn.Conv2d(15, 64, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, 13, kernel_size=1),
         )
 
-    def forward(self, sar, cloudy):
-        return self.net(torch.cat([sar, cloudy], dim=1))
+    def forward(self, batch):
+        fused = torch.cat([batch["sar"], batch["cloudy"]], dim=1)
+        return self.body(fused)
 
 
-# 2. Create data loaders (streams from Hugging Face)
-train_loader, val_loader, test_loader = build_loaders(batch_size=4)
-
-# 3. Train
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = MyModel().to(device)
+model = FusionBaseline().to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
 trainer = Trainer(
-    model=model,
-    optimizer=torch.optim.AdamW(model.parameters(), lr=1e-4),
-    criterion=nn.MSELoss(),
-    metrics=[MAE()],
-    config=TrainerConfig(max_epochs=5, checkpoint_dir="checkpoints"),
-    train_loader=train_loader,
-    val_loader=val_loader,
-    test_loader=test_loader,
+    model,
+    optimizer,
+    lambda prediction, batch: F.l1_loss(prediction, batch["target"]),
+    metrics={
+        "mae": lambda prediction, batch: torch.mean(torch.abs(prediction - batch["target"])),
+    },
+    max_train_samples=2048,
+    max_val_samples=256,
+    max_test_samples=256,
+    batch_size=4,
+    epochs=2,
+    seed=42,        # sample-selection seed
+    dataset_seed=7, # canonical dataset-stream seed
+    output_dir="runs/sen12mscr",
 )
 
-for epoch in trainer.step():
-    print(f"Epoch {epoch['epoch']}  "
-          f"train_loss={epoch['train']['loss']:.4f}  "
-          f"val_loss={epoch['val']['loss']:.4f}")
+for _ in range(trainer.epochs):
+    print(trainer.step())
 
 print(trainer.test())
 ```
 
-```bash
-uv run my_train.py
-```
+## Notes
 
-For more examples: [`examples/minimal_train.py`](./examples/minimal_train.py) (CLI example), [`examples/colab_quickstart.ipynb`](./examples/colab_quickstart.ipynb) (Colab notebook).
-
----
-
-## How It Works
-
-```
-Hugging Face (parquet shards)
-  │
-  ▼
-build_loaders()                    ← HF split loading, decode, preprocessing
-  │
-  ├── train_loader                 ← seeded sample-buffer shuffle
-  ├── val_loader                   ← fixed order
-  └── test_loader                  ← fixed order
-        │
-        ▼
-    Trainer.step()                 ← train/val loop, progress bars, auto-checkpointing
-        │
-        ▼
-    Trainer.test()                 ← final evaluation
-```
-
-**Data pipeline.** `build_loaders()` streams the official Hugging Face `train`, `validation`, and `test` splits directly from `Hermanni/sen12mscr`. Only the required parquet columns are scanned, each sample is decoded to CHW tensors (2x256x256 SAR, 13x256x256 optical), and values are normalized on the fly. Only `train` is shuffled, using the provided `seed` and `shuffle_buffer_size`; `val/test` keep split order.
-
-**Deterministic ordering.** Given the same `seed`, the training split uses the same Hugging Face streaming shuffle order. `Trainer` only calls `set_epoch()` on the train loader, so validation and test remain fixed.
-
-**Checkpointing.** When `checkpoint_dir` is set, `last.pt` and `epoch-NNNN.pt` are saved automatically after each epoch. Checkpoints include model, optimizer, scheduler (if provided), and full RNG state for exact resumption.
-
----
-
-## Batch Format
-
-Every batch is a dictionary with this structure:
-
-```python
-{
-    "inputs": (
-        Tensor,  # [B, 2, 256, 256]   SAR backscatter, float32 [0, 1]
-        Tensor,  # [B, 13, 256, 256]  cloudy Sentinel-2, float32 [0, 1]
-    ),
-    "target": Tensor,      # [B, 13, 256, 256]  cloud-free Sentinel-2, float32 [0, 1]
-    "metadata": {
-        "season": list[str],        # "spring" | "summer" | "fall" | "winter"
-        "scene":  list[str],        # scene ID
-        "patch":  list[str],        # patch ID within scene
-        "source_shard": list[str],  # e.g. "spring/scene_1.parquet"
-    },
-}
-```
-
-`inputs` is a tuple of `(sar, cloudy)`. The trainer unpacks it as `model(sar, cloudy)` -- parameter names in your `forward()` can be anything.
-
-**Preprocessing:**
-
-| Band | Raw range | Preprocessing | Output |
-|------|-----------|---------------|--------|
-| Optical (cloudy, target) | int16 [0, 10000] | `clip(0, 10000) / 10000` | float32 [0, 1] |
-| SAR | float32 [-25, 0] dB | `clip(-25, 0)` then `(x + 25) / 25` | float32 [0, 1] |
-
----
-
-## API Reference
-
-### `build_loaders(batch_size, **kwargs)`
-
-Returns `(train_loader, val_loader, test_loader)`. Only train is shuffled; val/test maintain fixed order.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `batch_size` | `int` | required | Samples per batch |
-| `dataset` | `str` | `"Hermanni/sen12mscr"` | Hugging Face dataset name passed to `datasets.load_dataset()` |
-| `seed` | `int` | `0` | Seed for train shuffle order |
-| `shuffle_buffer_size` | `int` | `64` | In-memory sample shuffle buffer for training |
-| `num_workers` | `int` | `0` | Number of PyTorch dataloader workers |
-| `pin_memory` | `bool` | `False` | Pin tensors for faster GPU transfer |
-
-### `TrainerConfig`
-
-Immutable (`frozen=True`) configuration for the training loop.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `max_epochs` | `int` | `1` | Training epochs |
-| `train_max_samples` | `int \| None` | `None` | Cap training samples per epoch |
-| `val_max_samples` | `int \| None` | `None` | Cap validation samples per epoch |
-| `test_max_samples` | `int \| None` | `None` | Cap test samples |
-| `checkpoint_dir` | `str \| Path \| None` | `None` | Checkpoint directory (auto-created); `None` disables saving |
-| `show_progress` | `bool \| None` | `None` | Progress bars; `None` = `True` |
-
-### `Trainer`
-
-```python
-Trainer(
-    *,
-    model: nn.Module,
-    optimizer: Optimizer,
-    criterion: (outputs, target) -> Tensor,
-    metrics: [MAE(), ...] | None,
-    config: TrainerConfig,
-    train_loader,
-    val_loader=None,
-    test_loader=None,
-    scheduler=None,            # e.g. torch.optim.lr_scheduler.*
-)
-```
-
-Device is inferred from model parameters. All batch data is moved to that device automatically. Metrics are averaged per-sample (not per-batch), so the last smaller batch does not skew results.
-
-#### `trainer.step(**overrides) -> Iterator[dict]`
-
-Runs train/val epochs. Yields one record per epoch:
-
-```python
-{
-    "epoch": 1,           # 1-indexed
-    "global_step": 120,   # cumulative optimizer steps
-    "train": {"loss": 0.0512, "mae": 0.0321},
-    "val":   {"loss": 0.0498, "mae": 0.0315},  # {} if no val_loader
-}
-```
-
-If a `scheduler` is provided, `scheduler.step()` is called after each epoch. Optional overrides: `max_epochs`, `train_max_samples`, `val_max_samples`.
-
-#### `trainer.test(**overrides) -> dict[str, float]`
-
-Returns `{"loss": ..., "mae": ...}`. Optional override: `max_samples`.
-
-#### `trainer.save_checkpoint(filename) -> Path | None`
-
-Saves to `checkpoint_dir/filename`. Returns `None` if checkpointing is disabled.
-
-#### `trainer.load_checkpoint(path)`
-
-Restores all state from a checkpoint file for exact training resumption.
-
-### `MAE`
-
-Built-in L1 loss metric. Usage: `metrics=[MAE()]`.
-
----
-
-## Reproducibility
-
-| Guarantee | Mechanism |
-|-----------|-----------|
-| Deterministic train shuffle | Same `seed` + same settings = identical HF streaming shuffle order |
-| Fixed val/test order | Validation and test loaders are not shuffled |
-| Train-only epoch hook | `Trainer` calls `set_epoch()` on the train loader only |
-| Exact resumption | Checkpoint captures model, optimizer, scheduler, and full RNG state |
-
----
-
-## Project Structure
-
-```
-cr-train/
-├── src/cr_train/
-│   ├── __init__.py         # public API
-│   ├── trainer.py          # training loop, checkpointing, progress
-│   ├── data.py             # HF streaming loaders, batch decode, preprocessing
-├── examples/
-│   ├── minimal_train.py    # minimal CLI training script
-│   └── colab_quickstart.ipynb
-├── tests/
-├── scripts/
-│   └── refresh_official_scene_splits.py  # repository maintenance utility
-└── pyproject.toml
-```
-
-## License
-
-[MIT](./LICENSE)
+- The first `step()` or `test()` warms local cache for `train`, `validation`, and
+  `test` before any batch runs.
+- Training and evaluation always read from the persistent local cache after warmup.
+- Cache identity is based on `split + dataset_seed + shuffle_buffer_size`.
+- `dataset_seed` fixes a canonical shuffled stream for each split.
+- `seed` drives the block-selection planner over that fixed stream.
+- `max_*_samples` is treated as requested row count, and the internal execution
+  plan rounds up to whole 16-row blocks.
+- The sampler scans the candidate window from left to right and raises take
+  probability as the remaining window shrinks, so cache warmup tends to finish
+  earlier than a uniform exact-`k` block draw.
+- Warmup expands the canonical stream in block order, caches only missing blocks,
+  and skips Hugging Face entirely when every selected block is already cached.
+- The example script accepts `--max-*-samples none` (or `full`) to trigger
+  full-split caching explicitly.
+- Equal `seed` values keep the same block-selection membership, and train batch
+  order still changes by epoch.
+- Finished caches are never auto-deleted. Remove them manually from the cache
+  directory if you want to reclaim disk space.
+- `Trainer.step()` runs exactly one training epoch and shows running-average loss
+  and metrics with batch-based `tqdm`.
+- Cache warmup shows a short block-resolution `tqdm` plus one-line cache
+  summaries instead of verbose startup logs.

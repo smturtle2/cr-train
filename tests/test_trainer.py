@@ -1,876 +1,303 @@
 from __future__ import annotations
 
-import subprocess
-import sys
-import textwrap
+import json
+from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-import cr_train.trainer as trainer_mod
-from cr_train import MAE, Trainer, TrainerConfig, build_loaders
+from cr_train import Trainer
+from cr_train.data import BLOCK_SIZE
 
 
-class _ToyDataset(Dataset[dict[str, object]]):
-    def __init__(self, rows: list[dict[str, object]]) -> None:
-        self.rows = rows
-        self.epochs: list[int] = []
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> dict[str, object]:
-        return self.rows[index]
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epochs.append(epoch)
-
-
-class _ToyStream(IterableDataset[dict[str, object]]):
-    def __init__(self, rows: list[dict[str, object]]) -> None:
-        self.rows = rows
-        self.epochs: list[int] = []
-
-    def __iter__(self):
-        yield from self.rows
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epochs.append(epoch)
+def _make_row(index: int) -> dict[str, object]:
+    sar = torch.arange(256 * 256 * 2, dtype=torch.float32).reshape(256, 256, 2).numpy() + index
+    cloudy = torch.arange(256 * 256 * 13, dtype=torch.int16).reshape(256, 256, 13).numpy() + index
+    target = torch.arange(256 * 256 * 13, dtype=torch.int16).reshape(256, 256, 13).numpy() + index + 1
+    return {
+        "sar": sar.tobytes(),
+        "cloudy": cloudy.tobytes(),
+        "target": target.tobytes(),
+        "sar_shape": [256, 256, 2],
+        "opt_shape": [256, 256, 13],
+        "season": "summer",
+        "scene": str(index),
+        "patch": f"p{index:03d}",
+    }
 
 
-class _LoggingStream(IterableDataset[dict[str, object]]):
-    def __init__(self, rows: list[dict[str, object]]) -> None:
-        self.rows = rows
-        self.events: list[str] = []
-
-    def __iter__(self):
-        for index, row in enumerate(self.rows):
-            self.events.append(f"yield:{index}")
-            yield row
-
-
-class _LengthMismatchLoader:
-    def __init__(self, rows: list[dict[str, object]], reported_length: int) -> None:
-        self.rows = rows
-        self.reported_length = reported_length
-
-    def __iter__(self):
-        return iter(self.rows)
-
-    def __len__(self) -> int:
-        return self.reported_length
-
-
-class _ToyModel(nn.Module):
+class TinyModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.linear = nn.Linear(1, 1)
+        self.body = torch.nn.Conv2d(15, 13, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
-
-
-class _RecordingModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.scale = nn.Parameter(torch.ones(1))
-        self.seen_inputs: list[float] = []
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self.seen_inputs.extend(float(value) for value in x.detach().cpu().reshape(-1).tolist())
-        return x * self.scale
+    def forward(self, batch):
+        fused = torch.cat([batch["sar"], batch["cloudy"]], dim=1)
+        return self.body(fused)
 
 
-class _DictInputModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.linear = nn.Linear(1, 1)
-
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        return self.linear(batch["x"])
+def loss_fn(prediction: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    return torch.nn.functional.mse_loss(prediction, batch["target"])
 
 
-class SquaredError:
-    def __call__(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return torch.mean((outputs - target) ** 2)
+def mae_metric(prediction: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    return torch.mean(torch.abs(prediction - batch["target"]))
 
 
-class DuplicateMAE:
-    name = "mae"
+class FakeTqdm:
+    instances: list["FakeTqdm"] = []
+    writes: list[str] = []
 
-    def __call__(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return torch.mean(torch.abs(outputs - target))
+    def __init__(self, *args, **kwargs) -> None:
+        self.total = kwargs.get("total")
+        self.desc = kwargs.get("desc")
+        self.disable = kwargs.get("disable", False)
+        self.updates: list[int] = []
+        self.postfixes: list[dict[str, object]] = []
+        FakeTqdm.instances.append(self)
+
+    @staticmethod
+    def write(message: str) -> None:
+        FakeTqdm.writes.append(message)
+
+    def update(self, value: int) -> None:
+        self.updates.append(value)
+
+    def set_postfix(self, values: dict[str, object]) -> None:
+        self.postfixes.append(values)
+
+    def close(self) -> None:
+        return None
 
 
-class GradStateMetric:
-    name = "grad_state"
+class _FakeStreamingDataset:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = [dict(row) for row in rows]
 
-    def __init__(self) -> None:
-        self.calls: list[tuple[bool, bool]] = []
+    def select_columns(self, columns: list[str]):
+        return _FakeStreamingDataset(
+            [{column: row[column] for column in columns} for row in self._rows]
+        )
 
-    def __call__(self, outputs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        _ = target
-        self.calls.append((torch.is_grad_enabled(), outputs.requires_grad))
-        return torch.mean(torch.abs(outputs))
+    def shuffle(self, *, seed: int, buffer_size: int):
+        del buffer_size
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(len(self._rows))
+        return _FakeStreamingDataset([self._rows[int(index)] for index in order])
+
+    def __iter__(self):
+        for row in self._rows:
+            yield dict(row)
 
 
-def _make_rows(values: list[float]) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for value in values:
-        rows.append(
+class _FakeRowGroupMetadata:
+    def __init__(self, num_rows: int) -> None:
+        self.num_rows = num_rows
+
+
+class _FakeParquetMetadata:
+    def __init__(self, row_group_rows: list[int]) -> None:
+        self.num_rows = sum(row_group_rows)
+        self.num_row_groups = len(row_group_rows)
+        self._row_group_rows = row_group_rows
+
+    def row_group(self, index: int) -> _FakeRowGroupMetadata:
+        return _FakeRowGroupMetadata(self._row_group_rows[index])
+
+
+class _FakeParquetFile:
+    def __init__(
+        self,
+        url: str,
+        row_group_rows: list[int],
+        stats: dict[str, object],
+    ) -> None:
+        self.metadata = _FakeParquetMetadata(row_group_rows)
+        stats["opens"][url] += 1
+
+
+def _patch_source(monkeypatch, split_rows: dict[str, list[dict[str, object]]]) -> dict[str, object]:
+    parquet_entries: list[dict[str, object]] = []
+    shard_rows: dict[str, list[int]] = {}
+    stats: dict[str, object] = {
+        "opens": defaultdict(int),
+        "load_dataset_calls": [],
+    }
+
+    for split, rows in split_rows.items():
+        url = f"hf://datasets/unit/test@refs/convert/parquet/default/{split}/0000.parquet"
+        parquet_entries.append(
             {
-                "inputs": (torch.tensor([[value]], dtype=torch.float32),),
-                "target": torch.tensor([[value]], dtype=torch.float32),
-                "metadata": {"index": value},
+                "dataset": "unit/test",
+                "config": "default",
+                "split": split,
+                "url": url,
+                "filename": "0000.parquet",
             }
         )
-    return rows
+        shard_rows[url] = [
+            min(BLOCK_SIZE, len(rows) - start)
+            for start in range(0, len(rows), BLOCK_SIZE)
+        ]
 
-
-def _make_rows_without_metadata(values: list[float]) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for value in values:
-        rows.append(
-            {
-                "inputs": (torch.tensor([[value]], dtype=torch.float32),),
-                "target": torch.tensor([[value]], dtype=torch.float32),
-            }
-        )
-    return rows
-
-
-def _make_nested_input_rows(values: list[float]) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for value in values:
-        rows.append(
-            {
-                "inputs": ({"x": torch.tensor([[value]], dtype=torch.float32)},),
-                "target": torch.tensor([[value]], dtype=torch.float32),
-                "metadata": {"index": value},
-            }
-        )
-    return rows
-
-
-def test_trainer_step_yields_epoch_history_and_test_metrics(tmp_path: Path) -> None:
-    train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0, 2.0, 3.0])), batch_size=2, shuffle=False)
-    val_loader = DataLoader(_ToyDataset(_make_rows([4.0, 5.0])), batch_size=1, shuffle=False)
-    test_loader = DataLoader(_ToyDataset(_make_rows([6.0, 7.0])), batch_size=1, shuffle=False)
-
-    model = _ToyModel().to(torch.device("cpu"))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
-    trainer = Trainer(
-        model=model,
-        optimizer=optimizer,
-        criterion=nn.MSELoss(),
-        metrics=[MAE(), SquaredError()],
-        config=TrainerConfig(
-            max_epochs=2,
-            train_max_samples=2,
-            val_max_samples=1,
-            test_max_samples=1,
-            checkpoint_dir=tmp_path,
-            show_progress=False,
-        ),
-        train_loader=train_loader,
-        val_loader=val_loader,
-        test_loader=test_loader,
-    )
-
-    history = list(trainer.step())
-    metrics = trainer.test()
-
-    assert len(history) == 2
-    assert history[0]["epoch"] == 1
-    assert history[1]["epoch"] == 2
-    assert "loss" in history[0]["train"]
-    assert "mae" in history[0]["train"]
-    assert "squared_error" in history[0]["train"]
-    assert "loss" in history[0]["val"]
-    assert "loss" in metrics
-    assert "mae" in metrics
-    assert "squared_error" in metrics
-    assert trainer.state.epoch == 2
-    assert trainer.state.global_step == 2
-    assert train_loader.dataset.epochs == [0, 1]
-    assert val_loader.dataset.epochs == []
-    assert test_loader.dataset.epochs == []
-    assert (tmp_path / "last.pt").exists()
-    assert (tmp_path / "epoch-0002.pt").exists()
-
-
-def test_trainer_disables_autograd_during_metric_evaluation() -> None:
-    metric = GradStateMetric()
-    train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0])), batch_size=2, shuffle=False)
-    model = _ToyModel().to(torch.device("cpu"))
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[metric],
-        config=TrainerConfig(max_epochs=1, train_max_samples=1, show_progress=False),
-        train_loader=train_loader,
-    )
-
-    history = list(trainer.step())
-
-    assert len(history) == 1
-    assert metric.calls == [(False, True)]
-
-
-def test_trainer_progress_defaults_on_and_supports_unsized_loaders() -> None:
-    train_dataset = _ToyStream(_make_rows([0.0, 1.0, 2.0]))
-    val_dataset = _ToyStream(_make_rows([3.0, 4.0]))
-    test_dataset = _ToyStream(_make_rows([5.0, 6.0]))
-    model = _ToyModel().to(torch.device("cpu"))
-
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[MAE()],
-        config=TrainerConfig(max_epochs=1),
-        train_loader=DataLoader(train_dataset, batch_size=1),
-        val_loader=DataLoader(val_dataset, batch_size=1),
-        test_loader=DataLoader(test_dataset, batch_size=1),
-    )
-
-    assert trainer.show_progress is True
-
-    history = list(trainer.step())
-    metrics = trainer.test()
-
-    assert len(history) == 1
-    assert "loss" in history[0]["train"]
-    assert "loss" in history[0]["val"]
-    assert "loss" in metrics
-    assert train_dataset.epochs == [0]
-    assert val_dataset.epochs == []
-    assert test_dataset.epochs == []
-
-
-def test_trainer_progress_uses_stage_descriptions_and_capped_totals(monkeypatch: pytest.MonkeyPatch) -> None:
-    created: list[dict[str, object]] = []
-    printed: list[str] = []
-
-    class _FakeProgress:
-        def __init__(self) -> None:
-            self.descriptions: list[tuple[str, bool]] = []
-            self.updates: list[int] = []
-            self.refresh_count = 0
-
-        def update(self, value: int) -> None:
-            self.updates.append(value)
-
-        def set_description_str(self, value: str, refresh: bool = True) -> None:
-            self.descriptions.append((value, refresh))
-
-        def refresh(self) -> None:
-            self.refresh_count += 1
-
-        def close(self) -> None:
-            return None
-
-    def fake_create_progress(*, desc: str, total: int | None, disable: bool, leave: bool) -> _FakeProgress:
-        progress = _FakeProgress()
-        created.append(
-            {
-                "desc": desc,
-                "total": total,
-                "disable": disable,
-                "leave": leave,
-                "progress": progress,
-            }
-        )
-        return progress
-
-    monkeypatch.setattr(trainer_mod, "_create_progress", fake_create_progress)
-    monkeypatch.setattr("builtins.print", lambda *args, **kwargs: printed.append(" ".join(map(str, args))))
-
-    train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0, 2.0, 3.0])), batch_size=2, shuffle=False)
-    val_loader = DataLoader(_ToyDataset(_make_rows([4.0, 5.0])), batch_size=1, shuffle=False)
-    test_loader = DataLoader(_ToyDataset(_make_rows([6.0, 7.0])), batch_size=1, shuffle=False)
-
-    model = _ToyModel().to(torch.device("cpu"))
-    with torch.no_grad():
-        model.linear.weight.zero_()
-        model.linear.bias.zero_()
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
-        criterion=nn.MSELoss(),
-        metrics=[MAE()],
-        config=TrainerConfig(
-            max_epochs=1,
-            train_max_samples=10,
-            val_max_samples=1,
-            test_max_samples=3,
-        ),
-        train_loader=train_loader,
-        val_loader=val_loader,
-        test_loader=test_loader,
-    )
-
-    list(trainer.step())
-    trainer.test()
-
-    assert printed == ["epoch 1/1"]
-    assert [{key: value for key, value in item.items() if key != "progress"} for item in created] == [
-        {"desc": "train", "total": 2, "disable": False, "leave": True},
-        {"desc": "val", "total": 1, "disable": False, "leave": True},
-        {"desc": "test", "total": 2, "disable": False, "leave": True},
-    ]
-
-    train_progress = created[0]["progress"]
-    val_progress = created[1]["progress"]
-    test_progress = created[2]["progress"]
-
-    assert isinstance(train_progress, _FakeProgress)
-    assert isinstance(val_progress, _FakeProgress)
-    assert isinstance(test_progress, _FakeProgress)
-
-    assert train_progress.descriptions == [
-        ("train | loading first batch...", True),
-        ("train | loss=0.5000 mae=0.5000", False),
-        ("train | loss=3.5000 mae=1.5000", False),
-    ]
-    assert train_progress.updates == [1, 1]
-    assert val_progress.descriptions == [
-        ("val | loading first batch...", True),
-        ("val | loss=16.0000 mae=4.0000", False),
-    ]
-    assert val_progress.updates == [1]
-    assert test_progress.descriptions == [
-        ("test | loading first batch...", True),
-        ("test | loss=36.0000 mae=6.0000", False),
-        ("test | loss=42.5000 mae=6.5000", False),
-    ]
-    assert test_progress.updates == [1, 1]
-    assert sum(train_progress.updates) == created[0]["total"]
-    assert sum(val_progress.updates) == created[1]["total"]
-    assert sum(test_progress.updates) == created[2]["total"]
-
-
-def test_trainer_step_does_not_prefetch_unused_sample_when_capped() -> None:
-    train_stream = _LoggingStream(_make_rows([0.0, 1.0, 2.0]))
-    model = _ToyModel().to(torch.device("cpu"))
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=1, show_progress=False),
-        train_loader=DataLoader(train_stream, batch_size=1),
-    )
-
-    history = list(trainer.step(train_max_samples=1))
-
-    assert len(history) == 1
-    assert train_stream.events == ["yield:0"]
-
-
-def test_trainer_caps_metrics_by_samples_even_when_batch_is_larger() -> None:
-    train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0, 2.0, 3.0])), batch_size=2, shuffle=False)
-    model = _ToyModel().to(torch.device("cpu"))
-    with torch.no_grad():
-        model.linear.weight.zero_()
-        model.linear.bias.zero_()
-
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
-        criterion=nn.MSELoss(),
-        metrics=[MAE()],
-        config=TrainerConfig(max_epochs=1, train_max_samples=3, show_progress=False),
-        train_loader=train_loader,
-    )
-
-    history = list(trainer.step())
-
-    assert len(history) == 1
-    assert trainer.state.global_step == 2
-    assert history[0]["train"]["loss"] == pytest.approx(5.0 / 3.0)
-    assert history[0]["train"]["mae"] == pytest.approx(1.0)
-
-
-def test_trainer_supports_nested_input_batches() -> None:
-    train_loader = DataLoader(_ToyDataset(_make_nested_input_rows([0.0, 1.0])), batch_size=2, shuffle=False)
-    model = _DictInputModel().to(torch.device("cpu"))
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[MAE()],
-        config=TrainerConfig(max_epochs=1, show_progress=False),
-        train_loader=train_loader,
-    )
-
-    history = list(trainer.step())
-
-    assert len(history) == 1
-    assert "loss" in history[0]["train"]
-    assert "mae" in history[0]["train"]
-
-
-def test_trainer_slices_partial_batch_without_metadata() -> None:
-    train_loader = DataLoader(
-        _ToyDataset(_make_rows_without_metadata([0.0, 1.0, 2.0])),
-        batch_size=2,
-        shuffle=False,
-    )
-    model = _ToyModel().to(torch.device("cpu"))
-    with torch.no_grad():
-        model.linear.weight.zero_()
-        model.linear.bias.zero_()
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
-        criterion=nn.MSELoss(),
-        metrics=[MAE()],
-        config=TrainerConfig(max_epochs=1, train_max_samples=3, show_progress=False),
-        train_loader=train_loader,
-    )
-
-    history = list(trainer.step())
-
-    assert len(history) == 1
-    assert history[0]["train"]["loss"] == pytest.approx(5.0 / 3.0)
-    assert history[0]["train"]["mae"] == pytest.approx(1.0)
-
-
-@pytest.mark.parametrize(
-    ("num_workers", "persistent_workers"),
-    [(0, False), (1, False), (1, True)],
-)
-def test_stage_samples_allows_clean_subprocess_exit_after_early_stop(
-    num_workers: int,
-    persistent_workers: bool,
-) -> None:
-    script = textwrap.dedent(
-        """
-        import sys
-
-        import numpy as np
-        import torch
-        from torch.utils.data import DataLoader, IterableDataset
-
-        from cr_train.data import _collate_sen12mscr_rows, _seed_worker
-        from cr_train.trainer import _stage_samples
-
-
-        def sample_row():
-            sar = np.zeros((2, 2, 2), dtype=np.float32)
-            optical = np.zeros((2, 1, 13), dtype=np.int16)
+    def fake_request_json(url: str):
+        if "/info?" in url:
             return {
-                "sar": sar.tobytes(),
-                "cloudy": optical.tobytes(),
-                "target": optical.tobytes(),
-                "sar_shape": list(sar.shape),
-                "opt_shape": list(optical.shape),
-                "season": "spring",
-                "scene": "1",
-                "patch": "p0",
+                "dataset_info": {
+                    "default": {
+                        "splits": {
+                            split: {"num_examples": len(rows)}
+                            for split, rows in split_rows.items()
+                        }
+                    }
+                }
             }
+        if "/parquet?" in url:
+            return {"parquet_files": parquet_entries}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def fake_parquet_file(url: str):
+        return _FakeParquetFile(str(url), row_group_rows=list(shard_rows[str(url)]), stats=stats)
+
+    def fake_load_dataset(path: str, *args, split: str | None = None, streaming: bool = False, **kwargs):
+        del args, kwargs
+        assert path == "Hermanni/sen12mscr"
+        assert split is not None
+        assert streaming is True
+        stats["load_dataset_calls"].append(str(split))
+        return _FakeStreamingDataset(list(split_rows[str(split)]))
+
+    monkeypatch.setattr("cr_train.data.source.request_json", fake_request_json)
+    monkeypatch.setattr("cr_train.data.source.pq.ParquetFile", fake_parquet_file)
+    monkeypatch.setattr("cr_train.data.runtime.load_dataset", fake_load_dataset)
+    return stats
 
 
-        class FakeDataset(IterableDataset):
-            def __iter__(self):
-                for _ in range(4):
-                    yield sample_row()
+def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Path) -> None:
+    rows = [_make_row(i) for i in range(4 * BLOCK_SIZE)]
+    output_dir = tmp_path / "run"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "metrics.jsonl"
+    metrics_path.write_text("old-record\n", encoding="utf-8")
 
-
-        num_workers = int(sys.argv[1])
-        persistent_workers = sys.argv[2] == "true"
-        kwargs = {
-            "batch_size": 1,
-            "num_workers": num_workers,
-            "collate_fn": _collate_sen12mscr_rows,
-            "worker_init_fn": _seed_worker,
-        }
-        if num_workers > 0:
-            kwargs["timeout"] = 1.0
-            kwargs["persistent_workers"] = persistent_workers
-
-        loader = DataLoader(FakeDataset(), **kwargs)
-        batches = list(_stage_samples(loader, 1))
-        print(batches[0]["metadata"]["scene"][0])
-        """
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    stats = _patch_source(
+        monkeypatch,
+        {
+            "train": rows,
+            "validation": rows,
+            "test": rows,
+        },
     )
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(num_workers), str(persistent_workers).lower()],
-        cwd=Path(__file__).resolve().parents[1],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "1"
-
-
-def test_stage_samples_can_reuse_persistent_workers_across_epochs() -> None:
-    script = textwrap.dedent(
-        """
-        import numpy as np
-        import torch
-        from torch.utils.data import DataLoader, IterableDataset
-
-        from cr_train.data import _collate_sen12mscr_rows, _seed_worker
-        from cr_train.trainer import _stage_samples
-
-
-        def sample_row():
-            sar = np.zeros((2, 2, 2), dtype=np.float32)
-            optical = np.zeros((2, 1, 13), dtype=np.int16)
-            return {
-                "sar": sar.tobytes(),
-                "cloudy": optical.tobytes(),
-                "target": optical.tobytes(),
-                "sar_shape": list(sar.shape),
-                "opt_shape": list(optical.shape),
-                "season": "spring",
-                "scene": "1",
-                "patch": "p0",
-            }
-
-
-        class FakeDataset(IterableDataset):
-            def __iter__(self):
-                for _ in range(4):
-                    yield sample_row()
-
-
-        loader = DataLoader(
-            FakeDataset(),
-            batch_size=1,
-            num_workers=1,
-            persistent_workers=True,
-            timeout=1.0,
-            collate_fn=_collate_sen12mscr_rows,
-            worker_init_fn=_seed_worker,
-        )
-        first = list(_stage_samples(loader, 1))
-        second = list(_stage_samples(loader, 1))
-        print(first[0]["metadata"]["scene"][0], second[0]["metadata"]["scene"][0])
-        """
-    )
-
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path(__file__).resolve().parents[1],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "1 1"
-
-
-def test_trainer_progress_shows_determinate_bar_for_streaming_with_max_samples(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    created: list[dict[str, object]] = []
-
-    class _FakeProgress:
-        def __init__(self) -> None:
-            self.descriptions: list[tuple[str, bool]] = []
-            self.updates: list[int] = []
-            self.refresh_count = 0
-
-        def update(self, value: int) -> None:
-            self.updates.append(value)
-
-        def set_description_str(self, value: str, refresh: bool = True) -> None:
-            self.descriptions.append((value, refresh))
-
-        def refresh(self) -> None:
-            self.refresh_count += 1
-
-        def close(self) -> None:
-            return None
-
-    def fake_create_progress(
-        *, desc: str, total: int | None, disable: bool, leave: bool
-    ) -> _FakeProgress:
-        progress = _FakeProgress()
-        created.append({"desc": desc, "total": total})
-        return progress
-
-    monkeypatch.setattr(trainer_mod, "_create_progress", fake_create_progress)
-    monkeypatch.setattr("builtins.print", lambda *args, **kwargs: None)
-
-    train_dataset = _ToyStream(_make_rows([0.0, 1.0, 2.0, 3.0, 4.0]))
-    model = _ToyModel().to(torch.device("cpu"))
+    model = TinyModel()
     trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=1, train_max_samples=3),
-        train_loader=DataLoader(train_dataset, batch_size=2),
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        metrics={"mae": mae_metric},
+        max_train_samples=2 * BLOCK_SIZE,
+        max_val_samples=BLOCK_SIZE,
+        max_test_samples=BLOCK_SIZE,
+        epochs=1,
+        batch_size=8,
+        seed=7,
+        dataset_seed=23,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
     )
 
-    list(trainer.step())
+    assert metrics_path.read_text(encoding="utf-8") == ""
 
-    # ceil(3/2) = 2 batches expected
-    assert created[0]["total"] == 2
+    epoch_summary = trainer.step()
+    test_summary = trainer.test()
+    metrics_records = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    startup_records = [record for record in metrics_records if record["kind"] == "startup"]
+    startup_stages = [record["stage"] for record in startup_records]
 
+    batch_bars = [
+        instance
+        for instance in FakeTqdm.instances
+        if str(instance.desc).startswith(("train", "val", "test"))
+    ]
+    warmup_bars = [
+        instance
+        for instance in FakeTqdm.instances
+        if str(instance.desc).startswith("cache ")
+    ]
+    config_record = next(record for record in metrics_records if record["kind"] == "config")
 
-def test_trainer_streaming_with_fewer_samples_than_max_does_not_raise() -> None:
-    train_dataset = _ToyStream(_make_rows([0.0, 1.0]))
-    model = _ToyModel().to(torch.device("cpu"))
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=1, train_max_samples=10, show_progress=False),
-        train_loader=DataLoader(train_dataset, batch_size=1),
-    )
+    assert epoch_summary["epoch"] == 1
+    assert epoch_summary["train"]["loss"] >= 0.0
+    assert "mae" in epoch_summary["train"]["metrics"]
+    assert epoch_summary["checkpoint_path"].endswith("epoch-0001.pt")
+    assert Path(epoch_summary["checkpoint_path"]).exists()
 
-    history = list(trainer.step())
-    assert len(history) == 1
+    assert test_summary["epoch"] == 1
+    assert "mae" in test_summary["metrics"]
+    assert epoch_summary["train"]["num_batches"] == 4
+    assert "batches_per_sec" in epoch_summary["train"]
+    assert "old-record" not in metrics_path.read_text(encoding="utf-8")
 
+    assert config_record["dataset_seed"] == 23
+    assert "ensure catalog" in startup_stages
+    assert "warm split cache" in startup_stages
+    assert "load local cache" in startup_stages
+    assert "build dataloader" in startup_stages
+    assert "wait first batch" in startup_stages
+    assert "start epoch" in startup_stages
 
-def test_resolve_progress_total_returns_estimated_batches_for_unsized_with_max_samples() -> None:
-    class _UnsizedLoader:
-        batch_size = 4
+    assert len(FakeTqdm.writes) == 3
+    assert any(message.startswith("cache train | warm | hit=0 miss=2 runs=") for message in FakeTqdm.writes)
+    assert any(message.startswith("cache validation | warm | hit=0 miss=1 runs=") for message in FakeTqdm.writes)
+    assert any(message.startswith("cache test | warm | hit=0 miss=1 runs=") for message in FakeTqdm.writes)
+    assert not any(message.startswith("loader ") for message in FakeTqdm.writes)
+    assert not any(message.startswith("train | epoch=") for message in FakeTqdm.writes)
 
-    assert trainer_mod._resolve_progress_total(_UnsizedLoader(), max_samples=10) == 3
-    assert trainer_mod._resolve_progress_total(_UnsizedLoader(), max_samples=8) == 2
-    assert trainer_mod._resolve_progress_total(_UnsizedLoader(), max_samples=None) is None
+    assert len(warmup_bars) == 3
+    assert [bar.total for bar in warmup_bars] == [2, 1, 1]
+    assert all(sum(bar.updates) == int(bar.total) for bar in warmup_bars)
+    assert all(any("miss" in values for values in bar.postfixes) for bar in warmup_bars)
+    assert all(any("hit" in values for values in bar.postfixes) for bar in warmup_bars)
+    assert all(any("runs" in values for values in bar.postfixes) for bar in warmup_bars)
+    assert all(any("blk/s" in values for values in bar.postfixes) for bar in warmup_bars)
 
+    assert len(batch_bars) == 3
+    assert any(any("loss" in values and "mae" in values for values in bar.postfixes) for bar in batch_bars)
+    assert any(any("batches/s" in values for values in bar.postfixes) for bar in batch_bars)
+    assert all(all(value == 1 for value in bar.updates) for bar in batch_bars)
 
-def test_trainer_raises_when_sized_stage_ends_before_progress_total() -> None:
-    model = _ToyModel().to(torch.device("cpu"))
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=1, show_progress=False),
-        train_loader=_LengthMismatchLoader(_make_rows([0.0]), reported_length=2),
-    )
+    warmup_done_records = [
+        record
+        for record in startup_records
+        if record["stage"] == "warm split cache" and record["status"] == "done"
+    ]
+    assert [record["missing_blocks"] for record in warmup_done_records[:3]] == [2, 1, 1]
+    assert all(record["run_count"] >= 1 for record in warmup_done_records[:3])
+    assert all(record["planner_mode"] == "sequential_additive_exact_k" for record in warmup_done_records[:3])
+    assert all(record["base_take_prob"] > 0.0 for record in warmup_done_records[:3])
+    assert stats["load_dataset_calls"] == ["train", "validation", "test"]
 
-    with pytest.raises(RuntimeError, match="train stage ended after 1 batches, expected 2 batches"):
-        list(trainer.step())
-
-
-def test_trainer_accepts_drop_last_loaders_when_progress_counts_batches() -> None:
-    train_loader = DataLoader(
-        _ToyDataset(_make_rows([0.0, 1.0, 2.0, 3.0, 4.0])),
-        batch_size=2,
-        drop_last=True,
-        shuffle=False,
-    )
-    model = _ToyModel().to(torch.device("cpu"))
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=1, show_progress=False),
-        train_loader=train_loader,
-    )
-
-    history = list(trainer.step())
-
-    assert len(history) == 1
-    assert trainer.state.global_step == 2
-
-
-def test_trainer_can_restore_checkpoint(tmp_path: Path) -> None:
-    train_loader = DataLoader(_ToyDataset(_make_rows([0.0, 1.0])), batch_size=2, shuffle=False)
-    val_loader = DataLoader(_ToyDataset(_make_rows([2.0])), batch_size=1, shuffle=False)
-
-    first_model = _ToyModel().to(torch.device("cpu"))
-    first = Trainer(
-        model=first_model,
-        optimizer=torch.optim.SGD(first_model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[MAE()],
-        config=TrainerConfig(
-            max_epochs=1,
-            train_max_samples=2,
-            val_max_samples=1,
-            checkpoint_dir=tmp_path,
-            show_progress=False,
-        ),
-        train_loader=train_loader,
-        val_loader=val_loader,
-    )
-    list(first.step())
-
-    restored_model = _ToyModel().to(torch.device("cpu"))
-    restored = Trainer(
-        model=restored_model,
-        optimizer=torch.optim.SGD(restored_model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[MAE()],
-        config=TrainerConfig(max_epochs=2, checkpoint_dir=tmp_path, show_progress=False),
-        train_loader=train_loader,
-        val_loader=val_loader,
-    )
-    restored.load_checkpoint(tmp_path / "last.pt")
-
-    assert restored.state.epoch == 1
-    assert restored.state.global_step == 1
-
-
-def test_trainer_checkpoint_restore_preserves_shuffled_epoch_order(tmp_path: Path) -> None:
-    def make_loader() -> DataLoader[dict[str, object]]:
-        generator = torch.Generator()
-        generator.manual_seed(17)
-        return DataLoader(
-            _ToyDataset(_make_rows([0.0, 1.0, 2.0, 3.0])),
-            batch_size=1,
-            shuffle=True,
-            generator=generator,
-        )
-
-    uninterrupted_model = _RecordingModel().to(torch.device("cpu"))
-    uninterrupted = Trainer(
-        model=uninterrupted_model,
-        optimizer=torch.optim.SGD(uninterrupted_model.parameters(), lr=0.0),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=2, show_progress=False),
-        train_loader=make_loader(),
-    )
-    list(uninterrupted.step())
-    expected_second_epoch_order = uninterrupted_model.seen_inputs[4:]
-
-    first_model = _RecordingModel().to(torch.device("cpu"))
-    first = Trainer(
-        model=first_model,
-        optimizer=torch.optim.SGD(first_model.parameters(), lr=0.0),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=1, checkpoint_dir=tmp_path, show_progress=False),
-        train_loader=make_loader(),
-    )
-    list(first.step())
-
-    restored_model = _RecordingModel().to(torch.device("cpu"))
-    restored = Trainer(
-        model=restored_model,
-        optimizer=torch.optim.SGD(restored_model.parameters(), lr=0.0),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=2, checkpoint_dir=tmp_path, show_progress=False),
-        train_loader=make_loader(),
-    )
-    restored.load_checkpoint(tmp_path / "last.pt")
-    list(restored.step())
-
-    assert restored_model.seen_inputs == expected_second_epoch_order
+    with pytest.raises(RuntimeError):
+        trainer.step()
 
 
 def test_trainer_rejects_optimizer_from_other_model() -> None:
-    model = _ToyModel().to(torch.device("cpu"))
-    other_model = _ToyModel().to(torch.device("cpu"))
+    model = TinyModel()
+    other_model = TinyModel()
 
     with pytest.raises(ValueError):
         Trainer(
-            model=model,
-            optimizer=torch.optim.SGD(other_model.parameters(), lr=0.1),
-            criterion=nn.MSELoss(),
-            metrics=[],
-            config=TrainerConfig(max_epochs=1, show_progress=False),
-            train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
+            model,
+            torch.optim.AdamW(other_model.parameters(), lr=1e-3),
+            loss_fn,
         )
-
-
-def test_trainer_rejects_duplicate_metric_names() -> None:
-    model = _ToyModel().to(torch.device("cpu"))
-    with pytest.raises(ValueError):
-        Trainer(
-            model=model,
-            optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-            criterion=nn.MSELoss(),
-            metrics=[MAE(), DuplicateMAE()],
-            config=TrainerConfig(max_epochs=1, show_progress=False),
-            train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
-        )
-
-
-def test_trainer_rejects_legacy_metric_mapping() -> None:
-    model = _ToyModel().to(torch.device("cpu"))
-    with pytest.raises(TypeError):
-        Trainer(
-            model=model,
-            optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-            criterion=nn.MSELoss(),
-            metrics={"mae": MAE()},
-            config=TrainerConfig(max_epochs=1, show_progress=False),
-            train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
-        )
-
-
-def test_trainer_rejects_lambda_metrics() -> None:
-    model = _ToyModel().to(torch.device("cpu"))
-    with pytest.raises(ValueError):
-        Trainer(
-            model=model,
-            optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-            criterion=nn.MSELoss(),
-            metrics=[lambda outputs, target: torch.mean(torch.abs(outputs - target))],
-            config=TrainerConfig(max_epochs=1, show_progress=False),
-            train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
-        )
-
-
-def test_trainer_requires_test_loader_for_test_call() -> None:
-    model = _ToyModel().to(torch.device("cpu"))
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=1, show_progress=False),
-        train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
-    )
-
-    with pytest.raises(ValueError):
-        trainer.test()
-
-
-def test_trainer_rejects_invalid_runtime_step_overrides() -> None:
-    model = _ToyModel().to(torch.device("cpu"))
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=1, show_progress=False),
-        train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
-        val_loader=DataLoader(_ToyDataset(_make_rows([1.0])), batch_size=1, shuffle=False),
-    )
-
-    with pytest.raises(ValueError, match="max_epochs must be positive"):
-        list(trainer.step(max_epochs=0))
-    with pytest.raises(ValueError, match="train_max_samples must be positive when provided"):
-        list(trainer.step(train_max_samples=0))
-    with pytest.raises(ValueError, match="val_max_samples must be positive when provided"):
-        list(trainer.step(val_max_samples=0))
-
-
-def test_trainer_rejects_invalid_runtime_test_override() -> None:
-    model = _ToyModel().to(torch.device("cpu"))
-    trainer = Trainer(
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
-        criterion=nn.MSELoss(),
-        metrics=[],
-        config=TrainerConfig(max_epochs=1, show_progress=False),
-        train_loader=DataLoader(_ToyDataset(_make_rows([0.0])), batch_size=1, shuffle=False),
-        test_loader=DataLoader(_ToyDataset(_make_rows([1.0])), batch_size=1, shuffle=False),
-    )
-
-    with pytest.raises(ValueError, match="max_samples must be positive when provided"):
-        trainer.test(max_samples=0)
