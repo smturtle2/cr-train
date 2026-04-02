@@ -13,22 +13,22 @@ import pyarrow.ipc
 import torch
 from torch.utils.data import DataLoader, Dataset as TorchDataset, DistributedSampler
 
-from .constants import CANONICAL_SHUFFLE_BUFFER_SIZE, DATA_COLUMNS, OPTICAL_CHANNELS, SAR_CHANNELS
-from .planning import compress_execution_runs, plan_sample
+from .constants import DATA_COLUMNS, OPTICAL_CHANNELS, SAR_CHANNELS
+from .planning import plan_sample
 from .runtime import get_rank, get_world_size, is_distributed
 from .source import ensure_source_root, ensure_split_catalog, run_startup_stage
-from .store import SplitBlockCache, as_bytes, load_or_init_block_cache, resolve_block_cache_paths, resolve_dataset_seed
+from .store import as_bytes, load_or_init_row_cache, resolve_row_cache_paths
 
 
 @dataclass(slots=True)
 class PreparedSplit:
-    """캐시된 블록 데이터로 구성된 DataLoader-ready split."""
+    """DataLoader-ready split backed by the row-indexed local cache."""
 
     dataset: TorchDataset[dict[str, Any]]
 
 
 def resolve_num_workers(num_workers: int | str) -> int:
-    """DataLoader 워커 수 결정. 정수 또는 ``'auto'`` (CPU 코어 기반 자동 산출)."""
+    """Resolve DataLoader worker count from an int or ``'auto'``."""
     if isinstance(num_workers, int):
         return max(0, num_workers)
     if num_workers != "auto":
@@ -38,7 +38,7 @@ def resolve_num_workers(num_workers: int | str) -> int:
 
 
 def seed_everything(seed: int, deterministic: bool) -> None:
-    """모든 RNG를 고정하여 재현성 보장. ``deterministic=True`` 시 CuDNN도 결정적 모드."""
+    """Seed every RNG used by the training stack."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -56,44 +56,7 @@ def seed_worker(_worker_id: int) -> None:
     np.random.seed(worker_seed)
 
 
-def _build_cached_row_refs(
-    execution_runs,
-    cache: SplitBlockCache,
-) -> tuple[np.ndarray, np.ndarray]:
-    row_chunk_refs: list[np.ndarray] = []
-    row_offset_refs: list[np.ndarray] = []
-
-    # 연속 블록을 단일 청크 범위로 병합
-    for run in execution_runs:
-        if run.kind != "take_cached":
-            continue
-        block_index = run.start_block
-        while block_index < run.stop_block:
-            chunk_id = cache.chunk_ids[block_index]
-            if chunk_id < 0:
-                raise KeyError(f"cached run references an uncached block: {block_index}")
-            start_offset = cache.block_offsets[block_index]
-            stop_offset = start_offset + cache.block_row_counts[block_index]
-            next_block = block_index + 1
-            while next_block < run.stop_block:
-                next_chunk_id = cache.chunk_ids[next_block]
-                next_offset = cache.block_offsets[next_block]
-                next_stop = next_offset + cache.block_row_counts[next_block]
-                if next_chunk_id != chunk_id or next_offset != stop_offset:
-                    break
-                stop_offset = next_stop
-                next_block += 1
-            row_count = stop_offset - start_offset
-            row_chunk_refs.append(np.full(row_count, chunk_id, dtype=np.int32))
-            row_offset_refs.append(np.arange(start_offset, stop_offset, dtype=np.int32))
-            block_index = next_block
-
-    if not row_chunk_refs:
-        return np.empty((0,), dtype=np.int32), np.empty((0,), dtype=np.int32)
-    return np.concatenate(row_chunk_refs), np.concatenate(row_offset_refs)
-
-
-class CachedBlockDataset(TorchDataset[dict[str, Any]]):
+class CachedRowDataset(TorchDataset[dict[str, Any]]):
     def __init__(
         self,
         *,
@@ -113,18 +76,18 @@ class CachedBlockDataset(TorchDataset[dict[str, Any]]):
         chunk_id = int(self.row_chunk_ids[index])
         row_offset = int(self.row_offsets[index])
         if chunk_id < 0 or row_offset < 0:
-            raise KeyError(f"cached row {index} is missing from the block cache")
+            raise KeyError(f"cached row {index} is missing from the row cache")
         table = self._load_chunk(chunk_id)
         return {col: table.column(col)[row_offset].as_py() for col in DATA_COLUMNS}
 
     def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
-        """chunk별 batch read로 Arrow take() 활용. DataLoader가 자동 호출."""
+        """Group indices by chunk so one Arrow take() serves each chunk."""
         chunk_groups: dict[int, list[tuple[int, int]]] = {}
         for pos, idx in enumerate(indices):
             chunk_id = int(self.row_chunk_ids[idx])
             row_offset = int(self.row_offsets[idx])
             if chunk_id < 0 or row_offset < 0:
-                raise KeyError(f"cached row {idx} is missing from the block cache")
+                raise KeyError(f"cached row {idx} is missing from the row cache")
             chunk_groups.setdefault(chunk_id, []).append((pos, row_offset))
 
         results: list[dict[str, Any] | None] = [None] * len(indices)
@@ -135,7 +98,6 @@ class CachedBlockDataset(TorchDataset[dict[str, Any]]):
             cols = {col: batch.column(col).to_pylist() for col in DATA_COLUMNS}
             for i, (pos, _) in enumerate(entries):
                 results[pos] = {col: cols[col][i] for col in DATA_COLUMNS}
-
         return results  # type: ignore[return-value]
 
     def _load_chunk(self, chunk_id: int) -> pa.Table:
@@ -147,7 +109,6 @@ class CachedBlockDataset(TorchDataset[dict[str, Any]]):
         self._chunk_cache[chunk_id] = table
         return table
 
-
 def prepare_split(
     *,
     split: str,
@@ -155,12 +116,10 @@ def prepare_split(
     revision: str | None,
     max_samples: int | None,
     seed: int,
-    dataset_seed: int | None,
     cache_root: Path,
     startup_callback=None,
-    predecoded: bool = False,
 ) -> PreparedSplit:
-    """캐시된 블록에서 sample plan에 따라 PreparedSplit 구성. 캐시 미스 시 FileNotFoundError."""
+    """Build a PreparedSplit from the row-indexed cache. Missing rows are fatal."""
     source_root, descriptor = ensure_source_root(
         dataset_name=dataset_name,
         revision=revision,
@@ -172,50 +131,33 @@ def prepare_split(
         split=split,
         startup_callback=startup_callback,
     )
-    sample_plan = plan_sample(catalog, seed, max_samples, split=split)
-    resolved_dataset_seed = resolve_dataset_seed(dataset_seed)
-    cache_paths = resolve_block_cache_paths(
-        source_root,
-        split,
-        resolved_dataset_seed,
-        CANONICAL_SHUFFLE_BUFFER_SIZE,
-        predecoded=predecoded,
+    sample_plan = plan_sample(
+        catalog,
+        seed,
+        max_samples,
+        split=split,
     )
-    cache = load_or_init_block_cache(
-        cache_paths,
-        dataset_seed=resolved_dataset_seed,
-        shuffle_buffer_size=CANONICAL_SHUFFLE_BUFFER_SIZE,
-        total_rows=int(catalog["total_rows"]),
-    )
-    if sample_plan.selected_blocks.size > 0 and not np.all(cache.cached[sample_plan.selected_blocks]):
-        raise FileNotFoundError(f"split {split} cache is missing requested blocks")
+    cache_paths = resolve_row_cache_paths(source_root, split)
+    cache = load_or_init_row_cache(cache_paths, total_rows=int(catalog["total_rows"]))
+    if sample_plan.selected_row_ids.size > 0 and not np.all(cache.cached[sample_plan.selected_row_ids]):
+        raise FileNotFoundError(f"split {split} cache is missing requested rows")
 
-    execution_runs = compress_execution_runs(
-        sample_plan.selected_bitmap,
-        cache.cached,
-        stop_block=sample_plan.execution_block_count,
-    )
-    if any(run.kind == "take_remote" for run in execution_runs):
-        raise FileNotFoundError(f"split {split} cache is missing requested blocks")
-    row_chunk_ids, row_offsets = _build_cached_row_refs(execution_runs, cache)
-
+    row_chunk_ids = cache.chunk_ids[sample_plan.selected_row_ids]
+    row_offsets = cache.row_offsets[sample_plan.selected_row_ids]
     dataset = run_startup_stage(
         startup_callback,
         stage="load local cache",
         split=split,
-        operation=lambda: CachedBlockDataset(
+        operation=lambda: CachedRowDataset(
             chunk_root=cache_paths.chunk_root,
             row_chunk_ids=row_chunk_ids,
             row_offsets=row_offsets,
         ),
-        dataset_seed=resolved_dataset_seed,
         requested_rows=sample_plan.requested_rows,
         effective_rows=sample_plan.effective_rows,
         required_blocks=sample_plan.required_blocks,
-        candidate_blocks=sample_plan.candidate_blocks,
         planner_mode=sample_plan.planner_mode,
         stop_bias_alpha=sample_plan.stop_bias_alpha,
-        run_count=len(execution_runs),
     )
     return PreparedSplit(dataset=dataset)
 
@@ -236,7 +178,6 @@ def _decode_image(buffer: Any, shape: Any, *, dtype: np.dtype[Any], expected_cha
     if raw.size != expected_size:
         raise ValueError(f"buffer size mismatch for shape {resolved_shape}: expected {expected_size}, got {raw.size}")
 
-    # CHW/HWC 자동 감지 — 채널 수로 축 판별
     image = raw.reshape(resolved_shape)
     if image.shape[-1] == expected_channels and image.shape[0] != expected_channels:
         chw = np.transpose(image, (2, 0, 1))
@@ -244,21 +185,18 @@ def _decode_image(buffer: Any, shape: Any, *, dtype: np.dtype[Any], expected_cha
         chw = image
     else:
         raise ValueError(f"could not infer channel dimension from shape {image.shape!r}")
-
     return np.ascontiguousarray(chw, dtype=np.float32)
 
 
 def decode_row(row: dict[str, Any], *, include_metadata: bool = True) -> dict[str, Any]:
-    """원시 바이너리 행을 CHW float32 numpy 배열로 디코딩 (DSen2-CR 스케일링)."""
+    """Decode one cached row into CHW float32 arrays."""
     sar = _decode_image(row["sar"], row["sar_shape"], dtype=np.float32, expected_channels=SAR_CHANNELS)
-    # DSen2-CR SAR: VV clip[-25,0]→[0,2], VH clip[-32.5,0]→[0,2]
     np.clip(sar[0], -25.0, 0.0, out=sar[0])
     sar[0] += 25.0
     sar[0] *= 2.0 / 25.0
     np.clip(sar[1], -32.5, 0.0, out=sar[1])
     sar[1] += 32.5
     sar[1] *= 2.0 / 32.5
-    # DSen2-CR Optical: clip[0,10000]→/2000→[0,5]
     cloudy = _decode_image(row["cloudy"], row["opt_shape"], dtype=np.int16, expected_channels=OPTICAL_CHANNELS)
     np.clip(cloudy, 0, 10000, out=cloudy)
     cloudy /= 2000.0
@@ -276,7 +214,6 @@ def decode_row(row: dict[str, Any], *, include_metadata: bool = True) -> dict[st
 
 
 def _resolve_chw_shape(shape: Any, expected_channels: int) -> tuple[int, int, int]:
-    """원시 shape에서 CHW 순서의 출력 shape를 결정."""
     resolved = _as_shape(shape)
     if resolved[-1] == expected_channels and resolved[0] != expected_channels:
         return (resolved[2], resolved[0], resolved[1])
@@ -286,7 +223,6 @@ def _resolve_chw_shape(shape: Any, expected_channels: int) -> tuple[int, int, in
 
 
 def _as_writable_buffer(buffer: Any) -> bytearray | memoryview:
-    """torch.frombuffer 경고를 피하기 위해 writable backing store를 보장."""
     if isinstance(buffer, bytearray):
         return buffer
     if isinstance(buffer, memoryview) and not buffer.readonly:
@@ -305,7 +241,6 @@ def _decode_image_into(
     clamp_max: float | None = None,
     scale: float = 1.0,
 ) -> None:
-    """원시 바이너리를 pre-allocated CHW float32 텐서에 직접 디코딩. 중간 numpy 복사 제거."""
     raw = torch.frombuffer(_as_writable_buffer(buffer), dtype=src_dtype)
     resolved_shape = _as_shape(shape)
     expected_size = math.prod(resolved_shape)
@@ -328,15 +263,8 @@ def _decode_image_into(
         dest.mul_(scale)
 
 
-def build_collate_fn(*, include_metadata: bool = True, predecoded: bool = False):
-    """행 리스트를 디코딩하여 배치 텐서로 묶는 collate 함수 생성.
-
-    DSen2-CR 스케일링 적용:
-      - Optical: clip [0, 10000] → /2000 → [0, 5]
-      - SAR VV: clip [-25, 0] dB → shift+scale → [0, 2]
-      - SAR VH: clip [-32.5, 0] dB → shift+scale → [0, 2]
-    predecoded=True 시 이미 스케일링된 데이터이므로 변환 생략.
-    """
+def build_collate_fn(*, include_metadata: bool = True):
+    """Build the batch collate function used by DataLoader workers."""
 
     def collate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if not rows:
@@ -354,33 +282,34 @@ def build_collate_fn(*, include_metadata: bool = True, predecoded: bool = False)
         metadata = {"season": [], "scene": [], "patch": []} if include_metadata else None
         for i, row in enumerate(rows):
             _decode_image_into(
-                sar_batch[i], row["sar"], row["sar_shape"],
-                src_dtype=torch.float32, expected_channels=SAR_CHANNELS,
+                sar_batch[i],
+                row["sar"],
+                row["sar_shape"],
+                src_dtype=torch.float32,
+                expected_channels=SAR_CHANNELS,
             )
-            if predecoded:
-                _decode_image_into(
-                    cloudy_batch[i], row["cloudy"], row["opt_shape"],
-                    src_dtype=torch.float32, expected_channels=OPTICAL_CHANNELS,
-                )
-                _decode_image_into(
-                    target_batch[i], row["target"], row["opt_shape"],
-                    src_dtype=torch.float32, expected_channels=OPTICAL_CHANNELS,
-                )
-            else:
-                # DSen2-CR SAR: per-channel clip → shift → scale
-                sar_batch[i][0].clamp_(-25.0, 0.0).add_(25.0).mul_(2.0 / 25.0)
-                sar_batch[i][1].clamp_(-32.5, 0.0).add_(32.5).mul_(2.0 / 32.5)
-                # DSen2-CR Optical: clip [0, 10000] → /2000
-                _decode_image_into(
-                    cloudy_batch[i], row["cloudy"], row["opt_shape"],
-                    src_dtype=torch.int16, expected_channels=OPTICAL_CHANNELS,
-                    clamp_min=0, clamp_max=10000, scale=1.0 / 2000.0,
-                )
-                _decode_image_into(
-                    target_batch[i], row["target"], row["opt_shape"],
-                    src_dtype=torch.int16, expected_channels=OPTICAL_CHANNELS,
-                    clamp_min=0, clamp_max=10000, scale=1.0 / 2000.0,
-                )
+            sar_batch[i][0].clamp_(-25.0, 0.0).add_(25.0).mul_(2.0 / 25.0)
+            sar_batch[i][1].clamp_(-32.5, 0.0).add_(32.5).mul_(2.0 / 32.5)
+            _decode_image_into(
+                cloudy_batch[i],
+                row["cloudy"],
+                row["opt_shape"],
+                src_dtype=torch.int16,
+                expected_channels=OPTICAL_CHANNELS,
+                clamp_min=0,
+                clamp_max=10000,
+                scale=1.0 / 2000.0,
+            )
+            _decode_image_into(
+                target_batch[i],
+                row["target"],
+                row["opt_shape"],
+                src_dtype=torch.int16,
+                expected_channels=OPTICAL_CHANNELS,
+                clamp_min=0,
+                clamp_max=10000,
+                scale=1.0 / 2000.0,
+            )
             if metadata is not None:
                 metadata["season"].append(str(row.get("season", "")))
                 metadata["scene"].append(str(row.get("scene", "")))
@@ -403,16 +332,15 @@ def build_dataloader(
     seed: int,
     epoch: int,
     include_metadata: bool = True,
-    predecoded: bool = False,
     pin_memory: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 2,
     drop_last: bool = False,
 ) -> DataLoader:
-    """PreparedSplit에서 DataLoader를 생성. 분산 환경 시 DistributedSampler 자동 적용."""
+    """Create the split DataLoader, adding DistributedSampler when needed."""
     dataloader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
-        "collate_fn": build_collate_fn(include_metadata=include_metadata, predecoded=predecoded),
+        "collate_fn": build_collate_fn(include_metadata=include_metadata),
         "num_workers": num_workers,
         "pin_memory": pin_memory and torch.cuda.is_available(),
         "worker_init_fn": seed_worker,
@@ -444,7 +372,6 @@ def build_dataloader(
 
 
 def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    """배치 dict 내 텐서를 대상 디바이스로 non-blocking 전송."""
     moved: dict[str, Any] = {}
     for key, value in batch.items():
         moved[key] = value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
@@ -452,7 +379,7 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
 
 
 __all__ = [
-    "CachedBlockDataset",
+    "CachedRowDataset",
     "PreparedSplit",
     "build_collate_fn",
     "build_dataloader",

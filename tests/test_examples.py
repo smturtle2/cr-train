@@ -24,6 +24,6 @@ def test_bitmask_demo_example_loads_without_running_main() -> None:
     result = namespace["build_selection_trace"](total_rows=128, requested_rows=48, seed=7)
 
     assert "main" in namespace
-    assert result["required_blocks"] == 3
-    assert result["candidate_blocks"] == 6
-    assert len(result["selected_blocks"]) == 3
+    assert result["required_blocks"] == 1
+    assert result["total_blocks"] == 2
+    assert len(result["selected_blocks"]) == 1

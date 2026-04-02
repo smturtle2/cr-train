@@ -38,8 +38,7 @@ MetricFn = Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int]
 class Trainer:
     """SEN12MS-CR trainer.
 
-    `dataset_seed` fixes the canonical shuffled dataset stream.
-    `seed` drives the sample-selection planner over that canonical stream.
+    `seed` fixes the deterministic logical row order and drives logical block selection.
     """
 
     def __init__(
@@ -55,10 +54,8 @@ class Trainer:
         batch_size: int = 4,
         epochs: int = 1,
         seed: int = 42,
-        dataset_seed: int | None = None,
         output_dir: str | Path = "runs/default",
         cache_dir: str | Path | None = None,
-        predecoded: bool = False,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
@@ -90,9 +87,7 @@ class Trainer:
         self.batch_size = batch_size
         self.epochs = epochs
         self.seed = seed
-        self.dataset_seed = dataset_seed
 
-        self.predecoded = predecoded
         self.num_workers = resolve_num_workers("auto")
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -110,7 +105,7 @@ class Trainer:
         self._config_written = False
         self._cache_ready = False
 
-        # DDP 래핑 후 원본 모듈에서 device 추론
+        self.device = self._infer_module_device(self.model)
         self._wrap_model_for_ddp_if_needed()
         self.device = self._infer_module_device(self._model_state_owner())
 
@@ -245,7 +240,6 @@ class Trainer:
                 "max_val_samples": self.max_val_samples,
                 "max_test_samples": self.max_test_samples,
                 "seed": self.seed,
-                "dataset_seed": self.dataset_seed,
                 "batch_size": self.batch_size,
                 "epochs": self.epochs,
                 "num_workers": self.num_workers,
@@ -259,7 +253,6 @@ class Trainer:
             batch_size=self.batch_size,
             epochs=self.epochs,
             seed=self.seed,
-            dataset_seed=self.dataset_seed,
             device=self.device,
         ))
 
@@ -293,10 +286,8 @@ class Trainer:
                 revision=None,
                 max_samples=max_samples,
                 seed=self.seed,
-                dataset_seed=self.dataset_seed,
                 cache_root=self.cache_root,
                 startup_callback=self._handle_startup_event,
-                predecoded=self.predecoded,
             )
         self._cache_ready = True
 
@@ -314,10 +305,8 @@ class Trainer:
             revision=None,
             max_samples=max_samples,
             seed=self.seed,
-            dataset_seed=self.dataset_seed,
             cache_root=self.cache_root,
             startup_callback=self._handle_startup_event,
-            predecoded=self.predecoded,
         )
         loader = run_startup_stage(
             self._handle_startup_event,
@@ -331,7 +320,6 @@ class Trainer:
                 seed=self.seed,
                 epoch=epoch_index,
                 include_metadata=self.include_metadata,
-                predecoded=self.predecoded,
                 pin_memory=self.pin_memory,
                 persistent_workers=self.persistent_workers,
                 prefetch_factor=self.prefetch_factor,
@@ -353,7 +341,6 @@ class Trainer:
         )
         self._set_sampler_epoch(loader, epoch_index)
         self.model.train()
-        batch_iterator = self._prime_loader(split="train", loader=loader, max_samples=self.max_train_samples)
         self._handle_startup_event(
             {
                 "stage": "start epoch",
@@ -365,6 +352,7 @@ class Trainer:
 
         accumulator = MetricAccumulator()
         start_time = time.perf_counter()
+        batch_iterator = self._prime_loader(split="train", loader=loader, max_samples=self.max_train_samples)
         progress = self._create_progress_bar(
             total=total_batches,
             description=f"train {epoch_index + 1}/{self.epochs}",
@@ -388,6 +376,9 @@ class Trainer:
                     progress,
                     accumulator=accumulator,
                     start_time=start_time,
+                    reduce_int=self._reduce_int,
+                    reduce_sum=self._reduce_sum,
+                    distributed=is_distributed(),
                 )
         finally:
             progress.close()
@@ -419,9 +410,10 @@ class Trainer:
             epoch_index=epoch_index,
         )
         self.model.eval()
-        batch_iterator = self._prime_loader(split=split, loader=loader, max_samples=max_samples)
 
         accumulator = MetricAccumulator()
+        start_time = time.perf_counter()
+        batch_iterator = self._prime_loader(split=split, loader=loader, max_samples=max_samples)
         progress = self._create_progress_bar(total=total_batches, description=description)
         try:
             with torch.no_grad():
@@ -437,7 +429,10 @@ class Trainer:
                     update_progress_bar(
                         progress,
                         accumulator=accumulator,
-                        start_time=None,
+                        start_time=start_time,
+                        reduce_int=self._reduce_int,
+                        reduce_sum=self._reduce_sum,
+                        distributed=is_distributed(),
                     )
         finally:
             progress.close()

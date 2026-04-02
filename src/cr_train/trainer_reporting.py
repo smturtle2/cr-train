@@ -22,9 +22,19 @@ _CYAN = "\033[36m"
 _YELLOW = "\033[33m"
 
 
-def _resolve_summary_timeline_width(*, split: str) -> int:
+def _resolve_summary_timeline_width(
+    *,
+    split: str,
+    selected_block_count: int,
+    resolved_blocks: int,
+    selected_missing_blocks: int,
+    cache_only: bool,
+) -> int:
     terminal_width = shutil.get_terminal_size(fallback=(WARMUP_TIMELINE_WIDTH + 48, 24)).columns
-    reserved_width = len(f" cache {split} | warm | selected=0 frontier=0->0") + 10
+    status = "cache-hit" if cache_only else "warm"
+    reserved_width = len(
+        f" cache {split} | {status} | selected: {selected_block_count}, fill: {resolved_blocks}/{selected_missing_blocks}"
+    ) + 1
     return max(12, terminal_width - reserved_width)
 
 
@@ -42,17 +52,23 @@ def should_print_startup(record: dict[str, Any]) -> bool:
 
 def format_cache_summary(event: dict[str, Any]) -> str:
     split = str(event.get("split", "unknown"))
+    selected_block_count = int(event.get("selected_block_count", 0))
+    selected_missing_blocks = int(event.get("selected_missing_blocks", 0))
+    resolved_blocks = int(event.get("resolved_blocks", 0))
     timeline = _compact_warmup_timeline(
         str(event.get("timeline", "")).strip(),
-        max_chars=_resolve_summary_timeline_width(split=split),
+        max_chars=_resolve_summary_timeline_width(
+            split=split,
+            selected_block_count=selected_block_count,
+            resolved_blocks=resolved_blocks,
+            selected_missing_blocks=selected_missing_blocks,
+            cache_only=selected_missing_blocks == 0,
+        ),
     )
-    selected_block_count = int(event.get("selected_block_count", 0))
-    frontier_before = int(event.get("frontier_before", 0))
-    frontier_after = int(event.get("frontier_after", 0))
     prefix = f"cache {split}" if not timeline else f"{timeline} cache {split}"
-    if int(event.get("extension_blocks", 0)) == 0:
-        return f"{prefix} | cache-hit | selected={selected_block_count} frontier={frontier_after}"
-    return f"{prefix} | warm | selected={selected_block_count} frontier={frontier_before}->{frontier_after}"
+    if selected_missing_blocks == 0:
+        return f"{prefix} | cache-hit | selected: {selected_block_count}, fill: 0/0"
+    return f"{prefix} | warm | selected: {selected_block_count}, fill: {resolved_blocks}/{selected_missing_blocks}"
 
 
 def format_startup_message(event: dict[str, Any]) -> str:
@@ -64,20 +80,15 @@ def format_startup_message(event: dict[str, Any]) -> str:
     parts = ["startup", f"split={split}", f"stage={stage}"]
     for field in (
         "max_samples",
-        "dataset_seed",
         "requested_rows",
         "effective_rows",
         "required_blocks",
-        "candidate_blocks",
         "planner_mode",
         "stop_bias_alpha",
         "selected_block_count",
         "cached_selected_blocks",
         "selected_missing_blocks",
-        "extension_blocks",
         "execution_block_count",
-        "frontier_before",
-        "frontier_after",
         "run_count",
         "resolved_blocks",
         "epoch",
@@ -116,7 +127,6 @@ def format_config_banner(
     batch_size: int,
     epochs: int,
     seed: int,
-    dataset_seed: int | None,
     device: torch.device,
 ) -> str:
     sep = f"{_DIM}│{_RESET}"
@@ -128,8 +138,6 @@ def format_config_banner(
         f"test {_BOLD}{_samples_label(max_test_samples)}{_RESET}"
     )
     config_parts = [f"batch {batch_size}", f"epochs {epochs}", f"seed {seed}"]
-    if dataset_seed is not None:
-        config_parts.append(f"dataset_seed {dataset_seed}")
     config = f"  {_DIM}config{_RESET}  " + f"  {sep}  ".join(config_parts)
     return f"{header}\n{splits}\n{config}"
 

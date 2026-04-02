@@ -1,7 +1,7 @@
 <h1 align="center">cr-train</h1>
 
 <p align="center">
-  <em>HuggingFace-first training module for satellite cloud removal on SEN12MS-CR</em>
+  <em>HuggingFace-backed training module for satellite cloud removal on SEN12MS-CR</em>
 </p>
 
 <p align="center">
@@ -19,11 +19,11 @@
 ## Highlights
 
 - **Single-class API** -- `Trainer` with `step()` + `test()`, nothing else to learn
-- **Deterministic block sampling** -- two-seed system (`seed` + `dataset_seed`) for exact reproducibility
-- **Smart cache warmup** -- downloads only missing blocks; skips HuggingFace entirely when cache is complete
+- **Deterministic block sampling** -- one-seed system (`seed`) for exact reproducibility
+- **Smart cache warmup** -- reads only missing rows from HF Parquet shards and reuses them across plans
 - **Distributed training** -- automatic DDP wrapping, `DistributedSampler`, all-reduce metrics
 - **JSONL experiment tracking** -- every epoch, validation, checkpoint, and startup event recorded to `metrics.jsonl`
-- **Zero config data** -- streams directly from [`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr); no manual download needed
+- **Zero config data** -- ingests directly from [`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr) Parquet exports; no manual download needed
 
 ---
 
@@ -32,7 +32,7 @@
 ### Installation
 
 ```bash
-uv add git+https://github.com/your-org/cr-train
+uv add git+https://github.com/smturtle2/cr-train.git
 ```
 
 ### Minimal example
@@ -70,7 +70,6 @@ trainer = Trainer(
     batch_size=4,
     epochs=2,
     seed=42,
-    dataset_seed=7,
     output_dir="runs/sen12mscr",
 )
 
@@ -119,16 +118,16 @@ Output shows the stop-block probability table, the sampled stop, the prefix draw
 
 ```mermaid
 flowchart TD
-    HF["HuggingFace Hub<br/><code>Hermanni/sen12mscr</code>"]
-    SHUFFLE["Streaming Shuffle<br/><code>dataset_seed</code>"]
+    HF["HF Parquet Export<br/><code>Hermanni/sen12mscr</code>"]
+    ORDER["Logical Row Order<br/><code>seed</code>"]
     PLAN["Block Selection Planner<br/><code>seed</code> · stop-biased exact-k"]
-    CACHE["Local Block Cache<br/>Arrow chunks · 16 rows/block"]
-    DS["CachedBlockDataset"]
+    CACHE["Local Row Cache<br/>Arrow chunks · row-indexed"]
+    DS["CachedRowDataset"]
     DL["DataLoader<br/>DDP-aware · pinned memory"]
     TRAIN["Trainer.step() / test()"]
     OUT["Outputs<br/><code>metrics.jsonl</code> · <code>epoch-NNNN.pt</code>"]
 
-    HF --> SHUFFLE --> PLAN --> CACHE
+    HF --> ORDER --> PLAN --> CACHE
     CACHE --> DS --> DL --> TRAIN --> OUT
 ```
 
@@ -144,15 +143,14 @@ flowchart TD
 | `optimizer` | `Optimizer` | *(required)* | Must be constructed from `model.parameters()`. |
 | `loss` | `Callable` | *(required)* | `(prediction, batch) -> scalar tensor`. |
 | `metrics` | `dict[str, Callable]` | `None` | `{"name": (prediction, batch) -> scalar}`. Logged per epoch. |
-| `max_train_samples` | `int \| None` | `None` | Requested train rows. Rounded up to 16-row blocks. `None` = full split. |
+| `max_train_samples` | `int \| None` | `None` | Requested train rows. Converted to block count using the fixed `BLOCK_SIZE=64` accounting unit. `None` = full split. |
 | `max_val_samples` | `int \| None` | `None` | Same for validation. |
 | `max_test_samples` | `int \| None` | `None` | Same for test. |
 | `batch_size` | `int` | `4` | Batch size for all DataLoaders. |
 | `epochs` | `int` | `1` | Total training epochs. Call `step()` once per epoch. |
-| `seed` | `int` | `42` | Block-selection seed over the canonical stream. |
-| `dataset_seed` | `int \| None` | `None` | Canonical dataset-stream shuffle seed. `None` defaults to `0` internally. |
+| `seed` | `int` | `42` | Seed controlling deterministic row-group block order and block selection. |
 | `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and checkpoint files. |
-| `cache_dir` | `str \| Path \| None` | `None` | Block cache root. `None` = `~/.cache/cr-train`. |
+| `cache_dir` | `str \| Path \| None` | `None` | Row cache root. `None` = `~/.cache/cr-train`. |
 
 ### `Trainer.step() -> dict`
 
@@ -197,41 +195,41 @@ Runs test evaluation with the current model state. Returns:
 
 ## How It Works
 
-### Block-based caching
+### Row-indexed caching
 
-Data from HuggingFace is streamed and partitioned into **16-row blocks** (`BLOCK_SIZE=16`). Each block is stored as an Arrow dataset chunk on disk. The cache is keyed on `split + dataset_seed + shuffle_buffer_size`, so different seed combinations produce independent caches.
+The source dataset is described once via the HF dataset viewer Parquet metadata. Warmup then fills a split-wide **row-indexed cache**. Logical blocks still exist for planning and tqdm display, but each logical block is now one source `row_group`, and the on-disk cache is keyed by global row id and reused across different plans.
 
 ```
-~/.cache/cr-train/layout-v7/<source>/block_store/<split>/dataset-seed=N-shuffle-buffer=128/
-├── chunks/          # Arrow dataset chunks, one per block
-├── state.json       # Cache state (frontier, seed info)
-├── chunk_ids.npy    # Block → chunk mapping
-└── cached.npy       # Boolean mask of cached blocks
+~/.cache/cr-train/layout-v10/<source>/row_store/<split>/
+├── chunks/             # Arrow IPC chunks with raw rows
+├── state.json          # cache state (row counts, next chunk id)
+├── chunk_ids.npy       # global row id → chunk id
+├── row_offsets.npy     # global row id → row offset inside the chunk
+└── cached_rows.npy     # boolean mask of cached global row ids
 ```
 
-### Two-seed deterministic sampling
+### Deterministic sampling
 
-The system uses two independent seeds for full reproducibility:
+The system uses one seed for full reproducibility:
 
 | Seed | Controls | Effect |
 |------|----------|--------|
-| `dataset_seed` | Canonical shuffled stream | `dataset.shuffle(seed=dataset_seed, buffer_size=128)` fixes a deterministic row ordering per split. |
-| `seed` | Block selection | A stop-biased exact-k planner samples a stop block inside a candidate window of `2 * required_blocks`, then draws the remaining blocks from its prefix. |
+| `seed` | Row-group block order + block selection | Derives a deterministic order over source `row_group` blocks and then samples logical blocks from the full block order with a stop-biased exact-k planner. |
 
-The planner remains deterministic and always returns exactly the required block count. Same `seed` = same block selection across runs. Different `seed` values sample different blocks from the same canonical stream.
+The planner remains deterministic and always returns exactly the required block count. The requested row count is converted to a block count using the fixed `BLOCK_SIZE=64` accounting unit, then full row-group blocks are sampled. Same `seed` = same row-group block order and block selection across runs. Different `seed` values sample different logical blocks and block orderings.
 
 ### Cache warmup lifecycle
 
 1. On the first `step()` or `test()`, warmup runs for all three splits (train, validation, test).
-2. A `CachePlan` compares selected blocks against already-cached blocks.
-3. Only missing blocks are fetched from HuggingFace. If every block is already cached, HuggingFace is never contacted.
-4. A tqdm progress bar tracks block download. On completion, a block timeline is printed:
+2. The planner compares selected logical blocks against already-cached rows.
+3. Only missing rows are read from HuggingFace Parquet shards. If every selected block is already covered, the remote source is never contacted.
+4. A tqdm progress bar tracks logical-block warmup. On completion, a block timeline is printed:
 
 ```
-██░░██████░░░░██████████░░██ cache train | warm | hit=42 miss=6 runs=8
+██░░██████░░░░██████████░░██ cache train | warm | selected=42 fill=42/42
 ```
 
-`█` = selected block, `░` = skipped block in the candidate window.
+`█` = selected logical block, `░` = skipped block before the sampled stop block.
 
 ---
 

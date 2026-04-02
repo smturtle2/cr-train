@@ -1,7 +1,7 @@
 <h1 align="center">cr-train</h1>
 
 <p align="center">
-  <em>SEN12MS-CR 위성 구름 제거를 위한 HuggingFace 기반 학습 모듈</em>
+  <em>SEN12MS-CR 위성 구름 제거를 위한 HuggingFace 연동 학습 모듈</em>
 </p>
 
 <p align="center">
@@ -19,11 +19,11 @@
 ## 주요 특징
 
 - **단일 클래스 API** -- `Trainer`의 `step()` + `test()`만으로 학습 완료
-- **결정적 블록 샘플링** -- 이중 시드 시스템(`seed` + `dataset_seed`)으로 완벽한 재현성
-- **스마트 캐시 워밍업** -- 누락된 블록만 다운로드하며, 캐시가 완전하면 HuggingFace에 접속하지 않음
+- **결정적 블록 샘플링** -- 단일 시드 시스템(`seed`)으로 완벽한 재현성
+- **스마트 캐시 워밍업** -- HF Parquet shard에서 누락된 행만 읽고, 다른 계획에서도 재사용
 - **분산 학습** -- 자동 DDP 래핑, `DistributedSampler`, all-reduce 메트릭
 - **JSONL 실험 기록** -- 매 epoch, 검증, 체크포인트, 시작 이벤트를 `metrics.jsonl`에 기록
-- **별도 데이터 다운로드 불필요** -- [`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr)에서 직접 스트리밍
+- **별도 데이터 다운로드 불필요** -- [`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr)의 Parquet export를 직접 사용
 
 ---
 
@@ -32,7 +32,7 @@
 ### 설치
 
 ```bash
-uv add git+https://github.com/your-org/cr-train
+uv add git+https://github.com/smturtle2/cr-train.git
 ```
 
 ### 최소 예제
@@ -70,7 +70,6 @@ trainer = Trainer(
     batch_size=4,
     epochs=2,
     seed=42,
-    dataset_seed=7,
     output_dir="runs/sen12mscr",
 )
 
@@ -119,16 +118,16 @@ stop block 확률표, 샘플링된 stop, prefix draw, 그리고 선택(`■`) vs
 
 ```mermaid
 flowchart TD
-    HF["HuggingFace Hub<br/><code>Hermanni/sen12mscr</code>"]
-    SHUFFLE["스트리밍 셔플<br/><code>dataset_seed</code>"]
+    HF["HF Parquet Export<br/><code>Hermanni/sen12mscr</code>"]
+    ORDER["논리적 행 순서<br/><code>seed</code>"]
     PLAN["블록 선택 플래너<br/><code>seed</code> · stop-biased exact-k"]
-    CACHE["로컬 블록 캐시<br/>Arrow 청크 · 블록당 16행"]
-    DS["CachedBlockDataset"]
+    CACHE["로컬 행 캐시<br/>Arrow 청크 · row-indexed"]
+    DS["CachedRowDataset"]
     DL["DataLoader<br/>DDP 지원 · pinned memory"]
     TRAIN["Trainer.step() / test()"]
     OUT["출력<br/><code>metrics.jsonl</code> · <code>epoch-NNNN.pt</code>"]
 
-    HF --> SHUFFLE --> PLAN --> CACHE
+    HF --> ORDER --> PLAN --> CACHE
     CACHE --> DS --> DL --> TRAIN --> OUT
 ```
 
@@ -144,15 +143,14 @@ flowchart TD
 | `optimizer` | `Optimizer` | *(필수)* | `model.parameters()`로 생성해야 함. |
 | `loss` | `Callable` | *(필수)* | `(prediction, batch) -> 스칼라 텐서`. |
 | `metrics` | `dict[str, Callable]` | `None` | `{"이름": (prediction, batch) -> 스칼라}`. epoch별 기록. |
-| `max_train_samples` | `int \| None` | `None` | 요청 학습 행 수. 16행 블록 단위로 올림. `None` = 전체 split. |
+| `max_train_samples` | `int \| None` | `None` | 요청 학습 행 수. 고정 `BLOCK_SIZE=64` 기준으로 블록 수로 변환. `None` = 전체 split. |
 | `max_val_samples` | `int \| None` | `None` | 검증용 동일. |
 | `max_test_samples` | `int \| None` | `None` | 테스트용 동일. |
 | `batch_size` | `int` | `4` | 모든 DataLoader의 배치 크기. |
 | `epochs` | `int` | `1` | 총 학습 epoch 수. epoch당 `step()` 한 번 호출. |
-| `seed` | `int` | `42` | 정규 스트림에 대한 블록 선택 시드. |
-| `dataset_seed` | `int \| None` | `None` | 정규 데이터셋 스트림 셔플 시드. `None`이면 내부적으로 `0` 사용. |
+| `seed` | `int` | `42` | 결정적 row-group block 순서와 블록 선택을 함께 제어하는 시드. |
 | `output_dir` | `str \| Path` | `"runs/default"` | `metrics.jsonl` 및 체크포인트 파일 디렉토리. |
-| `cache_dir` | `str \| Path \| None` | `None` | 블록 캐시 루트. `None` = `~/.cache/cr-train`. |
+| `cache_dir` | `str \| Path \| None` | `None` | 행 캐시 루트. `None` = `~/.cache/cr-train`. |
 
 ### `Trainer.step() -> dict`
 
@@ -197,41 +195,41 @@ flowchart TD
 
 ## 동작 원리
 
-### 블록 기반 캐싱
+### 행 기반 캐싱
 
-HuggingFace의 데이터는 스트리밍으로 가져와 **16행 블록**(`BLOCK_SIZE=16`) 단위로 분할됩니다. 각 블록은 디스크에 Arrow 데이터셋 청크로 저장됩니다. 캐시는 `split + dataset_seed + shuffle_buffer_size`를 키로 사용하므로, 시드 조합이 다르면 독립적인 캐시가 생성됩니다.
+소스 데이터셋은 HF dataset viewer의 Parquet 메타데이터로 한 번 기술되고, 이후 워밍업은 split 단위 **row-indexed cache**를 채웁니다. logical block은 샘플링과 tqdm 표시를 위해 유지되며, 이제 block 하나는 source `row_group` 하나와 같습니다. 디스크 캐시는 global row id 기준으로 저장되어 다른 계획에서도 재사용됩니다.
 
 ```
-~/.cache/cr-train/layout-v7/<source>/block_store/<split>/dataset-seed=N-shuffle-buffer=128/
-├── chunks/          # Arrow 데이터셋 청크, 블록당 하나
-├── state.json       # 캐시 상태 (frontier, 시드 정보)
-├── chunk_ids.npy    # 블록 → 청크 매핑
-└── cached.npy       # 캐시된 블록의 boolean 마스크
+~/.cache/cr-train/layout-v10/<source>/row_store/<split>/
+├── chunks/             # raw row를 담는 Arrow IPC 청크
+├── state.json          # 캐시 상태 (행 수, 다음 chunk id)
+├── chunk_ids.npy       # global row id → chunk id
+├── row_offsets.npy     # global row id → chunk 내부 row offset
+└── cached_rows.npy     # 캐시된 global row id의 boolean 마스크
 ```
 
-### 이중 시드 결정적 샘플링
+### 결정적 샘플링
 
-완벽한 재현성을 위해 두 개의 독립적인 시드를 사용합니다:
+완벽한 재현성을 위해 하나의 시드를 사용합니다:
 
 | 시드 | 제어 대상 | 효과 |
 |------|-----------|------|
-| `dataset_seed` | 정규 셔플 스트림 | `dataset.shuffle(seed=dataset_seed, buffer_size=128)`로 split별 결정적 행 순서를 고정. |
-| `seed` | 블록 선택 | stop-biased exact-k 플래너가 `2 * required_blocks` 크기의 후보 윈도우 안에서 stop block을 고른 뒤, 그 prefix에서 나머지 블록을 선택. |
+| `seed` | row-group block 순서 + 블록 선택 | source `row_group` block의 결정적 순서를 만들고, 그 위에서 stop-biased exact-k 플래너가 logical block을 선택. |
 
-플래너는 항상 정확한 블록 수를 결정적으로 반환합니다. 동일한 `seed` = 동일한 블록 선택. 다른 `seed`값은 같은 정규 스트림에서 다른 블록을 샘플링합니다.
+플래너는 항상 정확한 블록 수를 결정적으로 반환합니다. 요청된 row 수는 고정 `BLOCK_SIZE=64` 기준으로 블록 수로 변환되고, 선택은 항상 전체 `row_group` 단위로 이뤄집니다. 동일한 `seed` = 동일한 row-group block 순서와 블록 선택. 다른 `seed`값은 다른 block 순서와 논리 블록을 샘플링합니다.
 
 ### 캐시 워밍업 생명주기
 
 1. 첫 번째 `step()` 또는 `test()` 호출 시, 세 split(train, validation, test) 모두 워밍업 실행.
-2. `CachePlan`이 선택된 블록과 이미 캐시된 블록을 비교.
-3. 누락된 블록만 HuggingFace에서 가져옴. 모든 블록이 캐시되어 있으면 HuggingFace에 접속하지 않음.
-4. tqdm 프로그레스 바로 블록 다운로드를 추적하고, 완료 시 블록 타임라인을 출력:
+2. 플래너가 선택된 logical block과 이미 캐시된 행을 비교.
+3. 누락된 행만 HuggingFace Parquet shard에서 읽음. 선택된 블록이 모두 캐시되어 있으면 원격 소스에 접속하지 않음.
+4. tqdm 프로그레스 바로 logical block 워밍업을 추적하고, 완료 시 블록 타임라인을 출력:
 
 ```
-██░░██████░░░░██████████░░██ cache train | warm | hit=42 miss=6 runs=8
+██░░██████░░░░██████████░░██ cache train | warm | selected=42 fill=42/42
 ```
 
-`█` = 선택된 블록, `░` = 후보 윈도우에서 건너뛴 블록.
+`█` = 선택된 logical block, `░` = 샘플링된 stop block 이전에서 건너뛴 block.
 
 ---
 

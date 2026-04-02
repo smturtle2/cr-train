@@ -8,7 +8,6 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "datasets>=4.6.0",
     "numpy>=1.26",
     "pyarrow>=23",
     "torch>=2.4",

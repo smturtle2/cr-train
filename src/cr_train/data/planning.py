@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .constants import BLOCK_SIZE, CANDIDATE_WINDOW_FACTOR, STOP_BIAS_ALPHA, STOP_BIAS_MIX
+from .constants import BLOCK_SIZE, STOP_BIAS_ALPHA, STOP_BIAS_MIX
 
 
 SELECTION_PLANNER_MODE = "stop_biased_exact_k"
@@ -14,42 +14,19 @@ SELECTION_PLANNER_MODE = "stop_biased_exact_k"
 
 @dataclass(slots=True)
 class SamplePlan:
-    """블록 단위 샘플 선택 결과. selected_bitmap이 어떤 블록을 사용할지 결정."""
+    """Logical block sampling result plus the concrete global row ids to materialize."""
 
     requested_rows: int
     effective_rows: int
     required_blocks: int
     total_blocks: int
-    candidate_blocks: int
     planner_mode: str
     stop_bias_alpha: float
     selected_blocks: np.ndarray
     selected_bitmap: np.ndarray
     execution_block_count: int
-
-
-@dataclass(slots=True)
-class ExecutionRun:
-    """동일한 실행 종류(skip/take_cached/take_remote/materialize)의 연속 블록 범위."""
-
-    kind: str
-    start_block: int
-    stop_block: int
-    block_count: int
-    total_rows: int
-
-
-@dataclass(slots=True)
-class CachePlan:
-    """sample plan과 현재 캐시 상태를 결합한 warmup 실행 계획."""
-
-    sample_plan: SamplePlan
-    cached_selected_blocks: int
-    selected_missing_blocks: int
-    extension_blocks: int
-    cache_only: bool
-    frontier_before: int
-    frontier_after: int
+    selected_row_ids: np.ndarray
+    selected_row_offsets: np.ndarray
 
 
 @dataclass(slots=True)
@@ -57,7 +34,6 @@ class SelectionTrace:
     total_blocks: int
     requested_rows: int
     required_blocks: int
-    candidate_blocks: int
     planner_mode: str
     stop_bias_alpha: float
     stop_candidates: np.ndarray
@@ -71,20 +47,20 @@ class SelectionTrace:
 
 def compute_stop_probability(
     required_blocks: int,
-    candidate_blocks: int,
+    total_blocks: int,
     stop_block: int,
     *,
     stop_bias_alpha: float = STOP_BIAS_ALPHA,
 ) -> float:
-    """candidate window 내부 stop block 확률 질량 함수."""
-    if required_blocks <= 0 or candidate_blocks <= 0:
+    """Probability mass over stop blocks across the full logical block order."""
+    if required_blocks <= 0 or total_blocks <= 0:
         return 0.0
     min_stop = required_blocks - 1
-    max_stop = candidate_blocks - 1
+    max_stop = total_blocks - 1
     if stop_block < min_stop or stop_block > max_stop:
         return 0.0
     positions = np.arange(min_stop, max_stop + 1, dtype=np.float64)
-    denom = max(candidate_blocks - required_blocks, 1)
+    denom = max(total_blocks - required_blocks, 1)
     weights = np.exp(-stop_bias_alpha * ((positions - min_stop) / denom))
     weights /= float(np.sum(weights))
     uniform = np.full_like(weights, 1.0 / len(weights))
@@ -95,43 +71,20 @@ def compute_stop_probability(
     return float(mixed_weights[int(stop_block - min_stop)] / weights_sum)
 
 
-def compute_base_take_probability(required_blocks: int, candidate_blocks: int) -> float:
-    """호환용 legacy helper. 새 planner는 사용하지 않는다."""
-    if required_blocks <= 0 or candidate_blocks <= 0:
-        return 0.0
-    return min(1.0, required_blocks / candidate_blocks)
-
-
-def compute_take_probability(
-    required_blocks: int,
-    candidate_blocks: int,
-    remaining_candidates: int,
-) -> float:
-    """호환용 legacy helper. 새 planner는 사용하지 않는다."""
-    if required_blocks <= 0 or candidate_blocks <= 0 or remaining_candidates <= 0:
-        return 0.0
-    base_take_prob = compute_base_take_probability(required_blocks, candidate_blocks)
-    dynamic_bonus = max(0.0, (required_blocks / remaining_candidates) - base_take_prob)
-    return min(1.0, base_take_prob + dynamic_bonus)
-
-
-def _derive_split_seed(seed: int, split: str) -> int:
-    if not split:
-        return int(seed)
-    digest = hashlib.sha256(split.encode("utf-8")).digest()
-    split_bits = int.from_bytes(digest[:8], "big")
-    return int(seed) ^ split_bits
+def _derive_named_seed(seed: int, split: str, purpose: str) -> int:
+    digest = hashlib.sha256(f"{purpose}:{split}".encode("utf-8")).digest()
+    return int(seed) ^ int.from_bytes(digest[:8], "big")
 
 
 def _sample_stop_block(
     *,
     required_blocks: int,
-    candidate_blocks: int,
+    total_blocks: int,
     rng: np.random.Generator,
     stop_bias_alpha: float,
 ) -> tuple[int, np.ndarray, np.ndarray]:
     min_stop = required_blocks - 1
-    max_stop = candidate_blocks - 1
+    max_stop = total_blocks - 1
     if min_stop >= max_stop:
         stop_candidates = np.asarray([min_stop], dtype=np.int64)
         probabilities = np.asarray([1.0], dtype=np.float64)
@@ -141,7 +94,7 @@ def _sample_stop_block(
         [
             compute_stop_probability(
                 required_blocks,
-                candidate_blocks,
+                total_blocks,
                 int(stop_block),
                 stop_bias_alpha=stop_bias_alpha,
             )
@@ -155,19 +108,19 @@ def _sample_stop_block(
 def _select_blocks_stop_biased(
     *,
     required_blocks: int,
-    candidate_blocks: int,
+    total_blocks: int,
     seed: int,
     stop_bias_alpha: float,
 ) -> tuple[np.ndarray, float]:
-    if required_blocks <= 0 or candidate_blocks <= 0:
+    if required_blocks <= 0 or total_blocks <= 0:
         return np.empty((0,), dtype=np.int64), stop_bias_alpha
-    if required_blocks >= candidate_blocks:
-        return np.arange(candidate_blocks, dtype=np.int64), stop_bias_alpha
+    if required_blocks >= total_blocks:
+        return np.arange(total_blocks, dtype=np.int64), stop_bias_alpha
 
     rng = np.random.default_rng(seed)
     stop_block, _, _ = _sample_stop_block(
         required_blocks=required_blocks,
-        candidate_blocks=candidate_blocks,
+        total_blocks=total_blocks,
         rng=rng,
         stop_bias_alpha=stop_bias_alpha,
     )
@@ -178,6 +131,69 @@ def _select_blocks_stop_biased(
     return selected_blocks, stop_bias_alpha
 
 
+def _build_source_blocks(catalog: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
+    total_rows = int(catalog["total_rows"])
+    if total_rows <= 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty
+
+    shards = catalog.get("shards")
+    if not isinstance(shards, list):
+        starts = np.arange(0, total_rows, BLOCK_SIZE, dtype=np.int64)
+        stops = np.minimum(starts + BLOCK_SIZE, total_rows)
+        return starts, stops
+
+    starts: list[int] = []
+    stops: list[int] = []
+    for shard in shards:
+        if not isinstance(shard, dict):
+            continue
+        shard_global_start = int(shard["global_start"])
+        current = shard_global_start
+        for value in shard.get("row_group_rows", []):
+            row_group_rows = int(value)
+            if row_group_rows <= 0:
+                continue
+            row_group_stop = current + row_group_rows
+            starts.append(current)
+            stops.append(row_group_stop)
+            current = row_group_stop
+    if starts:
+        return np.asarray(starts, dtype=np.int64), np.asarray(stops, dtype=np.int64)
+    starts = np.arange(0, total_rows, BLOCK_SIZE, dtype=np.int64)
+    stops = np.minimum(starts + BLOCK_SIZE, total_rows)
+    return np.asarray(starts, dtype=np.int64), np.asarray(stops, dtype=np.int64)
+
+
+def _ordered_source_blocks(catalog: dict[str, object], *, seed: int, split: str) -> tuple[np.ndarray, np.ndarray]:
+    block_starts, block_stops = _build_source_blocks(catalog)
+    if block_starts.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty
+    rng = np.random.default_rng(_derive_named_seed(seed, split, "block-order"))
+    order = rng.permutation(block_starts.size)
+    return block_starts[order], block_stops[order]
+
+
+def _collect_selected_row_ids(
+    *,
+    ordered_block_starts: np.ndarray,
+    ordered_block_stops: np.ndarray,
+    selected_blocks: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if selected_blocks.size == 0:
+        return np.empty((0,), dtype=np.int64), np.asarray([0], dtype=np.int64)
+
+    offsets = [0]
+    segments: list[np.ndarray] = []
+    for block_index in selected_blocks:
+        start = int(ordered_block_starts[int(block_index)])
+        stop = int(ordered_block_stops[int(block_index)])
+        segment = np.arange(start, stop, dtype=np.int64)
+        segments.append(segment)
+        offsets.append(offsets[-1] + int(segment.size))
+    return np.concatenate(segments), np.asarray(offsets, dtype=np.int64)
+
 def trace_plan_sample(
     catalog: dict[str, object],
     seed: int,
@@ -185,17 +201,17 @@ def trace_plan_sample(
     *,
     split: str = "",
 ) -> SelectionTrace:
-    """예제/디버깅용 planner trace. 실제 sampling 로직을 그대로 재사용한다."""
-    split_seed = _derive_split_seed(seed, split)
+    """Planner trace for examples/debugging."""
+    split_seed = _derive_named_seed(seed, split, "selection")
     total_rows = int(catalog["total_rows"])
-    total_blocks = int(math.ceil(total_rows / BLOCK_SIZE)) if total_rows > 0 else 0
+    block_starts, _ = _build_source_blocks(catalog)
+    total_blocks = int(block_starts.size)
     requested_rows = total_rows if max_samples is None else min(max_samples, total_rows)
     if requested_rows <= 0 or total_blocks == 0:
         return SelectionTrace(
             total_blocks=total_blocks,
             requested_rows=0,
             required_blocks=0,
-            candidate_blocks=0,
             planner_mode=SELECTION_PLANNER_MODE,
             stop_bias_alpha=STOP_BIAS_ALPHA,
             stop_candidates=np.empty((0,), dtype=np.int64),
@@ -208,21 +224,19 @@ def trace_plan_sample(
         )
 
     required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE)))
-    candidate_blocks = min(total_blocks, CANDIDATE_WINDOW_FACTOR * required_blocks)
-    if required_blocks >= candidate_blocks:
-        selected_blocks = np.arange(candidate_blocks, dtype=np.int64)
+    if required_blocks >= total_blocks:
+        selected_blocks = np.arange(total_blocks, dtype=np.int64)
         selected_bitmap = np.zeros(total_blocks, dtype=np.bool_)
         selected_bitmap[selected_blocks] = True
         return SelectionTrace(
             total_blocks=total_blocks,
             requested_rows=requested_rows,
             required_blocks=required_blocks,
-            candidate_blocks=candidate_blocks,
             planner_mode=SELECTION_PLANNER_MODE,
             stop_bias_alpha=STOP_BIAS_ALPHA,
-            stop_candidates=np.asarray([candidate_blocks - 1], dtype=np.int64),
+            stop_candidates=np.asarray([total_blocks - 1], dtype=np.int64),
             stop_probabilities=np.asarray([1.0], dtype=np.float64),
-            sampled_stop_block=(candidate_blocks - 1) if candidate_blocks > 0 else None,
+            sampled_stop_block=(total_blocks - 1) if total_blocks > 0 else None,
             prefix_draws=selected_blocks[:-1],
             selected_blocks=selected_blocks,
             selected_bitmap=selected_bitmap,
@@ -232,7 +246,7 @@ def trace_plan_sample(
     rng = np.random.default_rng(split_seed)
     sampled_stop_block, stop_candidates, stop_probabilities = _sample_stop_block(
         required_blocks=required_blocks,
-        candidate_blocks=candidate_blocks,
+        total_blocks=total_blocks,
         rng=rng,
         stop_bias_alpha=STOP_BIAS_ALPHA,
     )
@@ -249,7 +263,6 @@ def trace_plan_sample(
         total_blocks=total_blocks,
         requested_rows=requested_rows,
         required_blocks=required_blocks,
-        candidate_blocks=candidate_blocks,
         planner_mode=SELECTION_PLANNER_MODE,
         stop_bias_alpha=STOP_BIAS_ALPHA,
         stop_candidates=stop_candidates,
@@ -262,11 +275,18 @@ def trace_plan_sample(
     )
 
 
-def plan_sample(catalog: dict[str, object], seed: int, max_samples: int | None, *, split: str = "") -> SamplePlan:
-    """stop-biased exact-k 샘플링으로 블록을 선택. 결정적이며 정확히 required_blocks개를 보장."""
-    split_seed = _derive_split_seed(seed, split)
+def plan_sample(
+    catalog: dict[str, object],
+    seed: int,
+    max_samples: int | None,
+    *,
+    split: str = "",
+) -> SamplePlan:
+    """Plan logical blocks and expand them into deterministic global row ids."""
+    split_seed = _derive_named_seed(seed, split, "selection")
     total_rows = int(catalog["total_rows"])
-    total_blocks = int(math.ceil(total_rows / BLOCK_SIZE)) if total_rows > 0 else 0
+    ordered_block_starts, ordered_block_stops = _ordered_source_blocks(catalog, seed=seed, split=split)
+    total_blocks = int(ordered_block_starts.size)
     requested_rows = total_rows if max_samples is None else min(max_samples, total_rows)
     if requested_rows <= 0 or total_blocks == 0:
         return SamplePlan(
@@ -274,126 +294,48 @@ def plan_sample(catalog: dict[str, object], seed: int, max_samples: int | None, 
             effective_rows=0,
             required_blocks=0,
             total_blocks=total_blocks,
-            candidate_blocks=0,
             planner_mode=SELECTION_PLANNER_MODE,
             stop_bias_alpha=STOP_BIAS_ALPHA,
             selected_blocks=np.empty((0,), dtype=np.int64),
             selected_bitmap=np.zeros(total_blocks, dtype=np.bool_),
             execution_block_count=0,
+            selected_row_ids=np.empty((0,), dtype=np.int64),
+            selected_row_offsets=np.asarray([0], dtype=np.int64),
         )
 
     required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE)))
-    effective_rows = required_blocks * BLOCK_SIZE
-    candidate_blocks = min(total_blocks, CANDIDATE_WINDOW_FACTOR * required_blocks)
     selected_blocks, stop_bias_alpha = _select_blocks_stop_biased(
         required_blocks=required_blocks,
-        candidate_blocks=candidate_blocks,
+        total_blocks=total_blocks,
         seed=split_seed,
         stop_bias_alpha=STOP_BIAS_ALPHA,
     )
-
     selected_bitmap = np.zeros(total_blocks, dtype=np.bool_)
     selected_bitmap[selected_blocks] = True
+    selected_row_ids, selected_row_offsets = _collect_selected_row_ids(
+        ordered_block_starts=ordered_block_starts,
+        ordered_block_stops=ordered_block_stops,
+        selected_blocks=selected_blocks,
+    )
     return SamplePlan(
         requested_rows=requested_rows,
-        effective_rows=effective_rows,
+        effective_rows=int(selected_row_ids.size),
         required_blocks=required_blocks,
         total_blocks=total_blocks,
-        candidate_blocks=candidate_blocks,
         planner_mode=SELECTION_PLANNER_MODE,
         stop_bias_alpha=stop_bias_alpha,
         selected_blocks=selected_blocks,
         selected_bitmap=selected_bitmap,
         execution_block_count=(int(selected_blocks[-1]) + 1) if selected_blocks.size else 0,
+        selected_row_ids=selected_row_ids,
+        selected_row_offsets=selected_row_offsets,
     )
 
-
-def _compress_runs_from_kinds(kinds: list[str], *, start_block: int = 0) -> list[ExecutionRun]:
-    if not kinds:
-        return []
-
-    runs: list[ExecutionRun] = []
-    current_kind = kinds[0]
-    current_start = start_block
-    for offset, kind in enumerate(kinds[1:], start=1):
-        block_index = start_block + offset
-        if kind == current_kind:
-            continue
-        runs.append(
-            ExecutionRun(
-                kind=current_kind,
-                start_block=current_start,
-                stop_block=block_index,
-                block_count=block_index - current_start,
-                total_rows=(block_index - current_start) * BLOCK_SIZE,
-            )
-        )
-        current_kind = kind
-        current_start = block_index
-
-    stop_block = start_block + len(kinds)
-    runs.append(
-        ExecutionRun(
-            kind=current_kind,
-            start_block=current_start,
-            stop_block=stop_block,
-            block_count=stop_block - current_start,
-            total_rows=(stop_block - current_start) * BLOCK_SIZE,
-        )
-    )
-    return runs
-
-
-def compress_execution_runs(
-    selected_bitmap: np.ndarray,
-    cached_bitmap: np.ndarray,
-    *,
-    stop_block: int,
-) -> list[ExecutionRun]:
-    """인접한 동일 종류 블록을 연속 실행 구간으로 병합."""
-    if stop_block <= 0:
-        return []
-
-    kinds: list[str] = []
-    for block_index in range(stop_block):
-        if not bool(selected_bitmap[block_index]):
-            kinds.append("skip")
-            continue
-        kinds.append("take_cached" if bool(cached_bitmap[block_index]) else "take_remote")
-    return _compress_runs_from_kinds(kinds)
-
-
-def build_cache_plan(
-    sample_plan: SamplePlan,
-    cached_bitmap: np.ndarray,
-    *,
-    frontier_block: int,
-) -> CachePlan:
-    """sample plan과 contiguous prefix 캐시 상태로부터 warmup 실행 계획 생성."""
-    selected_bitmap = sample_plan.selected_bitmap
-    cached_selected_blocks = int(np.count_nonzero(np.logical_and(selected_bitmap, cached_bitmap)))
-    selected_missing_blocks = int(np.count_nonzero(np.logical_and(selected_bitmap, ~cached_bitmap)))
-    frontier_before = max(0, int(frontier_block))
-    frontier_after = max(frontier_before, sample_plan.execution_block_count)
-    extension_blocks = max(0, frontier_after - frontier_before)
-    cache_only = extension_blocks == 0
-    if cache_only:
-        return CachePlan(
-            sample_plan=sample_plan,
-            cached_selected_blocks=cached_selected_blocks,
-            selected_missing_blocks=selected_missing_blocks,
-            extension_blocks=0,
-            cache_only=True,
-            frontier_before=frontier_before,
-            frontier_after=frontier_after,
-        )
-
-    return CachePlan(
-        sample_plan=sample_plan,
-        cached_selected_blocks=cached_selected_blocks,
-        selected_missing_blocks=selected_missing_blocks,
-        extension_blocks=extension_blocks,
-        cache_only=False,
-        frontier_before=frontier_before,
-        frontier_after=frontier_after,
-    )
+__all__ = [
+    "SELECTION_PLANNER_MODE",
+    "SamplePlan",
+    "SelectionTrace",
+    "compute_stop_probability",
+    "plan_sample",
+    "trace_plan_sample",
+]

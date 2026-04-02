@@ -229,22 +229,33 @@ def ensure_source_root(
 ) -> tuple[Path, dict[str, Any]]:
     """소스 메타데이터가 로컬에 캐시되었는지 확인. 없으면 HF에서 가져와 저장."""
     cached = _find_cached_source(cache_root, dataset_name, revision)
-    if cached is not None:
-        source_root, descriptor = cached
-        _source_descriptor_cache[(dataset_name, revision)] = descriptor
-        return source_root, descriptor
+    try:
+        descriptor = load_source_descriptor(dataset_name, revision)
+    except Exception:
+        if cached is None:
+            raise
+        source_root, cached_descriptor = cached
+        _source_descriptor_cache[(dataset_name, revision)] = cached_descriptor
+        return source_root, cached_descriptor
 
-    descriptor = load_source_descriptor(dataset_name, revision)
     source_root = resolve_source_root(cache_root, str(descriptor["source_signature"]))
     metadata_path = resolve_source_metadata_path(source_root)
+    payload = {
+        "cache_layout_version": CACHE_LAYOUT_VERSION,
+        **descriptor,
+    }
     if not metadata_path.exists():
         write_json_atomic(
             metadata_path,
-            {
-                "cache_layout_version": CACHE_LAYOUT_VERSION,
-                **descriptor,
-            },
+            payload,
         )
+    else:
+        try:
+            existing = read_json(metadata_path)
+        except Exception:
+            existing = None
+        if existing != payload:
+            write_json_atomic(metadata_path, payload)
     return source_root, descriptor
 
 

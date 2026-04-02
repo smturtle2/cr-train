@@ -67,16 +67,63 @@ def _format_metric(value: float) -> str:
     return f"{value:.2f}"
 
 
-def update_progress_bar(progress: Any, *, accumulator: MetricAccumulator, start_time: float | None) -> None:
+def _format_rate(value: float, unit: str) -> str:
+    return f"{value:.1f} {unit}" if value < 100 else f"{value:.0f} {unit}"
+
+
+def _set_progress_postfix_str(progress: Any, text: str) -> None:
+    if hasattr(progress, "set_postfix_str"):
+        progress.set_postfix_str(text)
+        return
+    if hasattr(progress, "set_postfix"):
+        progress.set_postfix(text)
+
+
+def _reduce_progress_state(
+    *,
+    accumulator: MetricAccumulator,
+    reduce_int: Callable[[int], int],
+    reduce_sum: Callable[[float], float],
+    distributed: bool,
+) -> tuple[int, int, dict[str, float]]:
+    reduced_examples = accumulator.total_examples
+    reduced_batches = accumulator.total_batches
+    reduced_sums = dict(accumulator.weighted_sums)
+    if distributed:
+        reduced_examples = reduce_int(reduced_examples)
+        reduced_batches = reduce_int(reduced_batches)
+        reduced_sums = {key: reduce_sum(value) for key, value in reduced_sums.items()}
+    return reduced_examples, reduced_batches, reduced_sums
+
+
+def update_progress_bar(
+    progress: Any,
+    *,
+    accumulator: MetricAccumulator,
+    start_time: float | None,
+    reduce_int: Callable[[int], int],
+    reduce_sum: Callable[[float], float],
+    distributed: bool,
+) -> None:
+    reduced_examples, reduced_batches, reduced_sums = _reduce_progress_state(
+        accumulator=accumulator,
+        reduce_int=reduce_int,
+        reduce_sum=reduce_sum,
+        distributed=distributed,
+    )
     if getattr(progress, "disable", False):
         return
     progress.update(1)
-    postfix = {key: _format_metric(value) for key, value in accumulator.averages().items()}
-    if start_time is not None and accumulator.total_batches > 0:
+    postfix_parts = [
+        f"{key}: {_format_metric(value / reduced_examples)}"
+        for key, value in reduced_sums.items()
+        if reduced_examples > 0
+    ]
+    if start_time is not None and reduced_batches > 0:
         elapsed = max(time.perf_counter() - start_time, 1e-9)
-        speed = accumulator.total_batches / elapsed
-        postfix["batches/s"] = f"{speed:.1f}" if speed < 100 else f"{speed:.0f}"
-    progress.set_postfix(postfix)
+        speed = reduced_batches / elapsed
+        postfix_parts.append(_format_rate(speed, "batches/s"))
+    _set_progress_postfix_str(progress, ", ".join(postfix_parts))
 
 
 def finalize_summary(
@@ -88,14 +135,12 @@ def finalize_summary(
     reduce_sum: Callable[[float], float],
     distributed: bool,
 ) -> dict[str, Any]:
-    reduced_examples = accumulator.total_examples
-    reduced_batches = accumulator.total_batches
-    reduced_sums = dict(accumulator.weighted_sums)
-
-    if distributed:
-        reduced_examples = reduce_int(reduced_examples)
-        reduced_batches = reduce_int(reduced_batches)
-        reduced_sums = {key: reduce_sum(value) for key, value in reduced_sums.items()}
+    reduced_examples, reduced_batches, reduced_sums = _reduce_progress_state(
+        accumulator=accumulator,
+        reduce_int=reduce_int,
+        reduce_sum=reduce_sum,
+        distributed=distributed,
+    )
 
     averages = {}
     if reduced_examples > 0:

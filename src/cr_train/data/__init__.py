@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from .constants import (
     BLOCK_SIZE,
-    CANONICAL_SHUFFLE_BUFFER_SIZE,
     DATA_COLUMNS,
     DATASET_ID,
     OPTICAL_CHANNELS,
@@ -10,7 +9,7 @@ from .constants import (
     STOP_BIAS_ALPHA,
 )
 from .dataset import (
-    CachedBlockDataset,
+    CachedRowDataset,
     PreparedSplit,
     build_collate_fn,
     build_dataloader,
@@ -22,15 +21,9 @@ from .dataset import (
     seed_worker,
 )
 from .planning import (
-    CachePlan,
-    ExecutionRun,
     SamplePlan,
     SelectionTrace,
-    build_cache_plan,
-    compute_base_take_probability,
     compute_stop_probability,
-    compute_take_probability,
-    compress_execution_runs,
     plan_sample,
     trace_plan_sample,
 )
@@ -45,43 +38,37 @@ from .source import (
     run_startup_stage,
 )
 from .store import (
-    BlockCachePaths,
-    SplitBlockCache,
-    SplitBlockCacheState,
+    RowCachePaths,
+    SplitRowCache,
+    SplitRowCacheState,
     file_lock,
     freeze_row,
     read_json,
     remove_tree,
     resolve_cache_root,
-    suppress_hf_datasets_progress_bars,
+    resolve_row_cache_paths,
     write_json_atomic,
 )
 
+
 __all__ = [
     "BLOCK_SIZE",
-    "BlockCachePaths",
-    "CANONICAL_SHUFFLE_BUFFER_SIZE",
-    "CachePlan",
-    "CachedBlockDataset",
+    "CachedRowDataset",
     "DATASET_ID",
     "DATA_COLUMNS",
-    "ExecutionRun",
     "OPTICAL_CHANNELS",
     "PreparedSplit",
+    "RowCachePaths",
     "SAR_CHANNELS",
     "SamplePlan",
     "SelectionTrace",
-    "SplitBlockCache",
-    "SplitBlockCacheState",
+    "SplitRowCache",
+    "SplitRowCacheState",
     "STOP_BIAS_ALPHA",
     "WarmupProgressState",
-    "build_cache_plan",
     "build_collate_fn",
     "build_dataloader",
-    "compress_execution_runs",
-    "compute_base_take_probability",
     "compute_stop_probability",
-    "compute_take_probability",
     "decode_row",
     "emit_startup_event",
     "ensure_source_root",
@@ -103,10 +90,10 @@ __all__ = [
     "request_json",
     "resolve_cache_root",
     "resolve_num_workers",
+    "resolve_row_cache_paths",
     "run_startup_stage",
     "seed_everything",
     "seed_worker",
-    "suppress_hf_datasets_progress_bars",
     "trace_plan_sample",
     "write_json_atomic",
 ]

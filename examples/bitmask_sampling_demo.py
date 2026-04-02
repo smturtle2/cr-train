@@ -1,15 +1,18 @@
 """Block-selection bitmask algorithm visualization.
 
 Demonstrates how the current stop-biased exact-k planner selects blocks
-from a candidate window by first sampling a stop block and then drawing
-the remaining blocks from its prefix.
+from the full logical block order by first sampling a stop block and then
+drawing the remaining blocks from its prefix.
+
+This is a synthetic planner demo. It does not load a real Parquet catalog,
+so it uses the library's fixed block-size accounting constant.
 
 Usage:
     uv run python examples/bitmask_sampling_demo.py
     uv run python examples/bitmask_sampling_demo.py --total-rows 107072 --requested-rows 2048 --seed 9
 
 Output:
-    - Configuration summary (block size, total/required/candidate blocks)
+    - Configuration summary (fixed block size, total/required blocks)
     - Stop-block probability table and sampled stop
     - Prefix draw summary from the sampled stop block
     - Final selection bitmap (selected vs. skipped)
@@ -27,7 +30,7 @@ from cr_train.data import BLOCK_SIZE, trace_plan_sample
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Show how the canonical block-selection bitmask is built.",
+        description="Show how the deterministic block-selection bitmask is built.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--total-rows", type=int, default=107072, help="Total rows in the split.")
@@ -116,7 +119,6 @@ def build_selection_trace(
     return {
         "total_blocks": trace.total_blocks,
         "required_blocks": trace.required_blocks,
-        "candidate_blocks": trace.candidate_blocks,
         "planner_mode": trace.planner_mode,
         "stop_bias_alpha": trace.stop_bias_alpha,
         "sampled_stop_block": trace.sampled_stop_block,
@@ -141,14 +143,13 @@ def main() -> None:
     print("  Block Selection Bitmask Demo")
     print("=" * 60)
     print()
-    print(f"  block_size          = {BLOCK_SIZE}")
+    print(f"  block_rows          = {BLOCK_SIZE}")
     print(f"  total_rows          = {args.total_rows}")
     print(f"  requested_rows      = {args.requested_rows}")
     print(f"  seed                = {args.seed}")
     print()
     print(f"  total_blocks        = {result['total_blocks']}")
     print(f"  required_blocks     = {result['required_blocks']}")
-    print(f"  candidate_blocks    = {result['candidate_blocks']}")
     print(f"  planner_mode        = {result['planner_mode']}")
     print(f"  stop_bias_alpha     = {result['stop_bias_alpha']:.4f}")
     print(f"  sampled_stop_block  = {result['sampled_stop_block']}")
@@ -171,15 +172,14 @@ def main() -> None:
     print("  ■ = selected    □ = skipped")
     print("-" * 60)
     print()
-    bitmap_width = min(int(result["candidate_blocks"]), 80)
-    bitmap = _render_bitmask(result["selected_bitmap"], width=int(result["candidate_blocks"]))
+    bitmap_width = min(int(result["total_blocks"]), 80)
+    bitmap = _render_bitmask(result["selected_bitmap"], width=int(result["total_blocks"]))
     print(f"  {_compact_text(bitmap, max_chars=bitmap_width)}")
     print()
 
     # --- Summary statistics ---
     selected = list(result["selected_blocks"])
     required = int(result["required_blocks"])
-    candidate = int(result["candidate_blocks"])
     total = int(result["total_blocks"])
     span = (max(selected) - min(selected) + 1) if selected else 0
 
@@ -188,10 +188,10 @@ def main() -> None:
     print("-" * 60)
     print()
     print(f"  selected_blocks     = {len(selected)} / {required} required")
-    print(f"  candidate_window    = {candidate} / {total} total blocks")
+    print(f"  total_blocks        = {total}")
     print(f"  selection_span      = {span} blocks (contiguous range covering all selected)")
     print(f"  selection_density   = {len(selected) / max(span, 1):.2%} within span")
-    print(f"  effective_rows      = {len(selected) * BLOCK_SIZE}")
+    print(f"  effective_rows_est  = {len(selected) * BLOCK_SIZE}")
     print()
 
 
