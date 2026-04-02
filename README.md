@@ -253,7 +253,7 @@ def my_loss(prediction, batch):
 
 ## Notes
 
-- Cache warmup shows a tqdm progress bar during block download and prints a block timeline on completion.
+- Cache warmup shows a tqdm progress bar during block download and prints a one-line `■/□` block timeline on completion.
 - Equal `seed` values keep the same uniform exact-k block-selection membership; train batch order still changes by epoch via `seed + epoch_index`.
 - Finished caches are never auto-deleted. Remove them manually from the cache directory to reclaim disk space.
 - `Trainer.step()` shows running-average loss and metrics with batch-level tqdm during training.

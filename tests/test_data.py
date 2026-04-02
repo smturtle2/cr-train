@@ -24,7 +24,15 @@ from cr_train.data import (
 )
 from cr_train.data.dataset import prepare_split
 from cr_train.data.runtime import ensure_split_cache
-from cr_train.data.store import block_metadata_path, load_block_metadata, resolve_block_cache_paths
+from cr_train.data.store import (
+    block_data_path,
+    block_is_cached,
+    block_metadata_path,
+    load_block,
+    load_block_metadata,
+    resolve_block_cache_paths,
+    save_block,
+)
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -241,6 +249,107 @@ def test_build_collate_fn_batches_rows() -> None:
     assert batch["cloudy"].shape == (2, 13, 256, 256)
     assert batch["target"].shape == (2, 13, 256, 256)
     assert batch["meta"]["patch"] == ["p000", "p001"]
+
+
+def test_block_payload_round_trip_uses_mmap_layout(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    cache_paths = resolve_block_cache_paths(source_root, "train")
+    rows = [_make_row(0), _make_row(1)]
+
+    save_result = save_block(
+        cache_paths,
+        cache_key="block-key",
+        rows=rows,
+        metadata={
+            "cache_key": "block-key",
+            "split": "train",
+            "block_index": 0,
+            "shard_index": 0,
+            "source_file": "hf://datasets/unit/test/train/0000.parquet",
+            "row_groups": [0],
+            "row_count": len(rows),
+        },
+    )
+
+    payload_path = block_data_path(cache_paths, "block-key")
+    payload = load_block(cache_paths, "block-key")
+    first_row = payload[0]
+
+    assert payload_path.is_dir()
+    assert sorted(path.name for path in payload_path.iterdir()) == ["cloudy.npy", "payload.json", "sar.npy", "target.npy"]
+    assert save_result.payload_bytes > 0
+    assert len(payload) == 2
+    assert isinstance(first_row["sar"], np.ndarray)
+    np.testing.assert_array_equal(
+        first_row["sar"],
+        np.frombuffer(rows[0]["sar"], dtype=np.float32).reshape(rows[0]["sar_shape"]),
+    )
+    np.testing.assert_array_equal(
+        first_row["cloudy"],
+        np.frombuffer(rows[0]["cloudy"], dtype=np.int16).reshape(rows[0]["opt_shape"]),
+    )
+    np.testing.assert_array_equal(
+        first_row["target"],
+        np.frombuffer(rows[0]["target"], dtype=np.int16).reshape(rows[0]["opt_shape"]),
+    )
+    assert first_row["scene"] == "0"
+    assert first_row["patch"] == "p000"
+
+
+def test_block_is_cached_requires_complete_payload_files(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    cache_paths = resolve_block_cache_paths(source_root, "train")
+    rows = [_make_row(0)]
+
+    save_block(
+        cache_paths,
+        cache_key="block-key",
+        rows=rows,
+        metadata={
+            "cache_key": "block-key",
+            "split": "train",
+            "block_index": 0,
+            "shard_index": 0,
+            "source_file": "hf://datasets/unit/test/train/0000.parquet",
+            "row_groups": [0],
+            "row_count": len(rows),
+        },
+    )
+
+    payload_path = block_data_path(cache_paths, "block-key")
+
+    assert block_is_cached(cache_paths, "block-key") is True
+    (payload_path / "sar.npy").unlink()
+    assert block_is_cached(cache_paths, "block-key") is False
+
+
+def test_load_block_does_not_call_torch_load(monkeypatch, tmp_path: Path) -> None:
+    import torch
+
+    source_root = tmp_path / "source"
+    cache_paths = resolve_block_cache_paths(source_root, "train")
+    rows = [_make_row(0)]
+
+    save_block(
+        cache_paths,
+        cache_key="block-key",
+        rows=rows,
+        metadata={
+            "cache_key": "block-key",
+            "split": "train",
+            "block_index": 0,
+            "shard_index": 0,
+            "source_file": "hf://datasets/unit/test/train/0000.parquet",
+            "row_groups": [0],
+            "row_count": len(rows),
+        },
+    )
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("torch.load should not run")))
+
+    payload = load_block(cache_paths, "block-key")
+
+    assert len(payload) == 1
+    assert payload[0]["scene"] == "0"
 
 
 def test_plan_sample_is_block_reproducible_within_total_block_domain() -> None:
@@ -602,6 +711,38 @@ def test_ensure_split_cache_refills_stale_block_cache(
     assert refilled_metadata["source_file"] == block["source_file"]
     assert refilled_metadata["row_groups"] == block["row_groups"]
     assert 0 < int(refilled_metadata["row_count"]) <= BLOCK_SIZE
+
+
+def test_ensure_split_cache_refills_missing_payload_file(monkeypatch, tmp_path: Path) -> None:
+    split_blocks = {"train": _make_block_splits(1)}
+    patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
+    block = patched["catalogs"]["train"]["blocks"][0]
+    cache_key = str(block["cache_key"])
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=BLOCK_SIZE,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    cache_paths = resolve_block_cache_paths(patched["source_root"], "train")
+    payload_path = block_data_path(cache_paths, cache_key)
+    (payload_path / "sar.npy").unlink()
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=BLOCK_SIZE,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    assert patched["load_counts"][cache_key] == 2
+    assert block_is_cached(cache_paths, cache_key) is True
 
 
 def test_prepare_split_reads_cached_blocks_in_selected_order(monkeypatch, tmp_path: Path) -> None:

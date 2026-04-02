@@ -253,7 +253,7 @@ def my_loss(prediction, batch):
 
 ## 참고사항
 
-- 캐시 워밍업 시 tqdm 프로그레스 바로 블록 다운로드를 표시하고, 완료 시 블록 타임라인을 출력합니다.
+- 캐시 워밍업 시 tqdm 프로그레스 바로 블록 다운로드를 표시하고, 완료 시 한 줄 `■/□` 블록 타임라인을 출력합니다.
 - 동일한 `seed`는 같은 uniform exact-k 블록 선택을 유지하며, 학습 배치 순서는 `seed + epoch_index`로 epoch마다 변경됩니다.
 - 완료된 캐시는 자동 삭제되지 않습니다. 디스크 공간 회수를 위해 캐시 디렉토리에서 직접 삭제하세요.
 - `Trainer.step()`은 학습 중 배치 단위 tqdm으로 running-average loss와 메트릭을 표시합니다.

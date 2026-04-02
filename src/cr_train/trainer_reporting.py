@@ -5,6 +5,8 @@ from typing import Any
 
 import torch
 
+from .data.constants import WARMUP_TIMELINE_WIDTH
+
 PRINTED_STARTUP_STAGES: dict[str, set[str]] = {
     "warm split cache": {"done"},
 }
@@ -29,6 +31,23 @@ def should_print_startup(record: dict[str, Any]) -> bool:
     return status == "error" or status in PRINTED_STARTUP_STAGES.get(stage, set())
 
 
+def _compact_timeline(timeline: str, *, max_chars: int = WARMUP_TIMELINE_WIDTH) -> str:
+    if len(timeline) <= max_chars:
+        return timeline
+    if max_chars <= 1:
+        return timeline[:max_chars]
+    head_chars = max(1, (max_chars - 1) // 2)
+    tail_chars = max(1, max_chars - head_chars - 1)
+    return f"{timeline[:head_chars]}…{timeline[-tail_chars:]}"
+
+
+def _format_warmup_timeline(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    timeline = str(value).translate(str.maketrans({"█": "■", "░": "□"}))
+    return _compact_timeline(timeline)
+
+
 def format_cache_summary(event: dict[str, Any]) -> str:
     split = str(event.get("split", "unknown"))
     selected_block_count = int(event.get("selected_block_count", 0))
@@ -40,9 +59,12 @@ def format_cache_summary(event: dict[str, Any]) -> str:
         summary = f"{prefix} | cache-hit | selected: {selected_block_count}, fill: 0/0"
     else:
         summary = f"{prefix} | warm | selected: {selected_block_count}, fill: {resolved_blocks}/{selected_missing_blocks}"
-    if elapsed_sec is None:
-        return summary
-    return f"{summary} | {float(elapsed_sec):.1f}s"
+    if elapsed_sec is not None:
+        summary = f"{summary} | {float(elapsed_sec):.1f}s"
+    timeline = _format_warmup_timeline(event.get("timeline"))
+    if timeline is not None:
+        summary = f"{summary} | {timeline}"
+    return summary
 
 
 def format_startup_message(event: dict[str, Any]) -> str:

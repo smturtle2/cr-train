@@ -11,6 +11,7 @@ import torch
 from cr_train import Trainer
 from cr_train.data import BLOCK_SIZE
 from cr_train.data.store import resolve_block_cache_paths
+from cr_train.trainer_reporting import format_cache_summary
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -200,6 +201,25 @@ def test_top_level_package_exports_trainer_as_primary_entry_point() -> None:
     assert namespace["Trainer"] is Trainer
 
 
+def test_format_cache_summary_compacts_square_timeline_on_one_line() -> None:
+    summary = format_cache_summary(
+        {
+            "split": "train",
+            "selected_block_count": 20,
+            "selected_missing_blocks": 3,
+            "resolved_blocks": 3,
+            "elapsed_sec": 1.25,
+            "timeline": ("█░" * 20),
+        }
+    )
+
+    assert "\n" not in summary
+    assert "1.2s" in summary
+    assert "■□" in summary
+    assert "█" not in summary and "░" not in summary
+    assert "…" in summary
+
+
 def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -295,6 +315,10 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert any("cr-train" in message for message in FakeTqdm.writes)
     assert any("Epoch 1/" in message for message in FakeTqdm.writes)
     assert any("Test" in message for message in FakeTqdm.writes)
+    warmup_messages = [message for message in FakeTqdm.writes if message.startswith("cache ")]
+    assert len(warmup_messages) == 3
+    assert all("\n" not in message for message in warmup_messages)
+    assert all(("■" in message or "□" in message) for message in warmup_messages)
     assert all("█" not in message and "░" not in message for message in FakeTqdm.writes)
 
     assert len(warmup_bars) == 3

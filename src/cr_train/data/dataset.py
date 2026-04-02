@@ -213,13 +213,16 @@ def _as_shape(value: Any) -> tuple[int, int, int]:
 
 
 def _decode_image(buffer: Any, shape: Any, *, dtype: np.dtype[Any], expected_channels: int) -> np.ndarray:
-    raw = np.frombuffer(as_bytes(buffer), dtype=dtype)
-    resolved_shape = _as_shape(shape)
-    expected_size = math.prod(resolved_shape)
-    if raw.size != expected_size:
-        raise ValueError(f"buffer size mismatch for shape {resolved_shape}: expected {expected_size}, got {raw.size}")
+    if isinstance(buffer, np.ndarray):
+        image = np.asarray(buffer)
+    else:
+        resolved_shape = _as_shape(shape)
+        raw = np.frombuffer(as_bytes(buffer), dtype=dtype)
+        expected_size = math.prod(resolved_shape)
+        if raw.size != expected_size:
+            raise ValueError(f"buffer size mismatch for shape {resolved_shape}: expected {expected_size}, got {raw.size}")
+        image = raw.reshape(resolved_shape)
 
-    image = raw.reshape(resolved_shape)
     if image.shape[-1] == expected_channels and image.shape[0] != expected_channels:
         chw = np.transpose(image, (2, 0, 1))
     elif image.shape[0] == expected_channels:
@@ -304,6 +307,19 @@ def _decode_image_into(
     clamp_max: float | None = None,
     scale: float = 1.0,
 ) -> None:
+    if isinstance(buffer, np.ndarray):
+        image = np.asarray(buffer)
+        if image.shape[-1] == expected_channels and image.shape[0] != expected_channels:
+            image = np.transpose(image, (2, 0, 1))
+        elif image.shape[0] != expected_channels:
+            raise ValueError(f"could not infer channel dimension from shape {image.shape!r}")
+        np.copyto(dest.numpy(), image, casting="unsafe")
+        if clamp_min is not None or clamp_max is not None:
+            dest.clamp_(clamp_min, clamp_max)
+        if scale != 1.0:
+            dest.mul_(scale)
+        return
+
     raw = torch.frombuffer(_as_writable_buffer(buffer), dtype=src_dtype)
     resolved_shape = _as_shape(shape)
     expected_size = math.prod(resolved_shape)
