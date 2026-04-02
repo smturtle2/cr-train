@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import torch
 from cr_train import Trainer
 from cr_train.data import BLOCK_SIZE
 from cr_train.data.store import resolve_block_cache_paths
-from cr_train.trainer_reporting import format_cache_summary
+from cr_train.trainer_reporting import format_cache_summary, format_epoch_summary
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -220,6 +221,28 @@ def test_format_cache_summary_compacts_square_timeline_on_one_line() -> None:
     assert "…" in summary
 
 
+def test_format_epoch_summary_prefers_elapsed_time_over_throughput() -> None:
+    summary = format_epoch_summary(
+        {
+            "epoch": 1,
+            "train": {
+                "loss": 0.0423,
+                "metrics": {"mae": 0.0312},
+                "samples_per_sec": 142.3,
+            },
+            "val": {
+                "loss": 0.0391,
+                "metrics": {"mae": 0.0298},
+            },
+            "elapsed_sec": 12.34,
+        },
+        epochs=2,
+    )
+
+    assert "12.3s" in summary
+    assert "samples/s" not in summary
+
+
 def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -278,6 +301,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     ]
     startup_records = [record for record in metrics_records if record["kind"] == "startup"]
     startup_stages = [record["stage"] for record in startup_records]
+    checkpoint_record = next(record for record in metrics_records if record["kind"] == "checkpoint")
 
     batch_bars = [
         instance
@@ -292,6 +316,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     config_record = next(record for record in metrics_records if record["kind"] == "config")
 
     assert epoch_summary["epoch"] == 1
+    assert epoch_summary["elapsed_sec"] > 0.0
     assert epoch_summary["train"]["loss"] >= 0.0
     assert "mae" in epoch_summary["train"]["metrics"]
     assert epoch_summary["checkpoint_path"].endswith("epoch-0001.pt")
@@ -301,6 +326,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert "mae" in test_summary["metrics"]
     assert epoch_summary["train"]["num_batches"] == (2 * BLOCK_SIZE) // 8
     assert "batches_per_sec" in epoch_summary["train"]
+    assert checkpoint_record["elapsed_sec"] > 0.0
     assert "old-record" not in metrics_path.read_text(encoding="utf-8")
 
     assert "dataset_seed" not in config_record
@@ -315,6 +341,9 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert any("cr-train" in message for message in FakeTqdm.writes)
     assert any("Epoch 1/" in message for message in FakeTqdm.writes)
     assert any("Test" in message for message in FakeTqdm.writes)
+    epoch_message = next(message for message in FakeTqdm.writes if "Epoch 1/" in message)
+    assert "samples/s" not in epoch_message
+    assert re.search(r"\d+\.\d+s", epoch_message)
     warmup_messages = [message for message in FakeTqdm.writes if message.startswith("cache ")]
     assert len(warmup_messages) == 3
     assert all("\n" not in message for message in warmup_messages)
@@ -332,7 +361,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
 
     assert len(batch_bars) == 3
     assert any(any("loss" in values and "mae" in values for values in bar.postfixes) for bar in batch_bars)
-    assert any(any("batches/s" in values for values in bar.postfixes) for bar in batch_bars)
+    assert all(all("batches/s" not in values for values in bar.postfixes) for bar in batch_bars)
     assert all(all(value == 1 for value in bar.updates) for bar in batch_bars)
 
     warmup_done_records = [

@@ -155,7 +155,9 @@ def format_epoch_summary(result: dict[str, Any], *, epochs: int) -> str:
         val_parts.append(f"{name} {_fmt(value)}")
     parts.append(" ".join(val_parts))
 
-    if "samples_per_sec" in train:
+    if "elapsed_sec" in result:
+        parts.append(f"{_DIM}{float(result['elapsed_sec']):.1f}s{_RESET}")
+    elif "samples_per_sec" in train:
         speed = train["samples_per_sec"]
         parts.append(f"{_DIM}{speed:.1f} samples/s{_RESET}")
 

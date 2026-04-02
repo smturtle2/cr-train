@@ -67,10 +67,6 @@ def _format_metric(value: float) -> str:
     return f"{value:.2f}"
 
 
-def _format_rate(value: float, unit: str) -> str:
-    return f"{value:.1f} {unit}" if value < 100 else f"{value:.0f} {unit}"
-
-
 def _set_progress_postfix_str(progress: Any, text: str) -> None:
     if hasattr(progress, "set_postfix_str"):
         progress.set_postfix_str(text)
@@ -111,6 +107,7 @@ def update_progress_bar(
         reduce_sum=reduce_sum,
         distributed=distributed,
     )
+    del start_time, reduced_batches
     if getattr(progress, "disable", False):
         return
     progress.update(1)
@@ -119,10 +116,6 @@ def update_progress_bar(
         for key, value in reduced_sums.items()
         if reduced_examples > 0
     ]
-    if start_time is not None and reduced_batches > 0:
-        elapsed = max(time.perf_counter() - start_time, 1e-9)
-        speed = reduced_batches / elapsed
-        postfix_parts.append(_format_rate(speed, "batches/s"))
     _set_progress_postfix_str(progress, ", ".join(postfix_parts))
 
 

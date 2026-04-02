@@ -12,7 +12,7 @@ Usage:
       --output-dir runs/sen12mscr-example
 
 Output:
-    Each epoch prints a human-readable summary (loss, metrics, throughput)
+    Each epoch prints a human-readable summary (loss, metrics, elapsed time)
     and writes structured JSON to stdout for pipeline consumption.
     Checkpoints are saved to <output-dir>/epoch-NNNN.pt.
 """

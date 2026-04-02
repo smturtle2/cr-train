@@ -124,6 +124,7 @@ class Trainer:
                 f"all epochs are already consumed ({self.current_epoch}/{self.epochs})"
             )
 
+        step_started_at = time.perf_counter()
         epoch_index = self.current_epoch
         self._seed_epoch(epoch_index)
         self._write_config_once()
@@ -155,12 +156,14 @@ class Trainer:
             )
 
         checkpoint_path = self._save_checkpoint(epoch_index + 1)
+        elapsed_sec = time.perf_counter() - step_started_at
         if is_primary():
             self._write_record(
                 {
                     "kind": "checkpoint",
                     "epoch": epoch_index + 1,
                     "path": checkpoint_path,
+                    "elapsed_sec": elapsed_sec,
                 }
             )
 
@@ -170,6 +173,7 @@ class Trainer:
             "train": train_summary,
             "val": validation_summary,
             "checkpoint_path": str(checkpoint_path),
+            "elapsed_sec": elapsed_sec,
         }
         if is_primary():
             tqdm.write(format_epoch_summary(result, epochs=self.epochs))

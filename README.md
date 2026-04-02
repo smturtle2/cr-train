@@ -104,10 +104,10 @@ print(trainer.test())
 train  ░░░░░…░░█░…░░░█░…  32 blocks (2 048 rows)
 val    ░░░░░░░░░░░█░░░░░…   4 blocks (  244 rows)
 
-Epoch 1/2 ━━━━━━━━━━━━━━━━━━━━ 512/512  loss=0.0423  mae=0.0312
+Epoch 1/2 ━━━━━━━━━━━━━━━━━━━━ 512/512  loss=0.0423  mae=0.0312  12.3s
   val  loss=0.0391  mae=0.0298  ckpt=runs/sen12mscr/epoch-0001.pt
 
-Epoch 2/2 ━━━━━━━━━━━━━━━━━━━━ 512/512  loss=0.0387  mae=0.0295
+Epoch 2/2 ━━━━━━━━━━━━━━━━━━━━ 512/512  loss=0.0387  mae=0.0295  11.8s
   val  loss=0.0372  mae=0.0281  ckpt=runs/sen12mscr/epoch-0002.pt
 
 Test  loss=0.0387  mae=0.0295  (256 samples)
@@ -158,7 +158,7 @@ Most users only need `from cr_train import Trainer`. Once you construct it, `Tra
 - warms only the splits needed for the current call
 - builds iterable dataloaders and rank-aware block partitioning
 - writes `metrics.jsonl` and `epoch-NNNN.pt` checkpoints
-- shows running-average loss and metrics with batch-level tqdm during training
+- shows running-average loss and metrics with batch-level tqdm during training, then prints elapsed time at epoch end
 - saves checkpoints as `epoch-NNNN.pt` containing `model`, `optimizer`, `epoch`, and `global_step` state dicts
 - appends metrics to `metrics.jsonl` in the output directory (one JSON object per line)
 
@@ -207,6 +207,7 @@ Runs one training epoch + validation + checkpoint. Returns:
         "num_batches": 64,
     },
     "checkpoint_path": "runs/sen12mscr/epoch-0001.pt",
+    "elapsed_sec": 12.3,
 }
 ```
 
