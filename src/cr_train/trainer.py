@@ -224,7 +224,7 @@ class Trainer:
         return torch.device("cpu")
 
     def _seed_epoch(self, epoch_index: int) -> None:
-        seed_everything(self.seed + epoch_index, deterministic=True)
+        seed_everything(self.seed + epoch_index)
 
     def _ensure_output_dir(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)

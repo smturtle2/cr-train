@@ -52,17 +52,13 @@ def resolve_num_workers(num_workers: int | str) -> int:
     return min(4, max(1, cpu_count // 4))
 
 
-def seed_everything(seed: int, deterministic: bool) -> None:
-    """Seed every RNG used by the training stack."""
+def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    if deterministic:
-        torch.use_deterministic_algorithms(True)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
 
 def seed_worker(_worker_id: int) -> None:
