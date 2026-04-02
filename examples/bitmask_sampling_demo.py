@@ -99,7 +99,6 @@ def main() -> None:
         seed=args.seed,
     )
 
-    # --- Configuration ---
     print("=" * 60)
     print("  Block Selection Bitmask Demo")
     print("=" * 60)
@@ -112,37 +111,27 @@ def main() -> None:
     print(f"  total_blocks        = {result['total_blocks']}")
     print(f"  required_blocks     = {result['required_blocks']}")
     print(f"  planner_mode        = {result['planner_mode']}")
-    print()
 
-    # --- Selection trace ---
-    print("-" * 60)
-    print("  Uniform exact-k draw")
-    print("-" * 60)
+    print()
+    print("--- Uniform exact-k draw ---")
     print()
     print(f"  draw_order          = {result['draw_order_summary']}")
     print(f"  selected_blocks     = {result['selected_blocks_summary']}")
-    print()
 
-    # --- Selection bitmap ---
-    print("-" * 60)
-    print("  Selection bitmap (first N blocks)")
-    print("  ■ = selected    □ = skipped")
-    print("-" * 60)
+    print()
+    print("--- Selection bitmap  (■ selected, □ skipped) ---")
     print()
     bitmap_width = min(int(result["total_blocks"]), 80)
     bitmap = _render_bitmask(result["selected_bitmap"], width=int(result["total_blocks"]))
     print(f"  {_compact_text(bitmap, max_chars=bitmap_width)}")
-    print()
 
-    # --- Summary statistics ---
     selected = list(result["selected_blocks"])
     required = int(result["required_blocks"])
     total = int(result["total_blocks"])
     span = (max(selected) - min(selected) + 1) if selected else 0
 
-    print("-" * 60)
-    print("  Summary")
-    print("-" * 60)
+    print()
+    print("--- Summary ---")
     print()
     print(f"  selected_blocks     = {len(selected)} / {required} required")
     print(f"  total_blocks        = {total}")

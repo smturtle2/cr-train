@@ -1,18 +1,36 @@
 <h1 align="center">cr-train</h1>
 
 <p align="center">
-  <em>HuggingFace-backed training module for satellite cloud removal on SEN12MS-CR</em>
+  <em>One-class training toolkit for satellite cloud removal -- deterministic sampling, smart caching, and DDP out of the box.</em>
 </p>
 
 <p align="center">
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue?logo=python&logoColor=white" alt="Python 3.12+"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.4%2B-ee4c2c?logo=pytorch&logoColor=white" alt="PyTorch 2.4+"></a>
   <a href="https://huggingface.co/datasets/Hermanni/sen12mscr"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Hermanni%2Fsen12mscr-yellow" alt="Dataset"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
 </p>
 
 <p align="center">
   <b>English</b> | <a href="README.ko.md">한국어</a>
 </p>
+
+---
+
+<details>
+<summary><b>Table of Contents</b></summary>
+
+- [Highlights](#highlights)
+- [Quick Start](#quick-start)
+- [Examples](#examples)
+- [What Trainer Handles](#what-trainer-handles)
+- [API Reference](#api-reference)
+- [Architecture](#architecture)
+- [Distributed Training](#distributed-training)
+- [Model Contract](#model-contract)
+- [License](#license)
+
+</details>
 
 ---
 
@@ -79,6 +97,24 @@ for _ in range(trainer.epochs):
 print(trainer.test())
 ```
 
+<details>
+<summary><b>Expected output</b></summary>
+
+```
+train  ░░░░░…░░█░…░░░█░…  32 blocks (2 048 rows)
+val    ░░░░░░░░░░░█░░░░░…   4 blocks (  244 rows)
+
+Epoch 1/2 ━━━━━━━━━━━━━━━━━━━━ 512/512  loss=0.0423  mae=0.0312
+  val  loss=0.0391  mae=0.0298  ckpt=runs/sen12mscr/epoch-0001.pt
+
+Epoch 2/2 ━━━━━━━━━━━━━━━━━━━━ 512/512  loss=0.0387  mae=0.0295
+  val  loss=0.0372  mae=0.0281  ckpt=runs/sen12mscr/epoch-0002.pt
+
+Test  loss=0.0387  mae=0.0295  (256 samples)
+```
+
+</details>
+
 ---
 
 ## Examples
@@ -122,18 +158,11 @@ Most users only need `from cr_train import Trainer`. Once you construct it, `Tra
 - warms only the splits needed for the current call
 - builds iterable dataloaders and rank-aware block partitioning
 - writes `metrics.jsonl` and `epoch-NNNN.pt` checkpoints
+- shows running-average loss and metrics with batch-level tqdm during training
+- saves checkpoints as `epoch-NNNN.pt` containing `model`, `optimizer`, `epoch`, and `global_step` state dicts
+- appends metrics to `metrics.jsonl` in the output directory (one JSON object per line)
 
 You do not need any cache or dataloader setup code for the normal training flow.
-
----
-
-## Advanced Sampling Tools
-
-If you want to inspect the deterministic uniform exact-k block planner directly, the supported advanced surface stays under `cr_train.data`:
-
-```python
-from cr_train.data import BLOCK_SIZE, trace_plan_sample
-```
 
 ---
 
@@ -195,13 +224,27 @@ Runs test evaluation with the current model state. Returns:
 }
 ```
 
+### Advanced: block planner inspection
+
+To inspect the deterministic uniform exact-k block planner directly, use the low-level surface under `cr_train.data`:
+
+```python
+from cr_train.data import BLOCK_SIZE, trace_plan_sample
+```
+
+See [`examples/bitmask_sampling_demo.py`](examples/bitmask_sampling_demo.py) for a full visualization.
+
 ---
 
-## Under the Hood
+## Architecture
 
 `Trainer` reads the dataset through HuggingFace streaming, keeps a reusable local block cache keyed by row group, and records startup events in `metrics.jsonl`. The same `seed` preserves uniform exact-k logical block membership across runs, while training block and row order still change by epoch through `seed + epoch_index`.
 
 During warmup, `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing blocks are fetched from HuggingFace only when the selected row-group blocks are not already cached locally.
+
+- Cache warmup shows a tqdm progress bar during block download and prints a one-line `■/□` block timeline on completion.
+- Equal `seed` values keep the same uniform exact-k block-selection membership; train batch order still changes by epoch via `seed + epoch_index`.
+- Finished caches are never auto-deleted. Remove them manually from the cache directory to reclaim disk space.
 
 ---
 
@@ -251,17 +294,6 @@ def my_loss(prediction, batch):
 
 ---
 
-## Notes
-
-- Cache warmup shows a tqdm progress bar during block download and prints a one-line `■/□` block timeline on completion.
-- Equal `seed` values keep the same uniform exact-k block-selection membership; train batch order still changes by epoch via `seed + epoch_index`.
-- Finished caches are never auto-deleted. Remove them manually from the cache directory to reclaim disk space.
-- `Trainer.step()` shows running-average loss and metrics with batch-level tqdm during training.
-- Checkpoints are saved as `epoch-NNNN.pt` containing `model`, `optimizer`, `epoch`, and `global_step` state dicts.
-- Metrics are appended to `metrics.jsonl` in the output directory (one JSON object per line).
-
----
-
 ## License
 
-This project is currently unlicensed. Please add a `LICENSE` file to specify your terms.
+[MIT](LICENSE)

@@ -28,9 +28,7 @@ from torch.nn import functional as F
 from cr_train import Trainer
 
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
+# --- Model ---
 
 class FusionBaseline(nn.Module):
     """Small baseline CNN for SAR + cloudy optical -> target optical regression.
@@ -57,9 +55,7 @@ class FusionBaseline(nn.Module):
         return self.head(self.stem(torch.cat([sar, cloudy], dim=1)))
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+# --- Argument parsing ---
 
 def parse_max_samples(value: str) -> int | None:
     lowered = value.strip().lower()
@@ -111,9 +107,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Loss and metrics
-# ---------------------------------------------------------------------------
+# --- Loss and metrics ---
 
 def resolve_device(device_name: str | None) -> torch.device:
     if device_name is not None:
@@ -131,9 +125,7 @@ def mean_absolute_error(prediction: torch.Tensor, batch: dict[str, torch.Tensor]
     return torch.mean(torch.abs(prediction - batch["target"]))
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# --- Main ---
 
 def main() -> None:
     args = parse_args()
