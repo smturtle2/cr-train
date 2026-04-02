@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
-import urllib.parse
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
-import pyarrow.parquet as pq
+from datasets import load_dataset, load_dataset_builder
+from datasets.download.download_config import DownloadConfig
+from datasets.iterable_dataset import IterableDataset
+from datasets.packaged_modules.parquet.parquet import Key, ds as parquet_ds, logger as parquet_logger, pa, pq
+from datasets.utils.file_utils import xopen
 
-from .constants import CACHE_LAYOUT_VERSION, CATALOG_METADATA_WORKERS, DATASETS_SERVER_BASE, StartupCallback
-from .store import read_json, write_json_atomic
+from .constants import BLOCK_SIZE, CACHE_LAYOUT_VERSION, DATA_COLUMNS, HF_DATASETS_VERSION, StartupCallback
+from .store import freeze_row, read_json, write_json_atomic
 
 
 def emit_startup_event(startup_callback: StartupCallback | None, **event: Any) -> None:
@@ -27,7 +32,7 @@ def run_startup_stage(
     operation,
     **fields: Any,
 ):
-    """operation 실행을 startup 이벤트(start/done/error)와 타이밍으로 감싸는 래퍼."""
+    """Wrap an operation in startup lifecycle events."""
     import time
 
     emit_startup_event(startup_callback, stage=stage, split=split, status="start", **fields)
@@ -83,104 +88,59 @@ def resolve_source_metadata_path(source_root: Path) -> Path:
     return source_root / "source.json"
 
 
-def request_json(url: str) -> dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=30) as response:
-        payload = json.load(response)
-    if not isinstance(payload, dict):
-        raise ValueError(f"unexpected JSON payload from {url}")
-    return payload
+@dataclass(frozen=True, slots=True)
+class BlockDescriptor:
+    index: int
+    shard_index: int
+    cache_key: str
+    source_file: str
+    row_groups: tuple[int, ...]
 
-
-def datasets_server_url(endpoint: str, *, dataset_name: str, revision: str | None) -> str:
-    query = {"dataset": dataset_name}
-    if revision is not None:
-        query["revision"] = revision
-    return f"{DATASETS_SERVER_BASE}/{endpoint}?{urllib.parse.urlencode(query)}"
-
-
-def normalize_parquet_uri(url: str) -> str:
-    if url.startswith("hf://"):
-        return url
-
-    parsed = urllib.parse.urlparse(url)
-    path_parts = [part for part in parsed.path.split("/") if part]
-    try:
-        datasets_index = path_parts.index("datasets")
-        resolve_index = path_parts.index("resolve")
-    except ValueError:
-        return url
-
-    if resolve_index - datasets_index != 3:
-        return url
-
-    repo_id = "/".join(path_parts[datasets_index + 1:resolve_index])
-    revision = urllib.parse.unquote(path_parts[resolve_index + 1])
-    file_path = "/".join(path_parts[resolve_index + 2:])
-    if not repo_id or not revision or not file_path:
-        return url
-    return f"hf://datasets/{repo_id}@{revision}/{file_path}"
-
-
-def normalize_split_sizes(info_payload: dict[str, Any]) -> dict[str, int]:
-    dataset_info = info_payload.get("dataset_info")
-    if not isinstance(dataset_info, dict):
-        raise ValueError("dataset_info payload is missing")
-    default_config = dataset_info.get("default")
-    if not isinstance(default_config, dict):
-        raise ValueError("default config payload is missing")
-    splits = default_config.get("splits")
-    if not isinstance(splits, dict):
-        raise ValueError("split payload is missing")
-    return {
-        str(split): int(split_info["num_examples"])
-        for split, split_info in splits.items()
-        if isinstance(split_info, dict)
-    }
-
-
-def normalize_parquet_files(parquet_payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    parquet_files = parquet_payload.get("parquet_files")
-    if not isinstance(parquet_files, list):
-        raise ValueError("parquet_files payload is missing")
-
-    normalized: dict[str, list[dict[str, Any]]] = {}
-    for entry in parquet_files:
-        if not isinstance(entry, dict):
-            continue
-        split = str(entry["split"])
-        normalized.setdefault(split, []).append(
-            {
-                "url": normalize_parquet_uri(str(entry["url"])),
-                "filename": str(entry["filename"]),
-                "config": str(entry.get("config", "default")),
-            }
-        )
-
-    for files in normalized.values():
-        files.sort(key=lambda item: item["filename"])
-    return normalized
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "shard_index": self.shard_index,
+            "cache_key": self.cache_key,
+            "source_file": self.source_file,
+            "row_groups": list(self.row_groups),
+        }
 
 
 _source_descriptor_cache: dict[tuple[str, str | None], dict[str, Any]] = {}
+_stream_template_cache: dict[tuple[str, str | None, str], IterableDataset] = {}
+_PATCHED_GENERATE_TABLES_SENTINEL = "__cr_train_patched_generate_tables__"
+
+
+def _installed_datasets_version() -> str:
+    return importlib.metadata.version("datasets")
+
+
+def ensure_supported_datasets_version() -> None:
+    installed = _installed_datasets_version()
+    if installed != HF_DATASETS_VERSION:
+        raise RuntimeError(
+            "cr-train requires datasets=="
+            f"{HF_DATASETS_VERSION} for the HF row-group streaming adapter, found {installed}"
+        )
 
 
 def load_source_descriptor(dataset_name: str, revision: str | None) -> dict[str, Any]:
+    ensure_supported_datasets_version()
     cache_key = (dataset_name, revision)
-    if cache_key in _source_descriptor_cache:
-        return _source_descriptor_cache[cache_key]
-    info_payload = request_json(datasets_server_url("info", dataset_name=dataset_name, revision=revision))
-    parquet_payload = request_json(datasets_server_url("parquet", dataset_name=dataset_name, revision=revision))
-    split_sizes = normalize_split_sizes(info_payload)
-    parquet_files_by_split = normalize_parquet_files(parquet_payload)
+    cached = _source_descriptor_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    builder = load_dataset_builder(dataset_name, revision=revision)
+    split_sizes = {
+        str(split_name): int(split_info.num_examples)
+        for split_name, split_info in builder.info.splits.items()
+    }
     signature_payload = {
         "cache_layout_version": CACHE_LAYOUT_VERSION,
         "dataset_name": dataset_name,
         "revision": revision,
         "split_sizes": split_sizes,
-        "split_urls": {
-            split: [entry["url"] for entry in parquet_files_by_split.get(split, [])]
-            for split in sorted(split_sizes)
-        },
     }
     source_signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
     descriptor = {
@@ -188,7 +148,6 @@ def load_source_descriptor(dataset_name: str, revision: str | None) -> dict[str,
         "revision": revision,
         "source_signature": source_signature,
         "split_sizes": split_sizes,
-        "parquet_files_by_split": parquet_files_by_split,
     }
     _source_descriptor_cache[cache_key] = descriptor
     return descriptor
@@ -212,11 +171,7 @@ def _find_cached_source(
             metadata = read_json(metadata_path)
         except Exception:
             continue
-        if (
-            metadata.get("dataset_name") == dataset_name
-            and metadata.get("revision") == revision
-            and "parquet_files_by_split" in metadata
-        ):
+        if metadata.get("dataset_name") == dataset_name and metadata.get("revision") == revision:
             return entry, metadata
     return None
 
@@ -227,7 +182,6 @@ def ensure_source_root(
     revision: str | None,
     cache_root: Path,
 ) -> tuple[Path, dict[str, Any]]:
-    """소스 메타데이터가 로컬에 캐시되었는지 확인. 없으면 HF에서 가져와 저장."""
     cached = _find_cached_source(cache_root, dataset_name, revision)
     try:
         descriptor = load_source_descriptor(dataset_name, revision)
@@ -245,10 +199,7 @@ def ensure_source_root(
         **descriptor,
     }
     if not metadata_path.exists():
-        write_json_atomic(
-            metadata_path,
-            payload,
-        )
+        write_json_atomic(metadata_path, payload)
     else:
         try:
             existing = read_json(metadata_path)
@@ -259,65 +210,201 @@ def ensure_source_root(
     return source_root, descriptor
 
 
-def read_parquet_shard_metadata(entry: dict[str, Any]) -> dict[str, Any]:
-    parquet_file = pq.ParquetFile(str(entry["url"]))
-    metadata = parquet_file.metadata
-    return {
-        "url": str(entry["url"]),
-        "filename": str(entry["filename"]),
-        "row_count": int(metadata.num_rows),
-        "row_group_rows": [
-            int(metadata.row_group(index).num_rows)
-            for index in range(metadata.num_row_groups)
-        ],
+def _clone_iterable_dataset(dataset: IterableDataset, kwargs: dict[str, Any]) -> IterableDataset:
+    ex_iterable = dataset._ex_iterable
+    cloned = type(ex_iterable)(
+        ex_iterable.generate_tables_fn,
+        kwargs,
+        ex_iterable.generate_more_kwargs_fn,
+    )
+    info = dataset._info.copy() if hasattr(dataset._info, "copy") else dataset._info
+    return IterableDataset(
+        ex_iterable=cloned,
+        info=info,
+        split=dataset._split,
+        formatting=getattr(dataset, "_formatting", None),
+        distributed=getattr(dataset, "_distributed", None),
+        token_per_repo_id=getattr(dataset, "_token_per_repo_id", None),
+    )
+
+
+def _patch_parquet_generate_tables_fn(dataset: IterableDataset) -> None:
+    ex_iterable = getattr(dataset, "_ex_iterable", None)
+    generate_tables_fn = getattr(ex_iterable, "generate_tables_fn", None)
+    builder = getattr(generate_tables_fn, "__self__", None)
+    generate_tables_func = getattr(generate_tables_fn, "__func__", generate_tables_fn)
+    if generate_tables_fn is None or builder is None:
+        raise RuntimeError("unexpected HF parquet iterable layout: missing generate_tables_fn")
+    if getattr(generate_tables_func, _PATCHED_GENERATE_TABLES_SENTINEL, False):
+        return
+
+    def generate_tables_wrapper(self, files, row_groups_list):
+        if self.config.features is not None and self.config.columns is not None:
+            if sorted(field.name for field in self.info.features.arrow_schema) != sorted(self.config.columns):
+                raise ValueError(
+                    f"Tried to load parquet data with columns '{self.config.columns}' with mismatching features '{self.info.features}'"
+                )
+        filter_expr = (
+            pq.filters_to_expression(self.config.filters)
+            if isinstance(self.config.filters, list)
+            else self.config.filters
+        )
+        parquet_file_format = parquet_ds.ParquetFileFormat(
+            default_fragment_scan_options=self.config.fragment_scan_options
+        )
+        download_config = DownloadConfig(
+            token=getattr(self, "token", None),
+            storage_options=dict(getattr(self, "storage_options", {}) or {}),
+        )
+        for file_idx, (file, row_groups) in enumerate(zip(files, row_groups_list)):
+            try:
+                with xopen(file, "rb", download_config=download_config) as f:
+                    parquet_fragment = parquet_file_format.make_fragment(f)
+                    if row_groups is not None:
+                        parquet_fragment = parquet_fragment.subset(row_group_ids=row_groups)
+                    if parquet_fragment.row_groups:
+                        batch_size = self.config.batch_size or parquet_fragment.row_groups[0].num_rows
+                        for batch_idx, record_batch in enumerate(
+                            parquet_fragment.to_batches(
+                                batch_size=batch_size,
+                                columns=self.config.columns,
+                                filter=filter_expr,
+                                batch_readahead=0,
+                                fragment_readahead=0,
+                            )
+                        ):
+                            pa_table = pa.Table.from_batches([record_batch])
+                            yield Key(file_idx, batch_idx), self._cast_table(pa_table)
+            except (pa.ArrowInvalid, ValueError) as e:
+                if self.config.on_bad_files == "error":
+                    parquet_logger.error(f"Failed to read file '{file}' with error {type(e).__name__}: {e}")
+                    raise
+                if self.config.on_bad_files == "warn":
+                    parquet_logger.warning(f"Skipping bad file '{file}'. {type(e).__name__}: {e}`")
+                else:
+                    parquet_logger.debug(f"Skipping bad file '{file}'. {type(e).__name__}: {e}`")
+
+    generate_tables_wrapper.__name__ = getattr(generate_tables_func, "__name__", "generate_tables_wrapper")
+    generate_tables_wrapper.__qualname__ = getattr(
+        generate_tables_func,
+        "__qualname__",
+        generate_tables_wrapper.__qualname__,
+    )
+    setattr(generate_tables_wrapper, _PATCHED_GENERATE_TABLES_SENTINEL, True)
+    ex_iterable.generate_tables_fn = MethodType(generate_tables_wrapper, builder)
+
+
+def _prepare_row_group_stream(dataset: IterableDataset) -> IterableDataset:
+    _patch_parquet_generate_tables_fn(dataset)
+    ex_iterable = getattr(dataset, "_ex_iterable", None)
+    kwargs = dict(getattr(ex_iterable, "kwargs", {}))
+    if not kwargs or "files" not in kwargs or "row_groups_list" not in kwargs:
+        raise RuntimeError("unexpected HF iterable layout: missing parquet kwargs")
+
+    row_groups_list = kwargs["row_groups_list"]
+    if row_groups_list is None:
+        return dataset.reshard()
+
+    if not isinstance(row_groups_list, list) or not all(item is None for item in row_groups_list):
+        return dataset.reshard()
+
+    base_num_shards = int(dataset.num_shards)
+    cloned_kwargs = dict(kwargs)
+    cloned_kwargs["row_groups_list"] = None
+    row_group_dataset = _clone_iterable_dataset(dataset, cloned_kwargs)
+    resharded = row_group_dataset.reshard()
+    if int(resharded.num_shards) <= base_num_shards:
+        raise RuntimeError("HF parquet reshard did not expose row-group shards for this dataset")
+    return resharded
+
+
+def load_row_group_stream(
+    *,
+    dataset_name: str,
+    revision: str | None,
+    split: str,
+) -> IterableDataset:
+    ensure_supported_datasets_version()
+    cache_key = (dataset_name, revision, split)
+    cached = _stream_template_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    stream = load_dataset(
+        dataset_name,
+        revision=revision,
+        split=split,
+        streaming=True,
+        columns=DATA_COLUMNS,
+    )
+    row_group_stream = _prepare_row_group_stream(stream)
+    _stream_template_cache[cache_key] = row_group_stream
+    return row_group_stream
+
+
+def _build_block_descriptor(
+    *,
+    dataset_name: str,
+    revision: str | None,
+    split: str,
+    index: int,
+    shard_index: int,
+    source_file: str,
+    row_groups: tuple[int, ...],
+) -> BlockDescriptor:
+    payload = {
+        "dataset_name": dataset_name,
+        "revision": revision,
+        "split": split,
+        "source_file": source_file,
+        "row_groups": list(row_groups),
     }
+    cache_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:32]
+    return BlockDescriptor(
+        index=index,
+        shard_index=shard_index,
+        cache_key=cache_key,
+        source_file=source_file,
+        row_groups=row_groups,
+    )
 
 
 def build_catalog(
     *,
+    dataset_name: str,
+    revision: str | None,
     split: str,
     total_rows: int,
-    parquet_files: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if total_rows > 0 and not parquet_files:
-        raise ValueError(f"missing parquet files for split {split}")
+    stream = load_row_group_stream(dataset_name=dataset_name, revision=revision, split=split)
+    ex_iterable = stream._ex_iterable
+    kwargs = dict(getattr(ex_iterable, "kwargs", {}))
+    files = list(kwargs.get("files", []))
+    row_groups_list = kwargs.get("row_groups_list")
+    if row_groups_list is None or len(files) != len(row_groups_list):
+        raise RuntimeError("unexpected row-group iterable layout after reshard")
 
-    max_workers = min(CATALOG_METADATA_WORKERS, max(1, len(parquet_files)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        shard_metadata = list(executor.map(read_parquet_shard_metadata, parquet_files))
-
-    shards: list[dict[str, Any]] = []
-    current_start = 0
-    total_row_groups = 0
-    for shard_index, shard in enumerate(shard_metadata):
-        row_count = int(shard["row_count"])
-        row_group_rows = [int(value) for value in shard["row_group_rows"]]
-        current_stop = current_start + row_count
-        shards.append(
-            {
-                "index": shard_index,
-                "url": str(shard["url"]),
-                "filename": str(shard["filename"]),
-                "row_count": row_count,
-                "global_start": current_start,
-                "global_stop": current_stop,
-                "row_group_rows": row_group_rows,
-            }
+    blocks = []
+    for index, (source_file, row_groups) in enumerate(zip(files, row_groups_list, strict=True)):
+        if row_groups is None:
+            raise RuntimeError("unexpected unsplit parquet shard after row-group reshard")
+        block = _build_block_descriptor(
+            dataset_name=dataset_name,
+            revision=revision,
+            split=split,
+            index=index,
+            shard_index=index,
+            source_file=str(source_file),
+            row_groups=tuple(int(value) for value in row_groups),
         )
-        current_start = current_stop
-        total_row_groups += len(row_group_rows)
-
-    if current_start != total_rows:
-        raise ValueError(
-            f"catalog row count mismatch for split {split}: expected {total_rows}, got {current_start}"
-        )
+        blocks.append(block.to_payload())
 
     return {
         "cache_layout_version": CACHE_LAYOUT_VERSION,
         "split": split,
         "total_rows": total_rows,
-        "total_row_groups": total_row_groups,
-        "shards": shards,
+        "total_blocks": len(blocks),
+        "blocks": blocks,
     }
 
 
@@ -333,39 +420,90 @@ def ensure_split_catalog(
     split: str,
     startup_callback: StartupCallback | None,
 ) -> dict[str, Any]:
-    """split 카탈로그가 디스크에 존재하는지 확인. 없으면 parquet 메타데이터에서 빌드."""
     catalog_path = resolve_catalog_path(source_root, split)
-    if catalog_path.exists():
-        return read_json(catalog_path)
-
     split_sizes = descriptor["split_sizes"]
     if split not in split_sizes:
         raise KeyError(f"split {split!r} does not exist in source descriptor")
+    cached_catalog = read_json(catalog_path) if catalog_path.exists() else None
 
-    return run_startup_stage(
-        startup_callback,
-        stage="ensure catalog",
-        split=split,
-        operation=lambda: _write_and_reload_catalog(
-            catalog_path=catalog_path,
-            payload=build_catalog(
+    try:
+        payload = run_startup_stage(
+            startup_callback,
+            stage="ensure catalog",
+            split=split,
+            operation=lambda: build_catalog(
+                dataset_name=str(descriptor["dataset_name"]),
+                revision=descriptor.get("revision"),
                 split=split,
                 total_rows=int(split_sizes[split]),
-                parquet_files=list(descriptor["parquet_files_by_split"].get(split, [])),
             ),
-        ),
-        total_rows=int(split_sizes[split]),
+            total_rows=int(split_sizes[split]),
+        )
+    except Exception:
+        if cached_catalog is not None:
+            return cached_catalog
+        raise
+
+    if cached_catalog != payload:
+        return _write_and_reload_catalog(catalog_path=catalog_path, payload=payload)
+    return cached_catalog if cached_catalog is not None else payload
+
+
+def _block_error_context(block: dict[str, Any], *, shard_index: int) -> str:
+    return (
+        f"cache_key={block['cache_key']} "
+        f"shard_index={shard_index} "
+        f"source_file={block['source_file']} "
+        f"row_groups={list(block['row_groups'])}"
     )
 
 
+def load_block_rows(
+    *,
+    dataset_name: str,
+    revision: str | None,
+    split: str,
+    block: dict[str, Any],
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict[str, Any]]:
+    template = load_row_group_stream(dataset_name=dataset_name, revision=revision, split=split)
+    shard_index = int(block["shard_index"])
+    block_dataset = template.shard(
+        num_shards=int(template.num_shards),
+        index=shard_index,
+        contiguous=True,
+    )
+    raw_rows = list(block_dataset.take(BLOCK_SIZE + 1))
+    row_count = len(raw_rows)
+    block_context = _block_error_context(block, shard_index=shard_index)
+    if row_count <= 0:
+        raise RuntimeError(f"empty row-group shard: {block_context}")
+    if row_count > BLOCK_SIZE:
+        raise RuntimeError(
+            f"row-group shard exceeded BLOCK_SIZE={BLOCK_SIZE}: got {row_count}; {block_context}"
+        )
+
+    rows: list[dict[str, Any]] = []
+    for row_index, row in enumerate(raw_rows, start=1):
+        frozen = freeze_row(dict(row))
+        rows.append(frozen)
+        if progress_callback is not None:
+            downloaded_bytes = sum(
+                len(value)
+                for value in frozen.values()
+                if isinstance(value, (bytes, bytearray, memoryview))
+            )
+            progress_callback(row_index, downloaded_bytes)
+    return rows
+
+
 __all__ = [
-    "datasets_server_url",
+    "BlockDescriptor",
     "emit_startup_event",
     "ensure_source_root",
     "ensure_split_catalog",
-    "normalize_parquet_uri",
-    "pq",
-    "request_json",
+    "load_block_rows",
+    "load_row_group_stream",
     "resolve_catalog_path",
     "run_startup_stage",
 ]

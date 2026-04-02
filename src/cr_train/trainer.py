@@ -109,6 +109,7 @@ class Trainer:
         epoch_index = self.current_epoch
         self._seed_epoch(epoch_index)
         self._write_config_once()
+        self._ensure_training_startup_caches()
 
         train_summary = self._run_training_epoch(epoch_index)
         if is_primary():
@@ -278,6 +279,14 @@ class Trainer:
         )
         self._cache_ready.add(split)
 
+    def _ensure_training_startup_caches(self) -> None:
+        for split, max_samples in (
+            ("train", self.max_train_samples),
+            ("validation", self.max_val_samples),
+            ("test", self.max_test_samples),
+        ):
+            self._ensure_split_cache(split=split, max_samples=max_samples)
+
     def _build_loader(
         self,
         *,
@@ -293,6 +302,8 @@ class Trainer:
             revision=None,
             max_samples=max_samples,
             seed=self.seed,
+            epoch=epoch_index,
+            training=training,
             cache_root=self.cache_root,
             startup_callback=self._handle_startup_event,
         )
@@ -315,10 +326,24 @@ class Trainer:
             ),
             max_samples=max_samples,
         )
-        return loader, self._infer_total_batches(loader)
+        return loader, self._infer_total_batches(
+            num_examples=prepared.num_examples,
+            batch_size=self.batch_size,
+            training=training,
+        )
 
-    def _infer_total_batches(self, loader: Any) -> int | None:
-        return len(loader)
+    def _infer_total_batches(
+        self,
+        *,
+        num_examples: int,
+        batch_size: int,
+        training: bool,
+    ) -> int | None:
+        if num_examples <= 0:
+            return 0
+        if training and self.drop_last:
+            return num_examples // batch_size
+        return (num_examples + batch_size - 1) // batch_size
 
     def _run_training_epoch(self, epoch_index: int) -> dict[str, Any]:
         loader, total_batches = self._build_loader(

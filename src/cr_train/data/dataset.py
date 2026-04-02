@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import random
@@ -8,23 +9,22 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.ipc
 import torch
-from torch.utils.data import DataLoader, Dataset as TorchDataset, DistributedSampler
+from torch.utils.data import DataLoader, IterableDataset as TorchIterableDataset, get_worker_info
 
-from .constants import DATA_COLUMNS, OPTICAL_CHANNELS, SAR_CHANNELS
+from .constants import OPTICAL_CHANNELS, SAR_CHANNELS
 from .planning import plan_sample
-from .runtime import get_rank, get_world_size, is_distributed
+from .runtime import get_rank, get_world_size
 from .source import ensure_source_root, ensure_split_catalog, run_startup_stage
-from .store import as_bytes, load_or_init_row_cache, resolve_row_cache_paths
+from .store import as_bytes, block_is_cached, load_block, load_block_metadata, resolve_block_cache_paths
 
 
 @dataclass(slots=True)
 class PreparedSplit:
-    """DataLoader-ready split backed by the row-indexed local cache."""
+    """DataLoader-ready split backed by the block cache."""
 
-    dataset: TorchDataset[dict[str, Any]]
+    dataset: TorchIterableDataset[dict[str, Any]]
+    num_examples: int
 
 
 def resolve_num_workers(num_workers: int | str) -> int:
@@ -56,58 +56,87 @@ def seed_worker(_worker_id: int) -> None:
     np.random.seed(worker_seed)
 
 
-class CachedRowDataset(TorchDataset[dict[str, Any]]):
+def _derive_named_seed(seed: int, split: str, purpose: str) -> int:
+    digest = hashlib.sha256(f"{purpose}:{split}".encode("utf-8")).digest()
+    return int(seed) ^ int.from_bytes(digest[:8], "big")
+
+
+def _derive_block_seed(seed: int, *, split: str, epoch: int, cache_key: str) -> int:
+    digest = hashlib.sha256(f"{split}:{epoch}:{cache_key}".encode("utf-8")).digest()
+    return int(seed) ^ int.from_bytes(digest[:8], "big")
+
+
+def _shuffle_blocks(
+    blocks: list[dict[str, Any]],
+    *,
+    seed: int,
+    split: str,
+    epoch: int,
+) -> list[dict[str, Any]]:
+    if len(blocks) <= 1:
+        return list(blocks)
+    rng = np.random.default_rng(_derive_named_seed(seed + epoch, split, "epoch-block-order"))
+    order = rng.permutation(len(blocks))
+    return [blocks[int(index)] for index in order.tolist()]
+
+
+def _slice_blocks_for_rank(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    world_size = get_world_size()
+    if world_size <= 1:
+        return list(blocks)
+    rank = get_rank()
+    return [block for i, block in enumerate(blocks) if i % world_size == rank]
+
+
+def _count_block_rows(cache_paths, blocks: list[dict[str, Any]]) -> int:
+    total = 0
+    for block in blocks:
+        metadata = load_block_metadata(cache_paths, str(block["cache_key"]))
+        if metadata is None:
+            raise FileNotFoundError(f"cached block metadata is missing for {block['cache_key']}")
+        total += int(metadata.get("row_count", 0))
+    return total
+
+
+class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
     def __init__(
         self,
         *,
-        chunk_root: Path,
-        row_chunk_ids: np.ndarray,
-        row_offsets: np.ndarray,
+        cache_paths,
+        blocks: tuple[dict[str, Any], ...],
+        seed: int,
+        epoch: int,
+        split: str,
+        training: bool,
     ) -> None:
-        self.chunk_root = chunk_root
-        self.row_chunk_ids = row_chunk_ids
-        self.row_offsets = row_offsets
-        self._chunk_cache: dict[int, pa.Table] = {}
+        self.cache_paths = cache_paths
+        self.blocks = blocks
+        self.seed = seed
+        self.epoch = epoch
+        self.split = split
+        self.training = training
 
-    def __len__(self) -> int:
-        return int(self.row_offsets.size)
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        worker_count = worker_info.num_workers if worker_info is not None else 1
+        blocks = [block for index, block in enumerate(self.blocks) if index % worker_count == worker_id]
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        chunk_id = int(self.row_chunk_ids[index])
-        row_offset = int(self.row_offsets[index])
-        if chunk_id < 0 or row_offset < 0:
-            raise KeyError(f"cached row {index} is missing from the row cache")
-        table = self._load_chunk(chunk_id)
-        return {col: table.column(col)[row_offset].as_py() for col in DATA_COLUMNS}
+        for block in blocks:
+            cache_key = str(block["cache_key"])
+            rows = load_block(self.cache_paths, cache_key)
+            if self.training and len(rows) > 1:
+                indices = list(range(len(rows)))
+                rng = random.Random(_derive_block_seed(self.seed, split=self.split, epoch=self.epoch, cache_key=cache_key))
+                rng.shuffle(indices)
+                for index in indices:
+                    yield rows[index]
+                continue
+            yield from rows
 
-    def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
-        """Group indices by chunk so one Arrow take() serves each chunk."""
-        chunk_groups: dict[int, list[tuple[int, int]]] = {}
-        for pos, idx in enumerate(indices):
-            chunk_id = int(self.row_chunk_ids[idx])
-            row_offset = int(self.row_offsets[idx])
-            if chunk_id < 0 or row_offset < 0:
-                raise KeyError(f"cached row {idx} is missing from the row cache")
-            chunk_groups.setdefault(chunk_id, []).append((pos, row_offset))
 
-        results: list[dict[str, Any] | None] = [None] * len(indices)
-        for chunk_id, entries in chunk_groups.items():
-            table = self._load_chunk(chunk_id)
-            offsets = [offset for _, offset in entries]
-            batch = table.take(offsets)
-            cols = {col: batch.column(col).to_pylist() for col in DATA_COLUMNS}
-            for i, (pos, _) in enumerate(entries):
-                results[pos] = {col: cols[col][i] for col in DATA_COLUMNS}
-        return results  # type: ignore[return-value]
+CachedRowDataset = CachedBlockIterableDataset
 
-    def _load_chunk(self, chunk_id: int) -> pa.Table:
-        cached = self._chunk_cache.get(chunk_id)
-        if cached is not None:
-            return cached
-        chunk_path = self.chunk_root / f"{chunk_id:08d}.arrow"
-        table = pa.ipc.open_file(pa.memory_map(str(chunk_path), "r")).read_all()
-        self._chunk_cache[chunk_id] = table
-        return table
 
 def prepare_split(
     *,
@@ -116,10 +145,12 @@ def prepare_split(
     revision: str | None,
     max_samples: int | None,
     seed: int,
+    epoch: int,
+    training: bool,
     cache_root: Path,
     startup_callback=None,
 ) -> PreparedSplit:
-    """Build a PreparedSplit from the row-indexed cache. Missing rows are fatal."""
+    """Build a PreparedSplit from the block cache. Missing blocks are fatal."""
     source_root, descriptor = ensure_source_root(
         dataset_name=dataset_name,
         revision=revision,
@@ -137,28 +168,39 @@ def prepare_split(
         max_samples,
         split=split,
     )
-    cache_paths = resolve_row_cache_paths(source_root, split)
-    cache = load_or_init_row_cache(cache_paths, total_rows=int(catalog["total_rows"]))
-    if sample_plan.selected_row_ids.size > 0 and not np.all(cache.cached[sample_plan.selected_row_ids]):
-        raise FileNotFoundError(f"split {split} cache is missing requested rows")
+    cache_paths = resolve_block_cache_paths(source_root, split)
+    catalog_blocks = list(catalog.get("blocks", []))
+    selected_blocks = [catalog_blocks[int(index)] for index in sample_plan.selected_blocks.tolist()]
+    missing_cache_keys = [
+        str(block["cache_key"])
+        for block in selected_blocks
+        if not block_is_cached(cache_paths, str(block["cache_key"]))
+    ]
+    if missing_cache_keys:
+        raise FileNotFoundError(f"split {split} cache is missing requested blocks")
 
-    row_chunk_ids = cache.chunk_ids[sample_plan.selected_row_ids]
-    row_offsets = cache.row_offsets[sample_plan.selected_row_ids]
+    ordered_blocks = _shuffle_blocks(selected_blocks, seed=seed, split=split, epoch=epoch) if training else selected_blocks
+    rank_blocks = _slice_blocks_for_rank(ordered_blocks)
+    num_examples = _count_block_rows(cache_paths, rank_blocks)
+    effective_rows = _count_block_rows(cache_paths, selected_blocks)
     dataset = run_startup_stage(
         startup_callback,
         stage="load local cache",
         split=split,
-        operation=lambda: CachedRowDataset(
-            chunk_root=cache_paths.chunk_root,
-            row_chunk_ids=row_chunk_ids,
-            row_offsets=row_offsets,
+        operation=lambda: CachedBlockIterableDataset(
+            cache_paths=cache_paths,
+            blocks=tuple(rank_blocks),
+            seed=seed,
+            epoch=epoch,
+            split=split,
+            training=training,
         ),
         requested_rows=sample_plan.requested_rows,
-        effective_rows=sample_plan.effective_rows,
+        effective_rows=effective_rows,
         required_blocks=sample_plan.required_blocks,
         planner_mode=sample_plan.planner_mode,
     )
-    return PreparedSplit(dataset=dataset)
+    return PreparedSplit(dataset=dataset, num_examples=num_examples)
 
 
 def _as_shape(value: Any) -> tuple[int, int, int]:
@@ -353,7 +395,8 @@ def build_dataloader(
     prefetch_factor: int = 2,
     drop_last: bool = False,
 ) -> DataLoader:
-    """Create the split DataLoader, adding DistributedSampler when needed."""
+    """Create the split DataLoader for the cached iterable dataset."""
+    del seed, epoch
     dataloader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
         "collate_fn": build_collate_fn(include_metadata=include_metadata),
@@ -365,24 +408,6 @@ def build_dataloader(
     if num_workers > 0:
         dataloader_kwargs["persistent_workers"] = persistent_workers
         dataloader_kwargs["prefetch_factor"] = prefetch_factor
-
-    generator = torch.Generator()
-    generator.manual_seed(seed + epoch)
-
-    if is_distributed():
-        sampler = DistributedSampler(
-            prepared.dataset,
-            num_replicas=get_world_size(),
-            rank=get_rank(),
-            shuffle=training,
-            seed=seed,
-        )
-        sampler.set_epoch(epoch)
-        dataloader_kwargs["sampler"] = sampler
-        dataloader_kwargs["shuffle"] = False
-    else:
-        dataloader_kwargs["shuffle"] = training
-        dataloader_kwargs["generator"] = generator if training else None
 
     return DataLoader(prepared.dataset, **dataloader_kwargs)
 

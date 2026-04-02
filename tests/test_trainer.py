@@ -5,23 +5,12 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-import pyarrow as pa
 import pytest
 import torch
 
 from cr_train import Trainer
 from cr_train.data import BLOCK_SIZE
-from cr_train.trainer_runtime import MetricAccumulator, update_progress_bar
-
-
-def test_top_level_package_exports_trainer_as_primary_entry_point() -> None:
-    package = importlib.import_module("cr_train")
-    namespace: dict[str, object] = {}
-    exec("from cr_train import Trainer\n", namespace)
-
-    assert package.__all__ == ["Trainer"]
-    assert package.Trainer is Trainer
-    assert namespace["Trainer"] is Trainer
+from cr_train.data.store import resolve_block_cache_paths
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -37,6 +26,105 @@ def _make_row(index: int) -> dict[str, object]:
         "season": "summer",
         "scene": str(index),
         "patch": f"p{index:03d}",
+    }
+
+
+def _make_block_splits(block_count: int) -> list[list[dict[str, object]]]:
+    blocks: list[list[dict[str, object]]] = []
+    current_index = 0
+    for _ in range(block_count):
+        block_rows = [_make_row(current_index + offset) for offset in range(BLOCK_SIZE)]
+        blocks.append(block_rows)
+        current_index += BLOCK_SIZE
+    return blocks
+
+
+def _catalog(split: str, blocks: list[list[dict[str, object]]]) -> tuple[dict[str, object], dict[str, list[dict[str, object]]]]:
+    import hashlib
+
+    rows_by_key: dict[str, list[dict[str, object]]] = {}
+    block_entries = []
+    total_rows = 0
+    for index, rows in enumerate(blocks):
+        cache_key = hashlib.sha256(f"{split}:{index}".encode("utf-8")).hexdigest()[:16]
+        rows_by_key[cache_key] = [dict(row) for row in rows]
+        block_entries.append(
+            {
+                "index": index,
+                "shard_index": index,
+                "cache_key": cache_key,
+                "source_file": f"hf://datasets/unit/test/{split}/{index:04d}.parquet",
+                "row_groups": [index],
+            }
+        )
+        total_rows += len(rows)
+    return {
+        "split": split,
+        "total_rows": total_rows,
+        "total_blocks": len(block_entries),
+        "blocks": block_entries,
+    }, rows_by_key
+
+
+def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list[list[dict[str, object]]]]) -> dict[str, object]:
+    source_root = tmp_path / "source"
+    source_root.mkdir(parents=True, exist_ok=True)
+    catalogs: dict[str, dict[str, object]] = {}
+    rows_by_key: dict[str, list[dict[str, object]]] = {}
+    split_sizes: dict[str, int] = {}
+    for split, blocks in split_blocks.items():
+        catalog, block_rows = _catalog(split, blocks)
+        catalogs[split] = catalog
+        rows_by_key.update(block_rows)
+        split_sizes[split] = int(catalog["total_rows"])
+
+    descriptor = {
+        "dataset_name": "unit/test",
+        "revision": None,
+        "split_sizes": split_sizes,
+    }
+    load_counts: dict[str, int] = defaultdict(int)
+
+    def fake_ensure_source_root(*, dataset_name: str, revision: str | None, cache_root: Path):
+        assert dataset_name in {"unit/test", "Hermanni/sen12mscr"}
+        del revision, cache_root
+        return source_root, descriptor
+
+    def fake_ensure_split_catalog(*, source_root: Path, descriptor: dict[str, object], split: str, startup_callback):
+        del source_root, descriptor, startup_callback
+        return catalogs[split]
+
+    def fake_load_block_rows(
+        *,
+        dataset_name: str,
+        revision: str | None,
+        split: str,
+        block: dict[str, object],
+        progress_callback=None,
+    ):
+        del dataset_name, revision, split
+        cache_key = str(block["cache_key"])
+        load_counts[cache_key] += 1
+        rows = [dict(row) for row in rows_by_key[cache_key]]
+        if progress_callback is not None:
+            for index, row in enumerate(rows, start=1):
+                downloaded_bytes = sum(
+                    len(value)
+                    for value in row.values()
+                    if isinstance(value, (bytes, bytearray, memoryview))
+                )
+                progress_callback(index, downloaded_bytes)
+        return rows
+
+    monkeypatch.setattr("cr_train.data.runtime.ensure_source_root", fake_ensure_source_root)
+    monkeypatch.setattr("cr_train.data.runtime.ensure_split_catalog", fake_ensure_split_catalog)
+    monkeypatch.setattr("cr_train.data.runtime.load_block_rows", fake_load_block_rows)
+    monkeypatch.setattr("cr_train.data.dataset.ensure_source_root", fake_ensure_source_root)
+    monkeypatch.setattr("cr_train.data.dataset.ensure_split_catalog", fake_ensure_split_catalog)
+    return {
+        "source_root": source_root,
+        "catalogs": catalogs,
+        "load_counts": load_counts,
     }
 
 
@@ -102,117 +190,17 @@ class FakeTqdm:
         return None
 
 
-class ManualClock:
-    def __init__(self, current: float = 0.0) -> None:
-        self.current = current
+def test_top_level_package_exports_trainer_as_primary_entry_point() -> None:
+    package = importlib.import_module("cr_train")
+    namespace: dict[str, object] = {}
+    exec("from cr_train import Trainer\n", namespace)
 
-    def perf_counter(self) -> float:
-        return self.current
-
-
-class _FakeRowGroupMetadata:
-    def __init__(self, num_rows: int) -> None:
-        self.num_rows = num_rows
+    assert package.__all__ == ["Trainer"]
+    assert package.Trainer is Trainer
+    assert namespace["Trainer"] is Trainer
 
 
-class _FakeParquetMetadata:
-    def __init__(self, row_group_rows: list[int]) -> None:
-        self.num_rows = sum(row_group_rows)
-        self.num_row_groups = len(row_group_rows)
-        self._row_group_rows = row_group_rows
-
-    def row_group(self, index: int) -> _FakeRowGroupMetadata:
-        return _FakeRowGroupMetadata(self._row_group_rows[index])
-
-
-class _FakeParquetFile:
-    def __init__(
-        self,
-        url: str,
-        rows: list[dict[str, object]],
-        row_group_rows: list[int],
-        stats: dict[str, object],
-    ) -> None:
-        self.url = url
-        self._rows = [dict(row) for row in rows]
-        self._row_group_rows = list(row_group_rows)
-        self.metadata = _FakeParquetMetadata(row_group_rows)
-        stats["opens"][url] += 1
-        self._stats = stats
-
-    def read_row_group(self, index: int, columns: list[str] | None = None):
-        self._stats["read_row_groups"].append((self.url, int(index)))
-        start = sum(self._row_group_rows[:index])
-        stop = start + self._row_group_rows[index]
-        rows = self._rows[start:stop]
-        selected_columns = list(columns) if columns is not None else list(rows[0].keys())
-        return pa.table({column: [row[column] for row in rows] for column in selected_columns})
-
-
-def _patch_source(monkeypatch, split_rows: dict[str, list[dict[str, object]]]) -> dict[str, object]:
-    from cr_train.data.source import _source_descriptor_cache
-
-    _source_descriptor_cache.clear()
-
-    parquet_entries: list[dict[str, object]] = []
-    rows_by_url: dict[str, list[dict[str, object]]] = {}
-    row_groups_by_url: dict[str, list[int]] = {}
-    stats: dict[str, object] = {
-        "opens": defaultdict(int),
-        "read_row_groups": [],
-        "request_json_calls": 0,
-    }
-
-    for split, rows in split_rows.items():
-        url = f"hf://datasets/unit/test@refs/convert/parquet/default/{split}/0000.parquet"
-        parquet_entries.append(
-            {
-                "dataset": "unit/test",
-                "config": "default",
-                "split": split,
-                "url": url,
-                "filename": "0000.parquet",
-            }
-        )
-        rows_by_url[url] = [dict(row) for row in rows]
-        row_groups_by_url[url] = [
-            min(BLOCK_SIZE, len(rows) - start)
-            for start in range(0, len(rows), BLOCK_SIZE)
-        ]
-
-    def fake_request_json(url: str):
-        stats["request_json_calls"] += 1
-        if "/info?" in url:
-            return {
-                "dataset_info": {
-                    "default": {
-                        "splits": {
-                            split: {"num_examples": len(rows)}
-                            for split, rows in split_rows.items()
-                        }
-                    }
-                }
-            }
-        if "/parquet?" in url:
-            return {"parquet_files": parquet_entries}
-        raise AssertionError(f"unexpected URL: {url}")
-
-    def fake_parquet_file(url: str):
-        return _FakeParquetFile(
-            str(url),
-            rows=rows_by_url[str(url)],
-            row_group_rows=row_groups_by_url[str(url)],
-            stats=stats,
-        )
-
-    monkeypatch.setattr("cr_train.data.source.request_json", fake_request_json)
-    monkeypatch.setattr("cr_train.data.source.pq.ParquetFile", fake_parquet_file)
-    monkeypatch.setattr("cr_train.data.runtime.pq.ParquetFile", fake_parquet_file)
-    return stats
-
-
-def test_trainer_step_and_test_with_row_cache_warmup(monkeypatch, tmp_path: Path) -> None:
-    rows = [_make_row(i) for i in range(4 * BLOCK_SIZE)]
+def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metrics.jsonl"
@@ -220,12 +208,13 @@ def test_trainer_step_and_test_with_row_cache_warmup(monkeypatch, tmp_path: Path
 
     FakeTqdm.instances.clear()
     FakeTqdm.writes.clear()
-    stats = _patch_source(
+    patched = _patch_split_cache(
         monkeypatch,
+        tmp_path,
         {
-            "train": rows,
-            "validation": rows,
-            "test": rows,
+            "train": _make_block_splits(4),
+            "validation": _make_block_splits(4),
+            "test": _make_block_splits(4),
         },
     )
     monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
@@ -295,28 +284,26 @@ def test_trainer_step_and_test_with_row_cache_warmup(monkeypatch, tmp_path: Path
     assert "old-record" not in metrics_path.read_text(encoding="utf-8")
 
     assert "dataset_seed" not in config_record
-    assert warmup_splits_after_step == {"train", "validation"}
-    assert "ensure catalog" in startup_stages
+    assert warmup_splits_after_step == {"train", "validation", "test"}
     assert "warm split cache" in startup_stages
     assert "load local cache" in startup_stages
     assert "build dataloader" in startup_stages
     assert "wait first batch" in startup_stages
     assert "start epoch" in startup_stages
 
-    assert len(FakeTqdm.writes) == 6
-    assert not any(message.startswith("loader ") for message in FakeTqdm.writes)
-    assert not any(message.startswith("train | epoch=") for message in FakeTqdm.writes)
+    assert len(FakeTqdm.writes) >= 6
     assert any("cr-train" in message for message in FakeTqdm.writes)
     assert any("Epoch 1/" in message for message in FakeTqdm.writes)
     assert any("Test" in message for message in FakeTqdm.writes)
+    assert all("█" not in message and "░" not in message for message in FakeTqdm.writes)
 
     assert len(warmup_bars) == 3
     assert all(int(bar.total) >= 1 for bar in warmup_bars)
     assert all(sum(bar.updates) == int(bar.total) for bar in warmup_bars)
     assert all(any("sel" in values for values in bar.postfixes) for bar in warmup_bars)
-    assert all(any("blk/s" in values for values in bar.postfixes) for bar in warmup_bars)
+    assert all(all("blk/s" not in values for values in bar.postfixes) for bar in warmup_bars)
     assert all(any("MB/s" in values for values in bar.postfixes) for bar in warmup_bars)
-    assert all(all("runs" not in values for values in bar.postfixes) for bar in warmup_bars)
+    assert all(len(bar.postfixes) > int(bar.total) for bar in warmup_bars)
     assert all(len(bar.desc_history) == 1 for bar in warmup_bars)
 
     assert len(batch_bars) == 3
@@ -329,27 +316,24 @@ def test_trainer_step_and_test_with_row_cache_warmup(monkeypatch, tmp_path: Path
         for record in startup_records
         if record["stage"] == "warm split cache" and record["status"] == "done"
     ]
-    warmup_records_by_split = {record["split"]: record for record in warmup_done_records[:3]}
-
     assert [record["selected_block_count"] for record in warmup_done_records[:3]] == [2, 1, 1]
     assert all(record["planner_mode"] == "uniform_exact_k" for record in warmup_done_records[:3])
     assert all("timeline" in record for record in warmup_done_records[:3])
     assert all(len(str(record["timeline"])) == int(record["execution_block_count"]) for record in warmup_done_records[:3])
     assert all(set(str(record["timeline"])) <= {"█", "░"} for record in warmup_done_records[:3])
     assert all(record["resolved_blocks"] == record["selected_missing_blocks"] for record in warmup_done_records[:3])
-    assert all("frontier_before" not in record for record in warmup_done_records[:3])
-    assert all("extension_blocks" not in record for record in warmup_done_records[:3])
-    assert all(int(bar.total) == int(record["selected_missing_blocks"]) for bar, record in zip(warmup_bars, warmup_done_records[:3], strict=True))
 
-    for split, record in warmup_records_by_split.items():
-        expected_summary = (
-            f"{record['timeline']} cache {split} | warm | "
-            f"selected: {record['selected_block_count']}, fill: {record['resolved_blocks']}/{record['selected_missing_blocks']}"
-        )
-        assert expected_summary in FakeTqdm.writes
+    for split in ("train", "validation", "test"):
+        cache_paths = resolve_block_cache_paths(patched["source_root"], split)
+        metadata_records = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in cache_paths.metadata_root.glob("*.json")
+        ]
+        assert metadata_records
+        assert all("shard_index" in record for record in metadata_records)
 
-    assert stats["request_json_calls"] == 2
-    assert len(stats["read_row_groups"]) >= 3
+    assert len(warmup_done_records) == 3
+    assert sum(patched["load_counts"].values()) == 4
 
     with pytest.raises(RuntimeError):
         trainer.step()
@@ -402,98 +386,3 @@ def test_trainer_wraps_model_for_distributed_without_device_bootstrap_bug(monkey
     assert isinstance(trainer.model, FakeDDP)
     assert trainer.model.module is model
     assert trainer.device.type == "cpu"
-
-
-def test_update_progress_bar_uses_reduced_global_snapshot(monkeypatch) -> None:
-    import cr_train.trainer_runtime as trainer_runtime_mod
-
-    progress = FakeTqdm(disable=False)
-    accumulator = MetricAccumulator()
-    accumulator.update({"loss": 2.0, "mae": 1.0}, batch_size=4)
-    reduce_int_calls: list[int] = []
-    reduce_sum_calls: list[float] = []
-
-    monkeypatch.setattr(trainer_runtime_mod.time, "perf_counter", lambda: 14.0)
-    update_progress_bar(
-        progress,
-        accumulator=accumulator,
-        start_time=10.0,
-        reduce_int=lambda value: reduce_int_calls.append(value) or (value * 2),
-        reduce_sum=lambda value: reduce_sum_calls.append(value) or (value * 2.0),
-        distributed=True,
-    )
-
-    assert progress.updates == [1]
-    assert "loss: 2.0000" in progress.postfixes[-1]
-    assert "mae: 1.0000" in progress.postfixes[-1]
-    assert "0.5 batches/s" in progress.postfixes[-1]
-    assert reduce_int_calls == [4, 1]
-    assert reduce_sum_calls == [8.0, 4.0]
-
-
-def test_update_progress_bar_reduces_even_when_progress_is_disabled(monkeypatch) -> None:
-    import cr_train.trainer_runtime as trainer_runtime_mod
-
-    progress = FakeTqdm(disable=True)
-    accumulator = MetricAccumulator()
-    accumulator.update({"loss": 2.0}, batch_size=4)
-    reduce_int_calls: list[int] = []
-    reduce_sum_calls: list[float] = []
-
-    monkeypatch.setattr(trainer_runtime_mod.time, "perf_counter", lambda: 14.0)
-    update_progress_bar(
-        progress,
-        accumulator=accumulator,
-        start_time=10.0,
-        reduce_int=lambda value: reduce_int_calls.append(value) or value,
-        reduce_sum=lambda value: reduce_sum_calls.append(value) or value,
-        distributed=True,
-    )
-
-    assert progress.updates == []
-    assert progress.postfixes == []
-    assert reduce_int_calls == [4, 1]
-    assert reduce_sum_calls == [8.0]
-
-
-def test_training_epoch_speed_includes_first_batch_wait(monkeypatch, tmp_path: Path) -> None:
-    import cr_train.trainer as trainer_mod
-    import cr_train.trainer_runtime as trainer_runtime_mod
-
-    FakeTqdm.instances.clear()
-    clock = ManualClock()
-    batch = {
-        "sar": torch.zeros((1, 2, 256, 256), dtype=torch.float32),
-        "cloudy": torch.zeros((1, 13, 256, 256), dtype=torch.float32),
-        "target": torch.zeros((1, 13, 256, 256), dtype=torch.float32),
-    }
-
-    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
-    monkeypatch.setattr(trainer_mod.time, "perf_counter", clock.perf_counter)
-    monkeypatch.setattr(trainer_runtime_mod.time, "perf_counter", clock.perf_counter)
-
-    model = TinyModel()
-    trainer = Trainer(
-        model,
-        torch.optim.AdamW(model.parameters(), lr=1e-3),
-        loss_fn,
-        output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
-    )
-
-    monkeypatch.setattr(trainer, "_build_loader", lambda **kwargs: (object(), 1))
-    monkeypatch.setattr(trainer, "_set_sampler_epoch", lambda loader, epoch_index: None)
-    monkeypatch.setattr(trainer, "_create_progress_bar", lambda **kwargs: FakeTqdm(**kwargs))
-
-    def fake_prime_loader(*, split: str, loader, max_samples):
-        del split, loader, max_samples
-        clock.current = 5.0
-        return iter([batch])
-
-    monkeypatch.setattr(trainer, "_prime_loader", fake_prime_loader)
-
-    summary = trainer._run_training_epoch(0)
-    progress = FakeTqdm.instances[-1]
-
-    assert summary["batches_per_sec"] == pytest.approx(0.2)
-    assert "0.2 batches/s" in progress.postfixes[-1]

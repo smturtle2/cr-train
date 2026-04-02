@@ -9,40 +9,27 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.ipc
+import torch
 
 from .constants import LOCK_POLL_INTERVAL_SECONDS, LOCK_TIMEOUT_SECONDS
 
 
-@dataclass(slots=True)
-class SplitRowCacheState:
-    """Persistent state for the split-wide row cache."""
-
-    total_rows: int
-    total_cached_rows: int
-    next_chunk_index: int
-
-
-@dataclass(slots=True)
-class SplitRowCache:
-    """In-memory row cache index keyed by global row id."""
-
-    state: SplitRowCacheState
-    cached: np.ndarray
-    chunk_ids: np.ndarray
-    row_offsets: np.ndarray
+@dataclass(frozen=True, slots=True)
+class BlockCachePaths:
+    store_root: Path
+    block_root: Path
+    metadata_root: Path
+    lock_root: Path
 
 
 @dataclass(frozen=True, slots=True)
-class RowCachePaths:
-    store_root: Path
-    chunk_root: Path
-    lock_path: Path
-    state_path: Path
-    cached_path: Path
-    chunk_ids_path: Path
-    row_offsets_path: Path
+class SaveBlockResult:
+    payload_bytes: int
+    metadata_bytes: int
+
+    @property
+    def written_bytes(self) -> int:
+        return self.payload_bytes + self.metadata_bytes
 
 
 def resolve_cache_root(cache_dir: str | os.PathLike[str] | None) -> Path:
@@ -50,19 +37,20 @@ def resolve_cache_root(cache_dir: str | os.PathLike[str] | None) -> Path:
     return Path(cache_dir) if cache_dir is not None else (Path.home() / ".cache" / "cr-train")
 
 
-def resolve_row_cache_paths(source_root: Path, split: str) -> RowCachePaths:
-    store_root = source_root / "row_store" / split
+def resolve_block_cache_paths(source_root: Path, split: str) -> BlockCachePaths:
+    store_root = source_root / "block_store" / split
     store_root.mkdir(parents=True, exist_ok=True)
-    chunk_root = store_root / "chunks"
-    chunk_root.mkdir(parents=True, exist_ok=True)
-    return RowCachePaths(
+    block_root = store_root / "blocks"
+    block_root.mkdir(parents=True, exist_ok=True)
+    metadata_root = store_root / "metadata"
+    metadata_root.mkdir(parents=True, exist_ok=True)
+    lock_root = store_root / "locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    return BlockCachePaths(
         store_root=store_root,
-        chunk_root=chunk_root,
-        lock_path=store_root / ".lock",
-        state_path=store_root / "state.json",
-        cached_path=store_root / "cached_rows.npy",
-        chunk_ids_path=store_root / "chunk_ids.npy",
-        row_offsets_path=store_root / "row_offsets.npy",
+        block_root=block_root,
+        metadata_root=metadata_root,
+        lock_root=lock_root,
     )
 
 
@@ -75,19 +63,6 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def write_numpy_atomic(path: Path, array: np.ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("wb") as handle:
-        np.save(handle, array, allow_pickle=False)
-    tmp_path.replace(path)
-
-
-def load_numpy(path: Path) -> np.ndarray:
-    with path.open("rb") as handle:
-        return np.load(handle, allow_pickle=False)
 
 
 def remove_tree(path: Path) -> None:
@@ -143,41 +118,87 @@ def file_lock(lock_path: Path):
         except FileNotFoundError:
             pass
 
-def _chunk_path(chunk_root: Path, chunk_index: int) -> Path:
-    return chunk_root / f"{chunk_index:08d}.arrow"
+
+def block_data_path(paths: BlockCachePaths, cache_key: str) -> Path:
+    return paths.block_root / f"{cache_key}.pt"
 
 
-def _existing_chunk_ids(chunk_root: Path) -> set[int]:
-    return {
-        int(path.stem)
-        for path in chunk_root.iterdir()
-        if path.is_file() and path.suffix == ".arrow" and path.stem.isdigit()
-    }
+def block_metadata_path(paths: BlockCachePaths, cache_key: str) -> Path:
+    return paths.metadata_root / f"{cache_key}.json"
 
 
-def _next_chunk_index(chunk_root: Path) -> int:
-    existing = _existing_chunk_ids(chunk_root)
-    return 0 if not existing else (max(existing) + 1)
+def block_lock_path(paths: BlockCachePaths, cache_key: str) -> Path:
+    return paths.lock_root / f"{cache_key}.lock"
 
 
-def save_chunk(paths: RowCachePaths, rows: list[dict[str, Any]], *, chunk_index: int | None = None) -> int:
-    """Save rows as one Arrow IPC chunk and return the chunk index."""
-    if chunk_index is None:
-        chunk_index = _next_chunk_index(paths.chunk_root)
-    chunk_file = _chunk_path(paths.chunk_root, chunk_index)
-    tmp_file = chunk_file.with_suffix(".tmp")
-    remove_tree(tmp_file)
-    if rows:
-        schema_data = {col: [row[col] for row in rows] for col in rows[0]}
-    else:
-        schema_data = {}
-    table = pa.table(schema_data)
-    with pa.OSFile(str(tmp_file), "wb") as sink:
-        writer = pa.ipc.new_file(sink, table.schema)
-        writer.write_table(table)
-        writer.close()
-    tmp_file.replace(chunk_file)
-    return chunk_index
+def clear_block_cache_entry(paths: BlockCachePaths, cache_key: str, *, keep_lock: bool = False) -> None:
+    payload_path = block_data_path(paths, cache_key)
+    metadata_path = block_metadata_path(paths, cache_key)
+    lock_path = block_lock_path(paths, cache_key)
+
+    remove_tree(payload_path)
+    remove_tree(payload_path.with_suffix(payload_path.suffix + ".tmp"))
+    remove_tree(metadata_path)
+    remove_tree(metadata_path.with_suffix(metadata_path.suffix + ".tmp"))
+    if not keep_lock:
+        remove_tree(lock_path)
+        remove_tree(lock_path.with_suffix(lock_path.suffix + ".tmp"))
+
+
+def block_is_cached(paths: BlockCachePaths, cache_key: str) -> bool:
+    return block_data_path(paths, cache_key).exists() and block_metadata_path(paths, cache_key).exists()
+
+
+def load_block_metadata(paths: BlockCachePaths, cache_key: str) -> dict[str, Any] | None:
+    path = block_metadata_path(paths, cache_key)
+    if not path.exists():
+        return None
+    return read_json(path)
+
+
+def save_block(
+    paths: BlockCachePaths,
+    *,
+    cache_key: str,
+    rows: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> SaveBlockResult:
+    payload_path = block_data_path(paths, cache_key)
+    metadata_path = block_metadata_path(paths, cache_key)
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload_tmp = payload_path.with_suffix(payload_path.suffix + ".tmp")
+    metadata_tmp = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    remove_tree(payload_tmp)
+    remove_tree(metadata_tmp)
+
+    torch.save(rows, payload_tmp)
+    metadata_tmp.write_text(json.dumps(metadata, sort_keys=True, indent=2), encoding="utf-8")
+
+    payload_tmp.replace(payload_path)
+    metadata_tmp.replace(metadata_path)
+    return SaveBlockResult(
+        payload_bytes=payload_path.stat().st_size,
+        metadata_bytes=metadata_path.stat().st_size,
+    )
+
+
+def _torch_load(path: Path) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def load_block(paths: BlockCachePaths, cache_key: str) -> list[dict[str, Any]]:
+    path = block_data_path(paths, cache_key)
+    if not path.exists():
+        raise FileNotFoundError(f"cached block is missing: {path}")
+    payload = _torch_load(path)
+    if not isinstance(payload, list):
+        raise TypeError(f"cached block payload must be a list, got {type(payload)!r}")
+    return payload
 
 
 def as_bytes(value: Any) -> bytes:
@@ -208,155 +229,23 @@ def freeze_row(row: dict[str, Any]) -> dict[str, Any]:
     return {key: freeze_value(value) for key, value in row.items()}
 
 
-def _init_empty_row_cache(total_rows: int) -> SplitRowCache:
-    return SplitRowCache(
-        state=SplitRowCacheState(total_rows=total_rows, total_cached_rows=0, next_chunk_index=0),
-        cached=np.zeros(total_rows, dtype=np.bool_),
-        chunk_ids=np.full(total_rows, -1, dtype=np.int32),
-        row_offsets=np.full(total_rows, -1, dtype=np.int32),
-    )
-
-
-def write_row_cache(paths: RowCachePaths, cache: SplitRowCache) -> None:
-    state = cache.state
-    write_json_atomic(
-        paths.state_path,
-        {
-            "total_rows": state.total_rows,
-            "total_cached_rows": state.total_cached_rows,
-            "next_chunk_index": state.next_chunk_index,
-        },
-    )
-    write_numpy_atomic(paths.cached_path, cache.cached)
-    write_numpy_atomic(paths.chunk_ids_path, cache.chunk_ids)
-    write_numpy_atomic(paths.row_offsets_path, cache.row_offsets)
-
-
-def _heal_missing_chunks(paths: RowCachePaths, cache: SplitRowCache) -> bool:
-    valid_chunk_ids = _existing_chunk_ids(paths.chunk_root)
-    if not valid_chunk_ids and cache.state.total_cached_rows == 0:
-        return False
-
-    invalid_mask = np.logical_and(cache.cached, ~np.isin(cache.chunk_ids, list(valid_chunk_ids)))
-    if not np.any(invalid_mask):
-        return False
-
-    cache.cached[invalid_mask] = False
-    cache.chunk_ids[invalid_mask] = -1
-    cache.row_offsets[invalid_mask] = -1
-    cache.state.total_cached_rows = int(np.count_nonzero(cache.cached))
-    return True
-
-
-def load_or_init_row_cache(paths: RowCachePaths, *, total_rows: int) -> SplitRowCache:
-    files = (
-        paths.state_path,
-        paths.cached_path,
-        paths.chunk_ids_path,
-        paths.row_offsets_path,
-    )
-    existing_count = sum(path.exists() for path in files)
-
-    if existing_count == len(files):
-        payload = read_json(paths.state_path)
-        cache = SplitRowCache(
-            state=SplitRowCacheState(
-                total_rows=int(payload["total_rows"]),
-                total_cached_rows=int(payload["total_cached_rows"]),
-                next_chunk_index=int(payload["next_chunk_index"]),
-            ),
-            cached=load_numpy(paths.cached_path),
-            chunk_ids=load_numpy(paths.chunk_ids_path),
-            row_offsets=load_numpy(paths.row_offsets_path),
-        )
-    elif existing_count == 0:
-        cache = _init_empty_row_cache(total_rows)
-        write_row_cache(paths, cache)
-        return cache
-    else:
-        cache = _init_empty_row_cache(total_rows)
-        write_row_cache(paths, cache)
-        return cache
-
-    if (
-        cache.state.total_rows != total_rows
-        or cache.cached.shape != (total_rows,)
-        or cache.chunk_ids.shape != (total_rows,)
-        or cache.row_offsets.shape != (total_rows,)
-    ):
-        cache = _init_empty_row_cache(total_rows)
-        write_row_cache(paths, cache)
-        return cache
-
-    cached_count = int(np.count_nonzero(cache.cached))
-    if cache.state.total_cached_rows != cached_count:
-        cache.state.total_cached_rows = cached_count
-    if cache.state.next_chunk_index < 0:
-        cache.state.next_chunk_index = _next_chunk_index(paths.chunk_root)
-    else:
-        cache.state.next_chunk_index = max(cache.state.next_chunk_index, _next_chunk_index(paths.chunk_root))
-
-    healed = _heal_missing_chunks(paths, cache)
-    if healed:
-        cache.state.next_chunk_index = _next_chunk_index(paths.chunk_root)
-        write_row_cache(paths, cache)
-    return cache
-
-
-def materialize_rows(
-    paths: RowCachePaths,
-    *,
-    row_entries: list[tuple[int, dict[str, Any]]],
-    cache: SplitRowCache,
-) -> int:
-    """Append fetched rows to a new chunk and update the row index."""
-    if not row_entries:
-        return 0
-
-    unique_entries: list[tuple[int, dict[str, Any]]] = []
-    seen_row_ids: set[int] = set()
-    for row_id, row in row_entries:
-        if row_id in seen_row_ids:
-            continue
-        seen_row_ids.add(row_id)
-        unique_entries.append((row_id, row))
-    if not unique_entries:
-        return 0
-
-    chunk_index = save_chunk(
-        paths,
-        [row for _, row in unique_entries],
-        chunk_index=cache.state.next_chunk_index,
-    )
-    inserted = 0
-    for row_offset, (row_id, _) in enumerate(unique_entries):
-        if row_id < 0 or row_id >= cache.state.total_rows:
-            raise IndexError(f"row id {row_id} is out of range for cache")
-        if not bool(cache.cached[row_id]):
-            inserted += 1
-        cache.cached[row_id] = True
-        cache.chunk_ids[row_id] = chunk_index
-        cache.row_offsets[row_id] = row_offset
-    cache.state.total_cached_rows = int(np.count_nonzero(cache.cached))
-    cache.state.next_chunk_index = chunk_index + 1
-    return inserted
-
-
 __all__ = [
-    "RowCachePaths",
-    "SplitRowCache",
-    "SplitRowCacheState",
+    "BlockCachePaths",
+    "SaveBlockResult",
     "as_bytes",
+    "block_data_path",
+    "block_is_cached",
+    "block_lock_path",
+    "block_metadata_path",
+    "clear_block_cache_entry",
     "file_lock",
     "freeze_row",
-    "load_numpy",
-    "load_or_init_row_cache",
-    "materialize_rows",
+    "load_block",
+    "load_block_metadata",
     "read_json",
     "remove_tree",
+    "resolve_block_cache_paths",
     "resolve_cache_root",
-    "resolve_row_cache_paths",
-    "save_chunk",
+    "save_block",
     "write_json_atomic",
-    "write_row_cache",
 ]

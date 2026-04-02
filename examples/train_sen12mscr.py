@@ -94,7 +94,12 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="Requested test rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Seed controlling row-group order and block selection.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed controlling block selection and epoch-wise block/row shuffle order.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)

@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from typing import Any
 
 import torch
-
-from .data.constants import WARMUP_TIMELINE_WIDTH
-from .data.runtime import _compact_warmup_timeline
-
 
 PRINTED_STARTUP_STAGES: dict[str, set[str]] = {
     "warm split cache": {"done"},
@@ -20,22 +15,6 @@ _BOLD = "\033[1m"
 _GREEN = "\033[32m"
 _CYAN = "\033[36m"
 _YELLOW = "\033[33m"
-
-
-def _resolve_summary_timeline_width(
-    *,
-    split: str,
-    selected_block_count: int,
-    resolved_blocks: int,
-    selected_missing_blocks: int,
-    cache_only: bool,
-) -> int:
-    terminal_width = shutil.get_terminal_size(fallback=(WARMUP_TIMELINE_WIDTH + 48, 24)).columns
-    status = "cache-hit" if cache_only else "warm"
-    reserved_width = len(
-        f" cache {split} | {status} | selected: {selected_block_count}, fill: {resolved_blocks}/{selected_missing_blocks}"
-    ) + 1
-    return max(12, terminal_width - reserved_width)
 
 
 def serialize_value(value: Any) -> Any:
@@ -55,20 +34,15 @@ def format_cache_summary(event: dict[str, Any]) -> str:
     selected_block_count = int(event.get("selected_block_count", 0))
     selected_missing_blocks = int(event.get("selected_missing_blocks", 0))
     resolved_blocks = int(event.get("resolved_blocks", 0))
-    timeline = _compact_warmup_timeline(
-        str(event.get("timeline", "")).strip(),
-        max_chars=_resolve_summary_timeline_width(
-            split=split,
-            selected_block_count=selected_block_count,
-            resolved_blocks=resolved_blocks,
-            selected_missing_blocks=selected_missing_blocks,
-            cache_only=selected_missing_blocks == 0,
-        ),
-    )
-    prefix = f"cache {split}" if not timeline else f"{timeline} cache {split}"
+    prefix = f"cache {split}"
+    elapsed_sec = event.get("elapsed_sec")
     if selected_missing_blocks == 0:
-        return f"{prefix} | cache-hit | selected: {selected_block_count}, fill: 0/0"
-    return f"{prefix} | warm | selected: {selected_block_count}, fill: {resolved_blocks}/{selected_missing_blocks}"
+        summary = f"{prefix} | cache-hit | selected: {selected_block_count}, fill: 0/0"
+    else:
+        summary = f"{prefix} | warm | selected: {selected_block_count}, fill: {resolved_blocks}/{selected_missing_blocks}"
+    if elapsed_sec is None:
+        return summary
+    return f"{summary} | {float(elapsed_sec):.1f}s"
 
 
 def format_startup_message(event: dict[str, Any]) -> str:

@@ -14,7 +14,7 @@ SELECTION_PLANNER_MODE = "uniform_exact_k"
 
 @dataclass(slots=True)
 class SamplePlan:
-    """Logical block sampling result plus the concrete global row ids to materialize."""
+    """Logical block sampling result."""
 
     requested_rows: int
     effective_rows: int
@@ -24,8 +24,6 @@ class SamplePlan:
     selected_blocks: np.ndarray
     selected_bitmap: np.ndarray
     execution_block_count: int
-    selected_row_ids: np.ndarray
-    selected_row_offsets: np.ndarray
 
 
 @dataclass(slots=True)
@@ -64,68 +62,40 @@ def _select_blocks_uniform_exact_k(
     return selected_blocks, draw_order
 
 
-def _build_source_blocks(catalog: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
-    total_rows = int(catalog["total_rows"])
+def _resolve_total_blocks(catalog: dict[str, object]) -> int:
+    block_row_counts = catalog.get("block_row_counts")
+    if isinstance(block_row_counts, list):
+        return len(block_row_counts)
+    if "total_blocks" in catalog:
+        return max(0, int(catalog["total_blocks"]))
+
+    total_rows = int(catalog.get("total_rows", 0))
     if total_rows <= 0:
-        empty = np.empty((0,), dtype=np.int64)
-        return empty, empty
-
-    shards = catalog.get("shards")
-    if not isinstance(shards, list):
-        starts = np.arange(0, total_rows, BLOCK_SIZE, dtype=np.int64)
-        stops = np.minimum(starts + BLOCK_SIZE, total_rows)
-        return starts, stops
-
-    starts: list[int] = []
-    stops: list[int] = []
-    for shard in shards:
-        if not isinstance(shard, dict):
-            continue
-        shard_global_start = int(shard["global_start"])
-        current = shard_global_start
-        for value in shard.get("row_group_rows", []):
-            row_group_rows = int(value)
-            if row_group_rows <= 0:
-                continue
-            row_group_stop = current + row_group_rows
-            starts.append(current)
-            stops.append(row_group_stop)
-            current = row_group_stop
-    if starts:
-        return np.asarray(starts, dtype=np.int64), np.asarray(stops, dtype=np.int64)
-    starts = np.arange(0, total_rows, BLOCK_SIZE, dtype=np.int64)
-    stops = np.minimum(starts + BLOCK_SIZE, total_rows)
-    return np.asarray(starts, dtype=np.int64), np.asarray(stops, dtype=np.int64)
+        return 0
+    return int(math.ceil(total_rows / BLOCK_SIZE))
 
 
-def _ordered_source_blocks(catalog: dict[str, object], *, seed: int, split: str) -> tuple[np.ndarray, np.ndarray]:
-    block_starts, block_stops = _build_source_blocks(catalog)
-    if block_starts.size == 0:
-        empty = np.empty((0,), dtype=np.int64)
-        return empty, empty
-    rng = np.random.default_rng(_derive_named_seed(seed, split, "block-order"))
-    order = rng.permutation(block_starts.size)
-    return block_starts[order], block_stops[order]
-
-
-def _collect_selected_row_ids(
+def _estimate_effective_rows(
+    catalog: dict[str, object],
     *,
-    ordered_block_starts: np.ndarray,
-    ordered_block_stops: np.ndarray,
+    requested_rows: int,
     selected_blocks: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+    total_blocks: int,
+) -> int:
     if selected_blocks.size == 0:
-        return np.empty((0,), dtype=np.int64), np.asarray([0], dtype=np.int64)
+        return 0
 
-    offsets = [0]
-    segments: list[np.ndarray] = []
-    for block_index in selected_blocks:
-        start = int(ordered_block_starts[int(block_index)])
-        stop = int(ordered_block_stops[int(block_index)])
-        segment = np.arange(start, stop, dtype=np.int64)
-        segments.append(segment)
-        offsets.append(offsets[-1] + int(segment.size))
-    return np.concatenate(segments), np.asarray(offsets, dtype=np.int64)
+    block_row_counts = catalog.get("block_row_counts")
+    if isinstance(block_row_counts, list):
+        return int(sum(int(block_row_counts[int(index)]) for index in selected_blocks.tolist()))
+
+    total_rows = int(catalog.get("total_rows", 0))
+    if total_rows <= 0:
+        return int(selected_blocks.size) * BLOCK_SIZE
+    if selected_blocks.size >= total_blocks:
+        return total_rows
+    return min(total_rows, int(selected_blocks.size) * BLOCK_SIZE)
+
 
 def trace_plan_sample(
     catalog: dict[str, object],
@@ -136,9 +106,8 @@ def trace_plan_sample(
 ) -> SelectionTrace:
     """Planner trace for examples/debugging."""
     split_seed = _derive_named_seed(seed, split, "selection")
-    total_rows = int(catalog["total_rows"])
-    block_starts, _ = _build_source_blocks(catalog)
-    total_blocks = int(block_starts.size)
+    total_rows = int(catalog.get("total_rows", 0))
+    total_blocks = _resolve_total_blocks(catalog)
     requested_rows = total_rows if max_samples is None else min(max_samples, total_rows)
     if requested_rows <= 0 or total_blocks == 0:
         return SelectionTrace(
@@ -194,11 +163,10 @@ def plan_sample(
     *,
     split: str = "",
 ) -> SamplePlan:
-    """Plan logical blocks and expand them into deterministic global row ids."""
+    """Plan logical blocks without binding to a row-indexed cache layout."""
     split_seed = _derive_named_seed(seed, split, "selection")
-    total_rows = int(catalog["total_rows"])
-    ordered_block_starts, ordered_block_stops = _ordered_source_blocks(catalog, seed=seed, split=split)
-    total_blocks = int(ordered_block_starts.size)
+    total_rows = int(catalog.get("total_rows", 0))
+    total_blocks = _resolve_total_blocks(catalog)
     requested_rows = total_rows if max_samples is None else min(max_samples, total_rows)
     if requested_rows <= 0 or total_blocks == 0:
         return SamplePlan(
@@ -210,8 +178,6 @@ def plan_sample(
             selected_blocks=np.empty((0,), dtype=np.int64),
             selected_bitmap=np.zeros(total_blocks, dtype=np.bool_),
             execution_block_count=0,
-            selected_row_ids=np.empty((0,), dtype=np.int64),
-            selected_row_offsets=np.asarray([0], dtype=np.int64),
         )
 
     required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE)))
@@ -222,23 +188,23 @@ def plan_sample(
     )
     selected_bitmap = np.zeros(total_blocks, dtype=np.bool_)
     selected_bitmap[selected_blocks] = True
-    selected_row_ids, selected_row_offsets = _collect_selected_row_ids(
-        ordered_block_starts=ordered_block_starts,
-        ordered_block_stops=ordered_block_stops,
+    effective_rows = _estimate_effective_rows(
+        catalog,
+        requested_rows=requested_rows,
         selected_blocks=selected_blocks,
+        total_blocks=total_blocks,
     )
     return SamplePlan(
         requested_rows=requested_rows,
-        effective_rows=int(selected_row_ids.size),
+        effective_rows=effective_rows,
         required_blocks=required_blocks,
         total_blocks=total_blocks,
         planner_mode=SELECTION_PLANNER_MODE,
         selected_blocks=selected_blocks,
         selected_bitmap=selected_bitmap,
         execution_block_count=(int(selected_blocks[-1]) + 1) if selected_blocks.size else 0,
-        selected_row_ids=selected_row_ids,
-        selected_row_offsets=selected_row_offsets,
     )
+
 
 __all__ = [
     "SELECTION_PLANNER_MODE",

@@ -20,10 +20,10 @@
 
 - **Single-class API** -- `Trainer` with `step()` + `test()`, nothing else to learn
 - **Deterministic block sampling** -- one-seed system (`seed`) for exact reproducibility
-- **Smart cache warmup** -- reads only missing rows from HF Parquet shards and reuses them across plans
-- **Distributed training** -- automatic DDP wrapping, `DistributedSampler`, all-reduce metrics
+- **Smart cache warmup** -- fills only missing HF streaming row-group blocks and reuses them across plans
+- **Distributed training** -- automatic DDP wrapping, rank-aware block partitioning, all-reduce metrics
 - **JSONL experiment tracking** -- every epoch, validation, checkpoint, and startup event recorded to `metrics.jsonl`
-- **Zero config data** -- ingests directly from [`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr) Parquet exports; no manual download needed
+- **Zero config data** -- ingests directly from [`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr) via `load_dataset(..., streaming=True)`; no manual download needed
 
 ---
 
@@ -120,7 +120,7 @@ Most users only need `from cr_train import Trainer`. Once you construct it, `Tra
 
 - resolves dataset metadata and local cache state
 - warms only the splits needed for the current call
-- builds dataloaders and distributed samplers
+- builds iterable dataloaders and rank-aware block partitioning
 - writes `metrics.jsonl` and `epoch-NNNN.pt` checkpoints
 
 You do not need any cache or dataloader setup code for the normal training flow.
@@ -134,8 +134,6 @@ If you want to inspect the deterministic uniform exact-k block planner directly,
 ```python
 from cr_train.data import BLOCK_SIZE, trace_plan_sample
 ```
-
-This is optional. The main product surface is still `Trainer`.
 
 ---
 
@@ -154,9 +152,9 @@ This is optional. The main product surface is still `Trainer`.
 | `max_test_samples` | `int \| None` | `None` | Same for test. |
 | `batch_size` | `int` | `4` | Batch size for all DataLoaders. |
 | `epochs` | `int` | `1` | Total training epochs. Call `step()` once per epoch. |
-| `seed` | `int` | `42` | Seed controlling deterministic row-group block order and block selection. |
+| `seed` | `int` | `42` | Seed controlling deterministic block selection and epoch-wise block/row shuffle order. |
 | `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and checkpoint files. |
-| `cache_dir` | `str \| Path \| None` | `None` | Row cache root. `None` = `~/.cache/cr-train`. |
+| `cache_dir` | `str \| Path \| None` | `None` | Block cache root. `None` = `~/.cache/cr-train`. |
 
 ### `Trainer.step() -> dict`
 
@@ -201,9 +199,9 @@ Runs test evaluation with the current model state. Returns:
 
 ## Under the Hood
 
-`Trainer` reads the HuggingFace Parquet export, keeps a reusable local row cache, and records startup events in `metrics.jsonl`. The same `seed` preserves uniform exact-k logical block membership across runs, while training batch order still changes by epoch through `seed + epoch_index`.
+`Trainer` reads the dataset through HuggingFace streaming, keeps a reusable local block cache keyed by row group, and records startup events in `metrics.jsonl`. The same `seed` preserves uniform exact-k logical block membership across runs, while training block and row order still change by epoch through `seed + epoch_index`.
 
-During warmup, `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing rows are fetched from HuggingFace only when the selected blocks are not already cached locally.
+During warmup, `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing blocks are fetched from HuggingFace only when the selected row-group blocks are not already cached locally.
 
 ---
 
@@ -217,7 +215,7 @@ torchrun --nproc_per_node=2 examples/train_sen12mscr.py \
   --epochs 5
 ```
 
-- Data is sharded across ranks via `DistributedSampler`
+- Data is sharded across ranks via deterministic block partitioning
 - Metrics are all-reduced across all processes
 - Only rank 0 writes `metrics.jsonl` and checkpoint files
 - Cache warmup runs on all ranks with file-lock coordination
