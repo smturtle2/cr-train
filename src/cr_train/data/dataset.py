@@ -16,7 +16,7 @@ from .constants import OPTICAL_CHANNELS, SAR_CHANNELS
 from .planning import plan_sample
 from .runtime import get_rank, get_world_size
 from .source import ensure_source_root, ensure_split_catalog, run_startup_stage
-from .store import as_bytes, block_is_cached, load_block, load_block_metadata, resolve_block_cache_paths
+from .store import BlockCachePaths, as_bytes, block_is_cached, load_block, load_block_metadata, resolve_block_cache_paths
 
 
 @dataclass(slots=True)
@@ -25,6 +25,21 @@ class PreparedSplit:
 
     dataset: TorchIterableDataset[dict[str, Any]]
     num_examples: int
+
+
+@dataclass(slots=True)
+class PreparedSplitState:
+    """Static split selection resolved against the local block cache."""
+
+    split: str
+    cache_paths: BlockCachePaths
+    seed: int
+    requested_rows: int
+    effective_rows: int
+    required_blocks: int
+    planner_mode: str
+    selected_blocks: tuple[dict[str, Any], ...]
+    row_counts_by_key: dict[str, int]
 
 
 def resolve_num_workers(num_workers: int | str) -> int:
@@ -88,13 +103,20 @@ def _slice_blocks_for_rank(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]
     return [block for i, block in enumerate(blocks) if i % world_size == rank]
 
 
-def _count_block_rows(cache_paths, blocks: list[dict[str, Any]]) -> int:
+def _count_block_rows(cache_paths: BlockCachePaths, blocks: list[dict[str, Any]]) -> int:
     total = 0
     for block in blocks:
         metadata = load_block_metadata(cache_paths, str(block["cache_key"]))
         if metadata is None:
             raise FileNotFoundError(f"cached block metadata is missing for {block['cache_key']}")
         total += int(metadata.get("row_count", 0))
+    return total
+
+
+def _count_rows_from_state(state: PreparedSplitState, blocks: list[dict[str, Any]]) -> int:
+    total = 0
+    for block in blocks:
+        total += int(state.row_counts_by_key[str(block["cache_key"])])
     return total
 
 
@@ -138,19 +160,46 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
 CachedRowDataset = CachedBlockIterableDataset
 
 
-def prepare_split(
+def _resolve_selected_blocks(
+    catalog: dict[str, Any],
+    *,
+    selected_indices: list[int],
+) -> list[dict[str, Any]]:
+    catalog_blocks = list(catalog.get("blocks", []))
+    return [catalog_blocks[index] for index in selected_indices]
+
+
+def _resolve_selected_block_row_counts(
+    cache_paths: BlockCachePaths,
+    selected_blocks: list[dict[str, Any]],
+) -> dict[str, int]:
+    missing_cache_keys: list[str] = []
+    row_counts_by_key: dict[str, int] = {}
+    for block in selected_blocks:
+        cache_key = str(block["cache_key"])
+        if not block_is_cached(cache_paths, cache_key):
+            missing_cache_keys.append(cache_key)
+            continue
+        metadata = load_block_metadata(cache_paths, cache_key)
+        if metadata is None:
+            raise FileNotFoundError(f"cached block metadata is missing for {cache_key}")
+        row_counts_by_key[cache_key] = int(metadata.get("row_count", 0))
+    if missing_cache_keys:
+        raise FileNotFoundError(f"split cache is missing requested blocks: {', '.join(missing_cache_keys)}")
+    return row_counts_by_key
+
+
+def resolve_prepared_split_state(
     *,
     split: str,
     dataset_name: str,
     revision: str | None,
     max_samples: int | None,
     seed: int,
-    epoch: int,
-    training: bool,
     cache_root: Path,
     startup_callback=None,
-) -> PreparedSplit:
-    """Build a PreparedSplit from the block cache. Missing blocks are fatal."""
+) -> PreparedSplitState:
+    """Resolve the static block selection for a split from the local cache."""
     source_root, descriptor = ensure_source_root(
         dataset_name=dataset_name,
         revision=revision,
@@ -169,38 +218,84 @@ def prepare_split(
         split=split,
     )
     cache_paths = resolve_block_cache_paths(source_root, split)
-    catalog_blocks = list(catalog.get("blocks", []))
-    selected_blocks = [catalog_blocks[int(index)] for index in sample_plan.selected_blocks.tolist()]
-    missing_cache_keys = [
-        str(block["cache_key"])
-        for block in selected_blocks
-        if not block_is_cached(cache_paths, str(block["cache_key"]))
-    ]
-    if missing_cache_keys:
-        raise FileNotFoundError(f"split {split} cache is missing requested blocks")
+    selected_blocks = _resolve_selected_blocks(
+        catalog,
+        selected_indices=[int(index) for index in sample_plan.selected_blocks.tolist()],
+    )
+    row_counts_by_key = _resolve_selected_block_row_counts(cache_paths, selected_blocks)
+    return PreparedSplitState(
+        split=split,
+        cache_paths=cache_paths,
+        seed=seed,
+        requested_rows=sample_plan.requested_rows,
+        effective_rows=int(sum(row_counts_by_key[str(block["cache_key"])] for block in selected_blocks)),
+        required_blocks=sample_plan.required_blocks,
+        planner_mode=sample_plan.planner_mode,
+        selected_blocks=tuple(selected_blocks),
+        row_counts_by_key=row_counts_by_key,
+    )
 
-    ordered_blocks = _shuffle_blocks(selected_blocks, seed=seed, split=split, epoch=epoch) if training else selected_blocks
+
+def prepare_split_from_state(
+    state: PreparedSplitState,
+    *,
+    epoch: int,
+    training: bool,
+    startup_callback=None,
+) -> PreparedSplit:
+    """Build a PreparedSplit from a pre-resolved split state."""
+    selected_blocks = list(state.selected_blocks)
+    ordered_blocks = _shuffle_blocks(selected_blocks, seed=state.seed, split=state.split, epoch=epoch) if training else selected_blocks
     rank_blocks = _slice_blocks_for_rank(ordered_blocks)
-    num_examples = _count_block_rows(cache_paths, rank_blocks)
-    effective_rows = _count_block_rows(cache_paths, selected_blocks)
+    num_examples = _count_rows_from_state(state, rank_blocks)
     dataset = run_startup_stage(
         startup_callback,
         stage="load local cache",
-        split=split,
+        split=state.split,
         operation=lambda: CachedBlockIterableDataset(
-            cache_paths=cache_paths,
+            cache_paths=state.cache_paths,
             blocks=tuple(rank_blocks),
-            seed=seed,
+            seed=state.seed,
             epoch=epoch,
-            split=split,
+            split=state.split,
             training=training,
         ),
-        requested_rows=sample_plan.requested_rows,
-        effective_rows=effective_rows,
-        required_blocks=sample_plan.required_blocks,
-        planner_mode=sample_plan.planner_mode,
+        requested_rows=state.requested_rows,
+        effective_rows=state.effective_rows,
+        required_blocks=state.required_blocks,
+        planner_mode=state.planner_mode,
     )
     return PreparedSplit(dataset=dataset, num_examples=num_examples)
+
+
+def prepare_split(
+    *,
+    split: str,
+    dataset_name: str,
+    revision: str | None,
+    max_samples: int | None,
+    seed: int,
+    epoch: int,
+    training: bool,
+    cache_root: Path,
+    startup_callback=None,
+) -> PreparedSplit:
+    """Build a PreparedSplit from the block cache. Missing blocks are fatal."""
+    state = resolve_prepared_split_state(
+        split=split,
+        dataset_name=dataset_name,
+        revision=revision,
+        max_samples=max_samples,
+        seed=seed,
+        cache_root=cache_root,
+        startup_callback=startup_callback,
+    )
+    return prepare_split_from_state(
+        state,
+        epoch=epoch,
+        training=training,
+        startup_callback=startup_callback,
+    )
 
 
 def _as_shape(value: Any) -> tuple[int, int, int]:
@@ -407,7 +502,7 @@ def build_dataloader(
     epoch: int,
     include_metadata: bool = True,
     pin_memory: bool = True,
-    persistent_workers: bool = True,
+    persistent_workers: bool = False,
     prefetch_factor: int = 2,
     drop_last: bool = False,
 ) -> DataLoader:
@@ -438,11 +533,14 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
 __all__ = [
     "CachedRowDataset",
     "PreparedSplit",
+    "PreparedSplitState",
     "build_collate_fn",
     "build_dataloader",
     "decode_row",
     "move_batch_to_device",
     "prepare_split",
+    "prepare_split_from_state",
+    "resolve_prepared_split_state",
     "resolve_num_workers",
     "seed_everything",
     "seed_worker",

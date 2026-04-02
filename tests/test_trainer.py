@@ -410,3 +410,54 @@ def test_trainer_wraps_model_for_distributed_without_device_bootstrap_bug(monkey
     assert isinstance(trainer.model, FakeDDP)
     assert trainer.model.module is model
     assert trainer.device.type == "cpu"
+
+
+def test_trainer_reuses_prepared_split_state_across_epochs(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.dataset as dataset_mod
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    _patch_split_cache(
+        monkeypatch,
+        tmp_path,
+        {
+            "train": _make_block_splits(4),
+            "validation": _make_block_splits(4),
+            "test": _make_block_splits(4),
+        },
+    )
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+
+    resolve_counts: dict[str, int] = defaultdict(int)
+    real_resolve = dataset_mod.resolve_prepared_split_state
+
+    def counting_resolve(**kwargs):
+        resolve_counts[str(kwargs["split"])] += 1
+        return real_resolve(**kwargs)
+
+    monkeypatch.setattr(trainer_mod, "resolve_prepared_split_state", counting_resolve)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        metrics={"mae": mae_metric},
+        max_train_samples=2 * BLOCK_SIZE,
+        max_val_samples=BLOCK_SIZE,
+        max_test_samples=BLOCK_SIZE,
+        epochs=2,
+        batch_size=8,
+        seed=7,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer.step()
+    trainer.step()
+    trainer.test()
+
+    assert trainer.persistent_workers is False
+    assert resolve_counts == {"train": 1, "validation": 1, "test": 1}

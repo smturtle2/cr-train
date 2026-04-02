@@ -16,13 +16,14 @@ from datasets import load_dataset
 from cr_train.data import (
     BLOCK_SIZE,
     DATA_COLUMNS,
+    PreparedSplit,
     build_collate_fn,
     build_dataloader,
     decode_row,
     plan_sample,
     trace_plan_sample,
 )
-from cr_train.data.dataset import prepare_split
+from cr_train.data.dataset import prepare_split, prepare_split_from_state, resolve_prepared_split_state
 from cr_train.data.runtime import ensure_split_cache
 from cr_train.data.store import (
     block_data_path,
@@ -811,25 +812,23 @@ def test_prepare_split_training_order_changes_by_epoch(monkeypatch, tmp_path: Pa
         seed=9,
         cache_root=tmp_path,
     )
-    prepared_epoch0 = prepare_split(
+    state = resolve_prepared_split_state(
         split="train",
         dataset_name="unit/test",
         revision=None,
         max_samples=2 * BLOCK_SIZE,
         seed=9,
-        epoch=0,
-        training=True,
         cache_root=tmp_path,
     )
-    prepared_epoch1 = prepare_split(
-        split="train",
-        dataset_name="unit/test",
-        revision=None,
-        max_samples=2 * BLOCK_SIZE,
-        seed=9,
+    prepared_epoch0 = prepare_split_from_state(
+        state,
+        epoch=0,
+        training=True,
+    )
+    prepared_epoch1 = prepare_split_from_state(
+        state,
         epoch=1,
         training=True,
-        cache_root=tmp_path,
     )
     loader_epoch0 = build_dataloader(
         prepared_epoch0,
@@ -853,3 +852,30 @@ def test_prepare_split_training_order_changes_by_epoch(monkeypatch, tmp_path: Pa
 
     assert scenes_epoch0 != scenes_epoch1
     assert set(scenes_epoch0) == set(scenes_epoch1)
+
+
+def test_build_dataloader_defaults_to_non_persistent_workers(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    captured: dict[str, Any] = {}
+
+    class FakeDataLoader:
+        def __init__(self, dataset, **kwargs):
+            captured["dataset"] = dataset
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(dataset_mod, "DataLoader", FakeDataLoader)
+
+    prepared = PreparedSplit(dataset=SimpleNamespace(name="dataset"), num_examples=4)
+    loader = build_dataloader(
+        prepared,
+        batch_size=2,
+        num_workers=2,
+        training=False,
+        seed=5,
+        epoch=0,
+    )
+
+    assert loader is not None
+    assert captured["dataset"] is prepared.dataset
+    assert captured["kwargs"]["persistent_workers"] is False

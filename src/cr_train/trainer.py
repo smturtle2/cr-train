@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,15 @@ from torch import nn
 from tqdm.auto import tqdm
 
 from .data.constants import DATASET_ID
-from .data.dataset import build_dataloader, move_batch_to_device, prepare_split, resolve_num_workers, seed_everything
+from .data.dataset import (
+    PreparedSplitState,
+    build_dataloader,
+    move_batch_to_device,
+    prepare_split_from_state,
+    resolve_num_workers,
+    resolve_prepared_split_state,
+    seed_everything,
+)
 from .data.runtime import ensure_split_cache, is_distributed, is_primary
 from .data.store import resolve_cache_root
 from .data.source import run_startup_stage
@@ -25,6 +34,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 LossFn = Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int]
 MetricFn = Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int]
+
+
+@dataclass(slots=True)
+class _PreparedSplitCacheEntry:
+    split: str
+    max_samples: int | None
+    state: PreparedSplitState
 
 
 class Trainer:
@@ -87,13 +103,15 @@ class Trainer:
 
         self.include_metadata = True
         self.pin_memory = True
-        self.persistent_workers = self.num_workers > 0
+        # Trainer rebuilds loaders per run, so keep worker lifetime on the PyTorch default path.
+        self.persistent_workers = False
         self.prefetch_factor = 2
         self.drop_last = False
         self.current_epoch = 0
         self.global_step = 0
         self._config_written = False
         self._cache_ready: set[str] = set()
+        self._prepared_split_states: dict[tuple[str, int | None], _PreparedSplitCacheEntry] = {}
 
         self.device = self._infer_module_device(self.model)
         self._wrap_model_for_ddp_if_needed()
@@ -287,6 +305,33 @@ class Trainer:
         ):
             self._ensure_split_cache(split=split, max_samples=max_samples)
 
+    def _resolve_prepared_split_state(
+        self,
+        *,
+        split: str,
+        max_samples: int | None,
+    ) -> PreparedSplitState:
+        key = (split, max_samples)
+        cached = self._prepared_split_states.get(key)
+        if cached is not None:
+            return cached.state
+
+        self._ensure_split_cache(split=split, max_samples=max_samples)
+        state = resolve_prepared_split_state(
+            split=split,
+            dataset_name=DATASET_ID,
+            revision=None,
+            max_samples=max_samples,
+            seed=self.seed,
+            cache_root=self.cache_root,
+        )
+        self._prepared_split_states[key] = _PreparedSplitCacheEntry(
+            split=split,
+            max_samples=max_samples,
+            state=state,
+        )
+        return state
+
     def _build_loader(
         self,
         *,
@@ -295,16 +340,11 @@ class Trainer:
         training: bool,
         epoch_index: int,
     ) -> tuple[Any, int | None]:
-        self._ensure_split_cache(split=split, max_samples=max_samples)
-        prepared = prepare_split(
-            split=split,
-            dataset_name=DATASET_ID,
-            revision=None,
-            max_samples=max_samples,
-            seed=self.seed,
+        state = self._resolve_prepared_split_state(split=split, max_samples=max_samples)
+        prepared = prepare_split_from_state(
+            state,
             epoch=epoch_index,
             training=training,
-            cache_root=self.cache_root,
             startup_callback=self._handle_startup_event,
         )
         loader = run_startup_stage(
