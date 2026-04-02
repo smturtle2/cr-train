@@ -101,7 +101,7 @@ uv run python examples/train_sen12mscr.py \
 
 ### 샘플링 알고리즘 시각화
 
-블록 선택 비트마스크가 단계별로 어떻게 구축되는지 확인합니다:
+uniform exact-k 블록 선택 비트마스크가 어떻게 만들어지는지 확인합니다:
 
 ```bash
 uv run python examples/bitmask_sampling_demo.py \
@@ -110,26 +110,32 @@ uv run python examples/bitmask_sampling_demo.py \
   --seed 9
 ```
 
-stop block 확률표, 샘플링된 stop, prefix draw, 그리고 선택(`■`) vs. 건너뜀(`□`)의 최종 비트맵을 출력합니다.
+raw draw order, 최종 선택 블록 인덱스, 그리고 선택(`■`) vs. 건너뜀(`□`)의 logical block 비트맵을 출력합니다.
 
 ---
 
-## 아키텍처
+## Trainer가 자동으로 하는 일
 
-```mermaid
-flowchart TD
-    HF["HF Parquet Export<br/><code>Hermanni/sen12mscr</code>"]
-    ORDER["논리적 행 순서<br/><code>seed</code>"]
-    PLAN["블록 선택 플래너<br/><code>seed</code> · stop-biased exact-k"]
-    CACHE["로컬 행 캐시<br/>Arrow 청크 · row-indexed"]
-    DS["CachedRowDataset"]
-    DL["DataLoader<br/>DDP 지원 · pinned memory"]
-    TRAIN["Trainer.step() / test()"]
-    OUT["출력<br/><code>metrics.jsonl</code> · <code>epoch-NNNN.pt</code>"]
+대부분의 사용자는 `from cr_train import Trainer`만 쓰면 됩니다. `Trainer`를 만들면 다음을 자동으로 처리합니다:
 
-    HF --> ORDER --> PLAN --> CACHE
-    CACHE --> DS --> DL --> TRAIN --> OUT
+- 데이터셋 메타데이터와 로컬 캐시 상태 확인
+- 현재 호출에 필요한 split만 워밍업
+- DataLoader와 분산 학습용 sampler 구성
+- `metrics.jsonl`과 `epoch-NNNN.pt` 체크포인트 기록
+
+일반적인 학습 흐름에서는 캐시나 데이터로더 헬퍼를 직접 호출할 필요가 없습니다.
+
+---
+
+## 고급 샘플링 도구
+
+결정적 uniform exact-k 블록 플래너를 직접 들여다보고 싶다면, 지원하는 고급 표면은 `cr_train.data` 아래에 남아 있습니다:
+
+```python
+from cr_train.data import BLOCK_SIZE, trace_plan_sample
 ```
+
+이건 선택 사항입니다. 기본 제품 표면은 여전히 `Trainer`입니다.
 
 ---
 
@@ -193,43 +199,11 @@ flowchart TD
 
 ---
 
-## 동작 원리
+## 내부 동작 요약
 
-### 행 기반 캐싱
+`Trainer`는 HuggingFace Parquet export를 읽고, 재사용 가능한 로컬 row cache를 유지하며, 시작 이벤트를 `metrics.jsonl`에 기록합니다. 같은 `seed`를 쓰면 uniform exact-k 기준의 논리 블록 선택은 유지되고, 학습 배치 순서는 `seed + epoch_index`에 따라 epoch마다 바뀝니다.
 
-소스 데이터셋은 HF dataset viewer의 Parquet 메타데이터로 한 번 기술되고, 이후 워밍업은 split 단위 **row-indexed cache**를 채웁니다. logical block은 샘플링과 tqdm 표시를 위해 유지되며, 이제 block 하나는 source `row_group` 하나와 같습니다. 디스크 캐시는 global row id 기준으로 저장되어 다른 계획에서도 재사용됩니다.
-
-```
-~/.cache/cr-train/layout-v10/<source>/row_store/<split>/
-├── chunks/             # raw row를 담는 Arrow IPC 청크
-├── state.json          # 캐시 상태 (행 수, 다음 chunk id)
-├── chunk_ids.npy       # global row id → chunk id
-├── row_offsets.npy     # global row id → chunk 내부 row offset
-└── cached_rows.npy     # 캐시된 global row id의 boolean 마스크
-```
-
-### 결정적 샘플링
-
-완벽한 재현성을 위해 하나의 시드를 사용합니다:
-
-| 시드 | 제어 대상 | 효과 |
-|------|-----------|------|
-| `seed` | row-group block 순서 + 블록 선택 | source `row_group` block의 결정적 순서를 만들고, 그 위에서 stop-biased exact-k 플래너가 logical block을 선택. |
-
-플래너는 항상 정확한 블록 수를 결정적으로 반환합니다. 요청된 row 수는 고정 `BLOCK_SIZE=64` 기준으로 블록 수로 변환되고, 선택은 항상 전체 `row_group` 단위로 이뤄집니다. 동일한 `seed` = 동일한 row-group block 순서와 블록 선택. 다른 `seed`값은 다른 block 순서와 논리 블록을 샘플링합니다.
-
-### 캐시 워밍업 생명주기
-
-1. 첫 번째 `step()` 또는 `test()` 호출 시, 세 split(train, validation, test) 모두 워밍업 실행.
-2. 플래너가 선택된 logical block과 이미 캐시된 행을 비교.
-3. 누락된 행만 HuggingFace Parquet shard에서 읽음. 선택된 블록이 모두 캐시되어 있으면 원격 소스에 접속하지 않음.
-4. tqdm 프로그레스 바로 logical block 워밍업을 추적하고, 완료 시 블록 타임라인을 출력:
-
-```
-██░░██████░░░░██████████░░██ cache train | warm | selected=42 fill=42/42
-```
-
-`█` = 선택된 logical block, `░` = 샘플링된 stop block 이전에서 건너뛴 block.
+워밍업은 호출에 필요한 split만 수행합니다. `step()`은 `train`과 `validation`, `test()`는 `test`를 준비하며, 선택된 블록이 이미 로컬에 있지 않을 때만 HuggingFace에서 누락된 row를 가져옵니다.
 
 ---
 
@@ -282,7 +256,7 @@ def my_loss(prediction, batch):
 ## 참고사항
 
 - 캐시 워밍업 시 tqdm 프로그레스 바로 블록 다운로드를 표시하고, 완료 시 블록 타임라인을 출력합니다.
-- 동일한 `seed`는 같은 블록 선택을 유지하며, 학습 배치 순서는 `seed + epoch_index`로 epoch마다 변경됩니다.
+- 동일한 `seed`는 같은 uniform exact-k 블록 선택을 유지하며, 학습 배치 순서는 `seed + epoch_index`로 epoch마다 변경됩니다.
 - 완료된 캐시는 자동 삭제되지 않습니다. 디스크 공간 회수를 위해 캐시 디렉토리에서 직접 삭제하세요.
 - `Trainer.step()`은 학습 중 배치 단위 tqdm으로 running-average loss와 메트릭을 표시합니다.
 - 체크포인트는 `epoch-NNNN.pt` 형태로 저장되며, `model`, `optimizer`, `epoch`, `global_step` 상태를 포함합니다.

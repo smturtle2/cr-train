@@ -157,7 +157,6 @@ def prepare_split(
         effective_rows=sample_plan.effective_rows,
         required_blocks=sample_plan.required_blocks,
         planner_mode=sample_plan.planner_mode,
-        stop_bias_alpha=sample_plan.stop_bias_alpha,
     )
     return PreparedSplit(dataset=dataset)
 
@@ -188,21 +187,43 @@ def _decode_image(buffer: Any, shape: Any, *, dtype: np.dtype[Any], expected_cha
     return np.ascontiguousarray(chw, dtype=np.float32)
 
 
+_SAR_NORMALIZATION = (
+    (0, -25.0, 0.0, 25.0, 2.0 / 25.0),
+    (1, -32.5, 0.0, 32.5, 2.0 / 32.5),
+)
+_OPTICAL_CLAMP_RANGE = (0.0, 10000.0)
+_OPTICAL_SCALE = 1.0 / 2000.0
+
+
+def _normalize_sar_numpy(sar: np.ndarray) -> None:
+    for channel, clamp_min, clamp_max, offset, scale in _SAR_NORMALIZATION:
+        np.clip(sar[channel], clamp_min, clamp_max, out=sar[channel])
+        sar[channel] += offset
+        sar[channel] *= scale
+
+
+def _normalize_optical_numpy(image: np.ndarray) -> None:
+    np.clip(image, *_OPTICAL_CLAMP_RANGE, out=image)
+    image *= _OPTICAL_SCALE
+
+
+def _normalize_sar_tensor(sar: torch.Tensor) -> None:
+    for channel, clamp_min, clamp_max, offset, scale in _SAR_NORMALIZATION:
+        sar[channel].clamp_(clamp_min, clamp_max).add_(offset).mul_(scale)
+
+
+def _normalize_optical_tensor(image: torch.Tensor) -> None:
+    image.clamp_(*_OPTICAL_CLAMP_RANGE).mul_(_OPTICAL_SCALE)
+
+
 def decode_row(row: dict[str, Any], *, include_metadata: bool = True) -> dict[str, Any]:
     """Decode one cached row into CHW float32 arrays."""
     sar = _decode_image(row["sar"], row["sar_shape"], dtype=np.float32, expected_channels=SAR_CHANNELS)
-    np.clip(sar[0], -25.0, 0.0, out=sar[0])
-    sar[0] += 25.0
-    sar[0] *= 2.0 / 25.0
-    np.clip(sar[1], -32.5, 0.0, out=sar[1])
-    sar[1] += 32.5
-    sar[1] *= 2.0 / 32.5
+    _normalize_sar_numpy(sar)
     cloudy = _decode_image(row["cloudy"], row["opt_shape"], dtype=np.int16, expected_channels=OPTICAL_CHANNELS)
-    np.clip(cloudy, 0, 10000, out=cloudy)
-    cloudy /= 2000.0
+    _normalize_optical_numpy(cloudy)
     target = _decode_image(row["target"], row["opt_shape"], dtype=np.int16, expected_channels=OPTICAL_CHANNELS)
-    np.clip(target, 0, 10000, out=target)
-    target /= 2000.0
+    _normalize_optical_numpy(target)
     decoded = {"sar": sar, "cloudy": cloudy, "target": target}
     if include_metadata:
         decoded["meta"] = {
@@ -288,28 +309,23 @@ def build_collate_fn(*, include_metadata: bool = True):
                 src_dtype=torch.float32,
                 expected_channels=SAR_CHANNELS,
             )
-            sar_batch[i][0].clamp_(-25.0, 0.0).add_(25.0).mul_(2.0 / 25.0)
-            sar_batch[i][1].clamp_(-32.5, 0.0).add_(32.5).mul_(2.0 / 32.5)
+            _normalize_sar_tensor(sar_batch[i])
             _decode_image_into(
                 cloudy_batch[i],
                 row["cloudy"],
                 row["opt_shape"],
                 src_dtype=torch.int16,
                 expected_channels=OPTICAL_CHANNELS,
-                clamp_min=0,
-                clamp_max=10000,
-                scale=1.0 / 2000.0,
             )
+            _normalize_optical_tensor(cloudy_batch[i])
             _decode_image_into(
                 target_batch[i],
                 row["target"],
                 row["opt_shape"],
                 src_dtype=torch.int16,
                 expected_channels=OPTICAL_CHANNELS,
-                clamp_min=0,
-                clamp_max=10000,
-                scale=1.0 / 2000.0,
             )
+            _normalize_optical_tensor(target_batch[i])
             if metadata is not None:
                 metadata["season"].append(str(row.get("season", "")))
                 metadata["scene"].append(str(row.get("scene", "")))

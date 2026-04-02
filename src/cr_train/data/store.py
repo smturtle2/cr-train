@@ -47,9 +47,7 @@ class RowCachePaths:
 
 def resolve_cache_root(cache_dir: str | os.PathLike[str] | None) -> Path:
     """Resolve the cache root directory. Defaults to ``~/.cache/cr-train``."""
-    root = Path(cache_dir) if cache_dir is not None else (Path.home() / ".cache" / "cr-train")
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return Path(cache_dir) if cache_dir is not None else (Path.home() / ".cache" / "cr-train")
 
 
 def resolve_row_cache_paths(source_root: Path, split: str) -> RowCachePaths:

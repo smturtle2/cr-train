@@ -6,10 +6,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .constants import BLOCK_SIZE, STOP_BIAS_ALPHA, STOP_BIAS_MIX
+from .constants import BLOCK_SIZE
 
 
-SELECTION_PLANNER_MODE = "stop_biased_exact_k"
+SELECTION_PLANNER_MODE = "uniform_exact_k"
 
 
 @dataclass(slots=True)
@@ -21,7 +21,6 @@ class SamplePlan:
     required_blocks: int
     total_blocks: int
     planner_mode: str
-    stop_bias_alpha: float
     selected_blocks: np.ndarray
     selected_bitmap: np.ndarray
     execution_block_count: int
@@ -35,40 +34,10 @@ class SelectionTrace:
     requested_rows: int
     required_blocks: int
     planner_mode: str
-    stop_bias_alpha: float
-    stop_candidates: np.ndarray
-    stop_probabilities: np.ndarray
-    sampled_stop_block: int | None
-    prefix_draws: np.ndarray
+    draw_order: np.ndarray
     selected_blocks: np.ndarray
     selected_bitmap: np.ndarray
     execution_block_count: int
-
-
-def compute_stop_probability(
-    required_blocks: int,
-    total_blocks: int,
-    stop_block: int,
-    *,
-    stop_bias_alpha: float = STOP_BIAS_ALPHA,
-) -> float:
-    """Probability mass over stop blocks across the full logical block order."""
-    if required_blocks <= 0 or total_blocks <= 0:
-        return 0.0
-    min_stop = required_blocks - 1
-    max_stop = total_blocks - 1
-    if stop_block < min_stop or stop_block > max_stop:
-        return 0.0
-    positions = np.arange(min_stop, max_stop + 1, dtype=np.float64)
-    denom = max(total_blocks - required_blocks, 1)
-    weights = np.exp(-stop_bias_alpha * ((positions - min_stop) / denom))
-    weights /= float(np.sum(weights))
-    uniform = np.full_like(weights, 1.0 / len(weights))
-    mixed_weights = (STOP_BIAS_MIX * weights) + ((1.0 - STOP_BIAS_MIX) * uniform)
-    weights_sum = float(np.sum(mixed_weights))
-    if weights_sum <= 0.0:
-        return 0.0
-    return float(mixed_weights[int(stop_block - min_stop)] / weights_sum)
 
 
 def _derive_named_seed(seed: int, split: str, purpose: str) -> int:
@@ -76,59 +45,23 @@ def _derive_named_seed(seed: int, split: str, purpose: str) -> int:
     return int(seed) ^ int.from_bytes(digest[:8], "big")
 
 
-def _sample_stop_block(
-    *,
-    required_blocks: int,
-    total_blocks: int,
-    rng: np.random.Generator,
-    stop_bias_alpha: float,
-) -> tuple[int, np.ndarray, np.ndarray]:
-    min_stop = required_blocks - 1
-    max_stop = total_blocks - 1
-    if min_stop >= max_stop:
-        stop_candidates = np.asarray([min_stop], dtype=np.int64)
-        probabilities = np.asarray([1.0], dtype=np.float64)
-        return min_stop, stop_candidates, probabilities
-    stop_candidates = np.arange(min_stop, max_stop + 1, dtype=np.int64)
-    probabilities = np.asarray(
-        [
-            compute_stop_probability(
-                required_blocks,
-                total_blocks,
-                int(stop_block),
-                stop_bias_alpha=stop_bias_alpha,
-            )
-            for stop_block in stop_candidates
-        ],
-        dtype=np.float64,
-    )
-    return int(rng.choice(stop_candidates, p=probabilities)), stop_candidates, probabilities
-
-
-def _select_blocks_stop_biased(
+def _select_blocks_uniform_exact_k(
     *,
     required_blocks: int,
     total_blocks: int,
     seed: int,
-    stop_bias_alpha: float,
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray]:
     if required_blocks <= 0 or total_blocks <= 0:
-        return np.empty((0,), dtype=np.int64), stop_bias_alpha
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty
     if required_blocks >= total_blocks:
-        return np.arange(total_blocks, dtype=np.int64), stop_bias_alpha
+        selected = np.arange(total_blocks, dtype=np.int64)
+        return selected, selected.copy()
 
     rng = np.random.default_rng(seed)
-    stop_block, _, _ = _sample_stop_block(
-        required_blocks=required_blocks,
-        total_blocks=total_blocks,
-        rng=rng,
-        stop_bias_alpha=stop_bias_alpha,
-    )
-    if required_blocks == 1:
-        return np.asarray([stop_block], dtype=np.int64), stop_bias_alpha
-    prefix_blocks = rng.choice(stop_block, size=required_blocks - 1, replace=False).astype(np.int64)
-    selected_blocks = np.sort(np.concatenate((prefix_blocks, np.asarray([stop_block], dtype=np.int64))))
-    return selected_blocks, stop_bias_alpha
+    draw_order = rng.choice(total_blocks, size=required_blocks, replace=False).astype(np.int64)
+    selected_blocks = np.sort(draw_order)
+    return selected_blocks, draw_order
 
 
 def _build_source_blocks(catalog: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
@@ -213,11 +146,7 @@ def trace_plan_sample(
             requested_rows=0,
             required_blocks=0,
             planner_mode=SELECTION_PLANNER_MODE,
-            stop_bias_alpha=STOP_BIAS_ALPHA,
-            stop_candidates=np.empty((0,), dtype=np.int64),
-            stop_probabilities=np.empty((0,), dtype=np.float64),
-            sampled_stop_block=None,
-            prefix_draws=np.empty((0,), dtype=np.int64),
+            draw_order=np.empty((0,), dtype=np.int64),
             selected_blocks=np.empty((0,), dtype=np.int64),
             selected_bitmap=np.zeros(total_blocks, dtype=np.bool_),
             execution_block_count=0,
@@ -233,30 +162,17 @@ def trace_plan_sample(
             requested_rows=requested_rows,
             required_blocks=required_blocks,
             planner_mode=SELECTION_PLANNER_MODE,
-            stop_bias_alpha=STOP_BIAS_ALPHA,
-            stop_candidates=np.asarray([total_blocks - 1], dtype=np.int64),
-            stop_probabilities=np.asarray([1.0], dtype=np.float64),
-            sampled_stop_block=(total_blocks - 1) if total_blocks > 0 else None,
-            prefix_draws=selected_blocks[:-1],
+            draw_order=selected_blocks.copy(),
             selected_blocks=selected_blocks,
             selected_bitmap=selected_bitmap,
             execution_block_count=(int(selected_blocks[-1]) + 1) if selected_blocks.size else 0,
         )
 
-    rng = np.random.default_rng(split_seed)
-    sampled_stop_block, stop_candidates, stop_probabilities = _sample_stop_block(
+    selected_blocks, draw_order = _select_blocks_uniform_exact_k(
         required_blocks=required_blocks,
         total_blocks=total_blocks,
-        rng=rng,
-        stop_bias_alpha=STOP_BIAS_ALPHA,
+        seed=split_seed,
     )
-    if required_blocks == 1:
-        prefix_draws = np.empty((0,), dtype=np.int64)
-        selected_blocks = np.asarray([sampled_stop_block], dtype=np.int64)
-    else:
-        prefix_draws = np.sort(rng.choice(sampled_stop_block, size=required_blocks - 1, replace=False).astype(np.int64))
-        selected_blocks = np.concatenate((prefix_draws, np.asarray([sampled_stop_block], dtype=np.int64)))
-
     selected_bitmap = np.zeros(total_blocks, dtype=np.bool_)
     selected_bitmap[selected_blocks] = True
     return SelectionTrace(
@@ -264,11 +180,7 @@ def trace_plan_sample(
         requested_rows=requested_rows,
         required_blocks=required_blocks,
         planner_mode=SELECTION_PLANNER_MODE,
-        stop_bias_alpha=STOP_BIAS_ALPHA,
-        stop_candidates=stop_candidates,
-        stop_probabilities=stop_probabilities,
-        sampled_stop_block=sampled_stop_block,
-        prefix_draws=prefix_draws,
+        draw_order=draw_order,
         selected_blocks=selected_blocks,
         selected_bitmap=selected_bitmap,
         execution_block_count=int(selected_blocks[-1]) + 1,
@@ -295,7 +207,6 @@ def plan_sample(
             required_blocks=0,
             total_blocks=total_blocks,
             planner_mode=SELECTION_PLANNER_MODE,
-            stop_bias_alpha=STOP_BIAS_ALPHA,
             selected_blocks=np.empty((0,), dtype=np.int64),
             selected_bitmap=np.zeros(total_blocks, dtype=np.bool_),
             execution_block_count=0,
@@ -304,11 +215,10 @@ def plan_sample(
         )
 
     required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE)))
-    selected_blocks, stop_bias_alpha = _select_blocks_stop_biased(
+    selected_blocks, _draw_order = _select_blocks_uniform_exact_k(
         required_blocks=required_blocks,
         total_blocks=total_blocks,
         seed=split_seed,
-        stop_bias_alpha=STOP_BIAS_ALPHA,
     )
     selected_bitmap = np.zeros(total_blocks, dtype=np.bool_)
     selected_bitmap[selected_blocks] = True
@@ -323,7 +233,6 @@ def plan_sample(
         required_blocks=required_blocks,
         total_blocks=total_blocks,
         planner_mode=SELECTION_PLANNER_MODE,
-        stop_bias_alpha=stop_bias_alpha,
         selected_blocks=selected_blocks,
         selected_bitmap=selected_bitmap,
         execution_block_count=(int(selected_blocks[-1]) + 1) if selected_blocks.size else 0,
@@ -335,7 +244,6 @@ __all__ = [
     "SELECTION_PLANNER_MODE",
     "SamplePlan",
     "SelectionTrace",
-    "compute_stop_probability",
     "plan_sample",
     "trace_plan_sample",
 ]

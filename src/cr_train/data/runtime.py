@@ -50,7 +50,6 @@ class WarmupSummary:
     effective_rows: int
     required_blocks: int
     planner_mode: str
-    stop_bias_alpha: float
     selected_block_count: int
     cached_selected_blocks: int
     selected_missing_blocks: int
@@ -64,7 +63,6 @@ class WarmupSummary:
             "effective_rows": self.effective_rows,
             "required_blocks": self.required_blocks,
             "planner_mode": self.planner_mode,
-            "stop_bias_alpha": self.stop_bias_alpha,
             "selected_block_count": self.selected_block_count,
             "cached_selected_blocks": self.cached_selected_blocks,
             "selected_missing_blocks": self.selected_missing_blocks,
@@ -227,7 +225,6 @@ def _build_warmup_summary(
         effective_rows=sample_plan.effective_rows,
         required_blocks=sample_plan.required_blocks,
         planner_mode=sample_plan.planner_mode,
-        stop_bias_alpha=sample_plan.stop_bias_alpha,
         selected_block_count=sample_plan.required_blocks,
         cached_selected_blocks=cached_selected_blocks,
         selected_missing_blocks=selected_missing_blocks,

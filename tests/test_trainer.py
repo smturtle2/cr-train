@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -11,6 +12,16 @@ import torch
 from cr_train import Trainer
 from cr_train.data import BLOCK_SIZE
 from cr_train.trainer_runtime import MetricAccumulator, update_progress_bar
+
+
+def test_top_level_package_exports_trainer_as_primary_entry_point() -> None:
+    package = importlib.import_module("cr_train")
+    namespace: dict[str, object] = {}
+    exec("from cr_train import Trainer\n", namespace)
+
+    assert package.__all__ == ["Trainer"]
+    assert package.Trainer is Trainer
+    assert namespace["Trainer"] is Trainer
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -237,9 +248,20 @@ def test_trainer_step_and_test_with_row_cache_warmup(monkeypatch, tmp_path: Path
         cache_dir=tmp_path / "cache",
     )
 
-    assert metrics_path.read_text(encoding="utf-8") == ""
+    assert metrics_path.read_text(encoding="utf-8") == "old-record\n"
 
     epoch_summary = trainer.step()
+    metrics_records_after_step = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    startup_records_after_step = [record for record in metrics_records_after_step if record["kind"] == "startup"]
+    warmup_splits_after_step = {
+        record["split"]
+        for record in startup_records_after_step
+        if record["stage"] == "warm split cache" and record["status"] == "done"
+    }
+
     test_summary = trainer.test()
     metrics_records = [
         json.loads(line)
@@ -273,6 +295,7 @@ def test_trainer_step_and_test_with_row_cache_warmup(monkeypatch, tmp_path: Path
     assert "old-record" not in metrics_path.read_text(encoding="utf-8")
 
     assert "dataset_seed" not in config_record
+    assert warmup_splits_after_step == {"train", "validation"}
     assert "ensure catalog" in startup_stages
     assert "warm split cache" in startup_stages
     assert "load local cache" in startup_stages
@@ -309,8 +332,7 @@ def test_trainer_step_and_test_with_row_cache_warmup(monkeypatch, tmp_path: Path
     warmup_records_by_split = {record["split"]: record for record in warmup_done_records[:3]}
 
     assert [record["selected_block_count"] for record in warmup_done_records[:3]] == [2, 1, 1]
-    assert all(record["planner_mode"] == "stop_biased_exact_k" for record in warmup_done_records[:3])
-    assert all(record["stop_bias_alpha"] == 8.0 for record in warmup_done_records[:3])
+    assert all(record["planner_mode"] == "uniform_exact_k" for record in warmup_done_records[:3])
     assert all("timeline" in record for record in warmup_done_records[:3])
     assert all(len(str(record["timeline"])) == int(record["execution_block_count"]) for record in warmup_done_records[:3])
     assert all(set(str(record["timeline"])) <= {"█", "░"} for record in warmup_done_records[:3])
@@ -343,6 +365,22 @@ def test_trainer_rejects_optimizer_from_other_model() -> None:
             torch.optim.AdamW(other_model.parameters(), lr=1e-3),
             loss_fn,
         )
+
+
+def test_trainer_defers_output_dir_creation_until_first_write(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    output_dir = tmp_path / "run"
+    model = TinyModel()
+    Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert not output_dir.exists()
 
 
 def test_trainer_wraps_model_for_distributed_without_device_bootstrap_bug(monkeypatch, tmp_path: Path) -> None:

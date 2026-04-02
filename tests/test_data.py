@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
+import importlib
 from pathlib import Path
 
 import numpy as np
@@ -9,23 +11,21 @@ import pytest
 
 from cr_train.data import (
     BLOCK_SIZE,
-    STOP_BIAS_ALPHA,
     build_collate_fn,
     build_dataloader,
-    compute_stop_probability,
     decode_row,
-    ensure_source_root,
-    ensure_split_cache,
-    normalize_parquet_uri,
     plan_sample,
-    prepare_split,
+    trace_plan_sample,
 )
+from cr_train.data.dataset import prepare_split
 from cr_train.data.runtime import (
     WarmupProgressState,
     _compact_warmup_timeline,
     _render_warmup_timeline,
     _update_warmup_progress,
+    ensure_split_cache,
 )
+from cr_train.data.source import ensure_source_root, normalize_parquet_uri
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -183,17 +183,85 @@ def _catalog(total_rows: int) -> dict[str, object]:
     return {"total_rows": total_rows}
 
 
-def _uniform_execution_block_count(seed: int, *, required_blocks: int, total_blocks: int) -> int:
-    rng = np.random.default_rng(seed)
-    selected_blocks = np.sort(
-        rng.choice(total_blocks, size=required_blocks, replace=False).astype(np.int64)
-    )
-    return int(selected_blocks[-1]) + 1
+def _selection_seed(seed: int, *, split: str) -> int:
+    digest = hashlib.sha256(f"selection:{split}".encode("utf-8")).digest()
+    return int(seed) ^ int.from_bytes(digest[:8], "big")
+
+
+def _uniform_selected_blocks(seed: int, *, split: str, required_blocks: int, total_blocks: int) -> np.ndarray:
+    if required_blocks <= 0 or total_blocks <= 0:
+        return np.empty((0,), dtype=np.int64)
+    if required_blocks >= total_blocks:
+        return np.arange(total_blocks, dtype=np.int64)
+    rng = np.random.default_rng(_selection_seed(seed, split=split))
+    return np.sort(rng.choice(total_blocks, size=required_blocks, replace=False).astype(np.int64))
 
 
 def _row_store_root(catalog_path: Path, split: str) -> Path:
     source_root = catalog_path.parent.parent
     return source_root / "row_store" / split
+
+
+def test_data_package_public_surface_is_minimal_and_explicit() -> None:
+    data_mod = importlib.import_module("cr_train.data")
+
+    assert set(data_mod.__all__) == {
+        "BLOCK_SIZE",
+        "CachedRowDataset",
+        "DATASET_ID",
+        "DATA_COLUMNS",
+        "OPTICAL_CHANNELS",
+        "PreparedSplit",
+        "SAR_CHANNELS",
+        "SamplePlan",
+        "SelectionTrace",
+        "build_collate_fn",
+        "build_dataloader",
+        "decode_row",
+        "move_batch_to_device",
+        "plan_sample",
+        "resolve_num_workers",
+        "seed_everything",
+        "seed_worker",
+        "trace_plan_sample",
+    }
+    assert all(hasattr(data_mod, name) for name in data_mod.__all__)
+
+
+def test_data_package_rejects_internal_helpers_from_top_level_imports() -> None:
+    for name in (
+        "STOP_BIAS_ALPHA",
+        "compute_stop_probability",
+        "prepare_split",
+        "ensure_split_cache",
+        "ensure_source_root",
+        "normalize_parquet_uri",
+        "resolve_cache_root",
+        "run_startup_stage",
+    ):
+        with pytest.raises(ImportError):
+            exec(f"from cr_train.data import {name}", {})
+
+
+def test_internal_data_helpers_live_in_owning_submodules() -> None:
+    source_mod = importlib.import_module("cr_train.data.source")
+    store_mod = importlib.import_module("cr_train.data.store")
+
+    namespace: dict[str, object] = {}
+    exec(
+        "from cr_train.data.dataset import prepare_split\n"
+        "from cr_train.data.runtime import ensure_split_cache\n"
+        "from cr_train.data.source import ensure_source_root, normalize_parquet_uri, run_startup_stage\n"
+        "from cr_train.data.store import resolve_cache_root\n",
+        namespace,
+    )
+
+    assert namespace["prepare_split"] is prepare_split
+    assert namespace["ensure_split_cache"] is ensure_split_cache
+    assert namespace["ensure_source_root"] is ensure_source_root
+    assert namespace["normalize_parquet_uri"] is normalize_parquet_uri
+    assert namespace["run_startup_stage"] is source_mod.run_startup_stage
+    assert namespace["resolve_cache_root"] is store_mod.resolve_cache_root
 
 
 def test_decode_row_converts_to_chw_and_normalizes() -> None:
@@ -218,6 +286,16 @@ def test_build_collate_fn_batches_rows() -> None:
     assert batch["meta"]["patch"] == ["p000", "p001"]
 
 
+def test_build_collate_fn_matches_decode_row_normalization() -> None:
+    row = _make_row(2)
+    decoded = decode_row(row, include_metadata=False)
+    batch = build_collate_fn(include_metadata=False)([row])
+
+    assert np.allclose(batch["sar"][0].numpy(), decoded["sar"])
+    assert np.allclose(batch["cloudy"][0].numpy(), decoded["cloudy"])
+    assert np.allclose(batch["target"][0].numpy(), decoded["target"])
+
+
 def test_plan_sample_is_block_reproducible_within_total_block_domain() -> None:
     catalog = _catalog(total_rows=10 * BLOCK_SIZE)
 
@@ -233,8 +311,7 @@ def test_plan_sample_is_block_reproducible_within_total_block_domain() -> None:
     assert sample_a.required_blocks == 2
     assert sample_a.effective_rows == 2 * BLOCK_SIZE
     assert sample_a.total_blocks == 10
-    assert sample_a.planner_mode == "stop_biased_exact_k"
-    assert sample_a.stop_bias_alpha == pytest.approx(STOP_BIAS_ALPHA)
+    assert sample_a.planner_mode == "uniform_exact_k"
     assert sample_a.selected_blocks.size == sample_a.required_blocks
     assert np.array_equal(sample_a.selected_blocks, sample_b.selected_blocks)
     assert np.array_equal(sample_a.selected_row_ids, sample_b.selected_row_ids)
@@ -288,15 +365,31 @@ def test_plan_sample_rounds_requested_rows_by_fixed_block_size() -> None:
     assert sample.total_blocks == 3
 
 
-def test_compute_stop_probability_is_front_biased_and_normalized() -> None:
-    stop_probs = [
-        compute_stop_probability(4, 8, stop_block, stop_bias_alpha=STOP_BIAS_ALPHA)
-        for stop_block in range(3, 8)
-    ]
+def test_plan_sample_matches_uniform_exact_k_selection() -> None:
+    sample = plan_sample(_catalog(total_rows=10 * BLOCK_SIZE), seed=7, max_samples=3 * BLOCK_SIZE, split="train")
+    expected_blocks = _uniform_selected_blocks(
+        7,
+        split="train",
+        required_blocks=sample.required_blocks,
+        total_blocks=sample.total_blocks,
+    )
 
-    assert sum(stop_probs) == pytest.approx(1.0)
-    assert stop_probs == sorted(stop_probs, reverse=True)
-    assert stop_probs[0] > stop_probs[-1]
+    assert np.array_equal(sample.selected_blocks, expected_blocks)
+
+
+def test_trace_plan_sample_exposes_uniform_draw_order() -> None:
+    trace = trace_plan_sample(_catalog(total_rows=10 * BLOCK_SIZE), seed=11, max_samples=3 * BLOCK_SIZE, split="train")
+    expected_rng = np.random.default_rng(_selection_seed(11, split="train"))
+    expected_draw_order = expected_rng.choice(
+        trace.total_blocks,
+        size=trace.required_blocks,
+        replace=False,
+    ).astype(np.int64)
+
+    assert trace.planner_mode == "uniform_exact_k"
+    assert np.array_equal(trace.draw_order, expected_draw_order)
+    assert np.array_equal(trace.selected_blocks, np.sort(expected_draw_order))
+    assert np.array_equal(trace.selected_bitmap.nonzero()[0], trace.selected_blocks)
 
 
 def test_render_warmup_timeline_maps_selected_and_skipped_blocks() -> None:
@@ -318,34 +411,19 @@ def test_compact_warmup_timeline_truncates_with_ellipsis() -> None:
     assert "…" in compact
 
 
-def test_plan_sample_front_bias_favors_earlier_stop_blocks() -> None:
-    stop_counts = np.zeros(9, dtype=np.int64)
-
-    for seed in range(4096):
-        sample_plan = plan_sample(_catalog(total_rows=10 * BLOCK_SIZE), seed=seed, max_samples=2 * BLOCK_SIZE)
-        stop_counts[sample_plan.execution_block_count - 2] += 1
-
-    assert stop_counts.tolist() == sorted(stop_counts.tolist(), reverse=True)
-    assert int(stop_counts[0]) > int(stop_counts[-1])
-
-
-def test_plan_sample_reduces_execution_span_vs_uniform_choice_baseline() -> None:
+def test_plan_sample_execution_span_matches_uniform_baseline() -> None:
     catalog = _catalog(total_rows=64 * BLOCK_SIZE)
-    sequential_counts = []
-    uniform_counts = []
 
-    for seed in range(256):
+    for seed in range(64):
         sample_plan = plan_sample(catalog, seed=seed, max_samples=16 * BLOCK_SIZE)
-        sequential_counts.append(sample_plan.execution_block_count)
-        uniform_counts.append(
-                _uniform_execution_block_count(
-                    seed,
-                    required_blocks=sample_plan.required_blocks,
-                    total_blocks=sample_plan.total_blocks,
-                )
-            )
+        expected_blocks = _uniform_selected_blocks(
+            seed,
+            split="",
+            required_blocks=sample_plan.required_blocks,
+            total_blocks=sample_plan.total_blocks,
+        )
 
-    assert float(np.mean(sequential_counts)) < float(np.mean(uniform_counts))
+        assert sample_plan.execution_block_count == int(expected_blocks[-1]) + 1
 
 
 def test_normalize_parquet_uri_converts_hf_resolve_url() -> None:

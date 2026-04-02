@@ -84,7 +84,6 @@ def format_startup_message(event: dict[str, Any]) -> str:
         "effective_rows",
         "required_blocks",
         "planner_mode",
-        "stop_bias_alpha",
         "selected_block_count",
         "cached_selected_blocks",
         "selected_missing_blocks",

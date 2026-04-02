@@ -101,7 +101,7 @@ Pass `--max-train-samples none` (or `full`) to cache and train on the entire spl
 
 ### Sampling algorithm visualization
 
-See how the block-selection bitmask is built step by step:
+See how the uniform exact-k block-selection bitmask is built:
 
 ```bash
 uv run python examples/bitmask_sampling_demo.py \
@@ -110,26 +110,32 @@ uv run python examples/bitmask_sampling_demo.py \
   --seed 9
 ```
 
-Output shows the stop-block probability table, the sampled stop, the prefix draws, and a final bitmap of selected (`■`) vs. skipped (`□`) blocks.
+Output shows the raw draw order, the final selected block indices, and a bitmap of selected (`■`) vs. skipped (`□`) logical blocks.
 
 ---
 
-## Architecture
+## What Trainer Handles
 
-```mermaid
-flowchart TD
-    HF["HF Parquet Export<br/><code>Hermanni/sen12mscr</code>"]
-    ORDER["Logical Row Order<br/><code>seed</code>"]
-    PLAN["Block Selection Planner<br/><code>seed</code> · stop-biased exact-k"]
-    CACHE["Local Row Cache<br/>Arrow chunks · row-indexed"]
-    DS["CachedRowDataset"]
-    DL["DataLoader<br/>DDP-aware · pinned memory"]
-    TRAIN["Trainer.step() / test()"]
-    OUT["Outputs<br/><code>metrics.jsonl</code> · <code>epoch-NNNN.pt</code>"]
+Most users only need `from cr_train import Trainer`. Once you construct it, `Trainer` automatically:
 
-    HF --> ORDER --> PLAN --> CACHE
-    CACHE --> DS --> DL --> TRAIN --> OUT
+- resolves dataset metadata and local cache state
+- warms only the splits needed for the current call
+- builds dataloaders and distributed samplers
+- writes `metrics.jsonl` and `epoch-NNNN.pt` checkpoints
+
+You do not need any cache or dataloader setup code for the normal training flow.
+
+---
+
+## Advanced Sampling Tools
+
+If you want to inspect the deterministic uniform exact-k block planner directly, the supported advanced surface stays under `cr_train.data`:
+
+```python
+from cr_train.data import BLOCK_SIZE, trace_plan_sample
 ```
+
+This is optional. The main product surface is still `Trainer`.
 
 ---
 
@@ -193,43 +199,11 @@ Runs test evaluation with the current model state. Returns:
 
 ---
 
-## How It Works
+## Under the Hood
 
-### Row-indexed caching
+`Trainer` reads the HuggingFace Parquet export, keeps a reusable local row cache, and records startup events in `metrics.jsonl`. The same `seed` preserves uniform exact-k logical block membership across runs, while training batch order still changes by epoch through `seed + epoch_index`.
 
-The source dataset is described once via the HF dataset viewer Parquet metadata. Warmup then fills a split-wide **row-indexed cache**. Logical blocks still exist for planning and tqdm display, but each logical block is now one source `row_group`, and the on-disk cache is keyed by global row id and reused across different plans.
-
-```
-~/.cache/cr-train/layout-v10/<source>/row_store/<split>/
-├── chunks/             # Arrow IPC chunks with raw rows
-├── state.json          # cache state (row counts, next chunk id)
-├── chunk_ids.npy       # global row id → chunk id
-├── row_offsets.npy     # global row id → row offset inside the chunk
-└── cached_rows.npy     # boolean mask of cached global row ids
-```
-
-### Deterministic sampling
-
-The system uses one seed for full reproducibility:
-
-| Seed | Controls | Effect |
-|------|----------|--------|
-| `seed` | Row-group block order + block selection | Derives a deterministic order over source `row_group` blocks and then samples logical blocks from the full block order with a stop-biased exact-k planner. |
-
-The planner remains deterministic and always returns exactly the required block count. The requested row count is converted to a block count using the fixed `BLOCK_SIZE=64` accounting unit, then full row-group blocks are sampled. Same `seed` = same row-group block order and block selection across runs. Different `seed` values sample different logical blocks and block orderings.
-
-### Cache warmup lifecycle
-
-1. On the first `step()` or `test()`, warmup runs for all three splits (train, validation, test).
-2. The planner compares selected logical blocks against already-cached rows.
-3. Only missing rows are read from HuggingFace Parquet shards. If every selected block is already covered, the remote source is never contacted.
-4. A tqdm progress bar tracks logical-block warmup. On completion, a block timeline is printed:
-
-```
-██░░██████░░░░██████████░░██ cache train | warm | selected=42 fill=42/42
-```
-
-`█` = selected logical block, `░` = skipped block before the sampled stop block.
+During warmup, `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing rows are fetched from HuggingFace only when the selected blocks are not already cached locally.
 
 ---
 
@@ -282,7 +256,7 @@ def my_loss(prediction, batch):
 ## Notes
 
 - Cache warmup shows a tqdm progress bar during block download and prints a block timeline on completion.
-- Equal `seed` values keep the same block-selection membership; train batch order still changes by epoch via `seed + epoch_index`.
+- Equal `seed` values keep the same uniform exact-k block-selection membership; train batch order still changes by epoch via `seed + epoch_index`.
 - Finished caches are never auto-deleted. Remove them manually from the cache directory to reclaim disk space.
 - `Trainer.step()` shows running-average loss and metrics with batch-level tqdm during training.
 - Checkpoints are saved as `epoch-NNNN.pt` containing `model`, `optimizer`, `epoch`, and `global_step` state dicts.

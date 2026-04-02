@@ -1,7 +1,7 @@
-"""SEN12MS-CR training example with the row-indexed sample cache.
+"""SEN12MS-CR training example built around ``Trainer``.
 
-Trains a small FusionBaseline CNN that fuses SAR (2ch) and cloudy optical (13ch)
-inputs to reconstruct cloud-free optical images (13ch) using L1 loss.
+Create a model, optimizer, and loss, then let ``Trainer`` handle dataset access,
+cache warmup, dataloaders, metrics, and checkpoints.
 
 Usage:
     uv run python examples/train_sen12mscr.py \\
@@ -20,7 +20,6 @@ Output:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import torch
 from torch import nn
@@ -74,7 +73,7 @@ def parse_max_samples(value: str) -> int | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run SEN12MS-CR training with the row-indexed sample cache.",
+        description="Run SEN12MS-CR training with Trainer.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -133,9 +132,6 @@ def mean_absolute_error(prediction: torch.Tensor, batch: dict[str, torch.Tensor]
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     device = resolve_device(args.device)
     model = FusionBaseline(hidden_channels=args.hidden_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -151,7 +147,7 @@ def main() -> None:
         batch_size=args.batch_size,
         epochs=args.epochs,
         seed=args.seed,
-        output_dir=output_dir,
+        output_dir=args.output_dir,
         cache_dir=args.cache_dir,
     )
 

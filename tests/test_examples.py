@@ -26,4 +26,6 @@ def test_bitmask_demo_example_loads_without_running_main() -> None:
     assert "main" in namespace
     assert result["required_blocks"] == 1
     assert result["total_blocks"] == 2
+    assert result["planner_mode"] == "uniform_exact_k"
+    assert len(result["draw_order"]) == 1
     assert len(result["selected_blocks"]) == 1

@@ -11,19 +11,11 @@ import torch
 from torch import nn
 from tqdm.auto import tqdm
 
-from .data import (
-    DATASET_ID,
-    build_dataloader,
-    ensure_split_cache,
-    is_distributed,
-    is_primary,
-    move_batch_to_device,
-    prepare_split,
-    resolve_cache_root,
-    resolve_num_workers,
-    run_startup_stage,
-    seed_everything,
-)
+from .data.constants import DATASET_ID
+from .data.dataset import build_dataloader, move_batch_to_device, prepare_split, resolve_num_workers, seed_everything
+from .data.runtime import ensure_split_cache, is_distributed, is_primary
+from .data.store import resolve_cache_root
+from .data.source import run_startup_stage
 from .trainer_reporting import format_config_banner, format_epoch_summary, format_startup_message, format_test_summary, serialize_value, should_print_startup
 from .trainer_runtime import MetricAccumulator, compute_loss, compute_metric_values, finalize_summary, prime_iterator, update_progress_bar
 
@@ -90,10 +82,8 @@ class Trainer:
 
         self.num_workers = resolve_num_workers("auto")
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.output_dir / "metrics.jsonl"
         self.cache_root = resolve_cache_root(cache_dir)
-        self._reset_metrics_file()
 
         self.include_metadata = True
         self.pin_memory = True
@@ -103,7 +93,7 @@ class Trainer:
         self.current_epoch = 0
         self.global_step = 0
         self._config_written = False
-        self._cache_ready = False
+        self._cache_ready: set[str] = set()
 
         self.device = self._infer_module_device(self.model)
         self._wrap_model_for_ddp_if_needed()
@@ -119,7 +109,6 @@ class Trainer:
         epoch_index = self.current_epoch
         self._seed_epoch(epoch_index)
         self._write_config_once()
-        self._ensure_split_caches()
 
         train_summary = self._run_training_epoch(epoch_index)
         if is_primary():
@@ -170,7 +159,6 @@ class Trainer:
     def test(self) -> dict[str, Any]:
         """Run the test split with the current model state."""
         self._write_config_once()
-        self._ensure_split_caches()
         test_summary = self._run_evaluation(
             split="test",
             max_samples=self.max_test_samples,
@@ -219,9 +207,13 @@ class Trainer:
     def _seed_epoch(self, epoch_index: int) -> None:
         seed_everything(self.seed + epoch_index, deterministic=True)
 
+    def _ensure_output_dir(self) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
     def _reset_metrics_file(self) -> None:
         if not is_primary():
             return
+        self._ensure_output_dir()
         self.metrics_path.write_text("", encoding="utf-8")
 
     def _write_config_once(self) -> None:
@@ -232,6 +224,7 @@ class Trainer:
         if not is_primary():
             return
 
+        self._reset_metrics_file()
         self._write_record(
             {
                 "kind": "config",
@@ -270,26 +263,20 @@ class Trainer:
             return self.model.module
         return self.model
 
-    def _ensure_split_caches(self) -> None:
-        if self._cache_ready:
+    def _ensure_split_cache(self, *, split: str, max_samples: int | None) -> None:
+        if split in self._cache_ready:
             return
 
-        split_specs = (
-            ("train", self.max_train_samples),
-            ("validation", self.max_val_samples),
-            ("test", self.max_test_samples),
+        ensure_split_cache(
+            split=split,
+            dataset_name=DATASET_ID,
+            revision=None,
+            max_samples=max_samples,
+            seed=self.seed,
+            cache_root=self.cache_root,
+            startup_callback=self._handle_startup_event,
         )
-        for split, max_samples in split_specs:
-            ensure_split_cache(
-                split=split,
-                dataset_name=DATASET_ID,
-                revision=None,
-                max_samples=max_samples,
-                seed=self.seed,
-                cache_root=self.cache_root,
-                startup_callback=self._handle_startup_event,
-            )
-        self._cache_ready = True
+        self._cache_ready.add(split)
 
     def _build_loader(
         self,
@@ -299,6 +286,7 @@ class Trainer:
         training: bool,
         epoch_index: int,
     ) -> tuple[Any, int | None]:
+        self._ensure_split_cache(split=split, max_samples=max_samples)
         prepared = prepare_split(
             split=split,
             dataset_name=DATASET_ID,
@@ -490,6 +478,7 @@ class Trainer:
         if not is_primary():
             return checkpoint_path
 
+        self._ensure_output_dir()
         checkpoint = {
             "epoch": next_epoch,
             "global_step": self.global_step,
@@ -500,6 +489,7 @@ class Trainer:
         return checkpoint_path
 
     def _write_record(self, record: Mapping[str, Any]) -> None:
+        self._ensure_output_dir()
         serialized = {key: serialize_value(value) for key, value in record.items()}
         with self.metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(serialized, sort_keys=True) + "\n")
