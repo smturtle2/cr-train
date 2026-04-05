@@ -64,9 +64,9 @@ class Trainer:
         seed: int = 42,
         output_dir: str | Path = "runs/default",
         cache_dir: str | Path | None = None,
-        train_crop_size: int | None = None,
-        train_random_flip: bool = False,
-        train_random_rot90: bool = False,
+        train_crop_size: int | None = 128,
+        train_random_flip: bool = True,
+        train_random_rot90: bool = True,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
