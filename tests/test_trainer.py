@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import os
 import re
 from collections import defaultdict
 from collections.abc import Mapping
@@ -14,6 +15,7 @@ import torch
 
 from cr_train import Trainer
 from cr_train.data import BLOCK_SIZE
+from cr_train.progress import resolve_progress_bar_ncols
 from cr_train.data.store import resolve_block_cache_paths
 from cr_train.trainer_reporting import format_cache_summary, format_epoch_summary
 
@@ -195,6 +197,7 @@ class FakeTqdm:
         self.total = kwargs.get("total")
         self.desc = kwargs.get("desc")
         self.disable = kwargs.get("disable", False)
+        self.ncols = kwargs.get("ncols")
         self.updates: list[int] = []
         self.postfixes: list[str] = []
         self.desc_history: list[str] = [str(self.desc)] if self.desc is not None else []
@@ -251,6 +254,22 @@ def test_format_cache_summary_compacts_square_timeline_on_one_line() -> None:
     assert "…" in summary
 
 
+def test_resolve_progress_bar_ncols_leaves_one_column_headroom(monkeypatch) -> None:
+    import cr_train.progress as progress_mod
+
+    monkeypatch.setattr(
+        progress_mod.shutil,
+        "get_terminal_size",
+        lambda fallback: os.terminal_size((80, 24)),
+    )
+
+    assert resolve_progress_bar_ncols(file=SimpleNamespace(isatty=lambda: True)) == 79
+
+
+def test_resolve_progress_bar_ncols_returns_none_for_non_tty() -> None:
+    assert resolve_progress_bar_ncols(file=SimpleNamespace(isatty=lambda: False)) is None
+
+
 def test_format_epoch_summary_prefers_elapsed_time_over_throughput() -> None:
     summary = format_epoch_summary(
         {
@@ -292,6 +311,8 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     )
     monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
     monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.data.runtime.resolve_progress_bar_ncols", lambda: 79)
+    monkeypatch.setattr("cr_train.trainer.resolve_progress_bar_ncols", lambda: 79)
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
     model = TinyModel()
@@ -390,11 +411,13 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert all(any("MB/s" in values for values in bar.postfixes) for bar in warmup_bars)
     assert all(len(bar.postfixes) > int(bar.total) for bar in warmup_bars)
     assert all(len(bar.desc_history) == 1 for bar in warmup_bars)
+    assert all(bar.ncols == 79 for bar in warmup_bars)
 
     assert len(batch_bars) == 3
     assert any(any("loss" in values and "mae" in values for values in bar.postfixes) for bar in batch_bars)
     assert all(all("batches/s" not in values for values in bar.postfixes) for bar in batch_bars)
     assert all(all(value == 1 for value in bar.updates) for bar in batch_bars)
+    assert all(bar.ncols == 79 for bar in batch_bars)
 
     warmup_done_records = [
         record

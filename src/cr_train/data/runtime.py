@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 from .constants import BLOCK_SIZE, WARMUP_DOWNLOAD_SPEED_WINDOW_SEC, WARMUP_SPEED_EMA_ALPHA, WARMUP_TIMELINE_WIDTH
 from .planning import SamplePlan, plan_sample
 from .source import emit_startup_event, ensure_source_root, ensure_split_catalog, load_block_rows, resolve_catalog_path
+from ..progress import resolve_progress_bar_ncols, set_progress_postfix_str
 from .store import (
     BlockCachePaths,
     block_is_cached,
@@ -120,14 +121,6 @@ def _format_rate(value: float, unit: str) -> str:
     return f"{value:.1f} {unit}" if value < 100 else f"{value:.0f} {unit}"
 
 
-def _set_progress_postfix_str(progress: Any, text: str) -> None:
-    if hasattr(progress, "set_postfix_str"):
-        progress.set_postfix_str(text)
-        return
-    if hasattr(progress, "set_postfix"):
-        progress.set_postfix(text)
-
-
 def _update_warmup_progress(
     progress: Any,
     *,
@@ -193,7 +186,7 @@ def _update_warmup_progress(
     download_speed_mb_per_sec = display_download_bytes_per_sec / (1024.0 * 1024.0)
     postfix_parts = [f"sel: {selected_block_count}"]
     postfix_parts.append(_format_rate(download_speed_mb_per_sec, "MB/s"))
-    _set_progress_postfix_str(
+    set_progress_postfix_str(
         progress,
         ", ".join(postfix_parts),
     )
@@ -383,7 +376,7 @@ def _warm_missing_blocks(
         desc=f"cache {split}",
         unit="blk",
         disable=not is_primary(),
-        dynamic_ncols=True,
+        ncols=resolve_progress_bar_ncols(),
         leave=False,
         colour="#ff9800",
         smoothing=0.3,

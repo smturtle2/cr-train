@@ -23,6 +23,7 @@ from .data.dataset import (
     seed_everything,
 )
 from .data.runtime import ensure_split_cache, is_distributed, is_primary
+from .progress import resolve_progress_bar_ncols
 from .data.store import resolve_cache_root
 from .data.source import run_startup_stage
 from .trainer_reporting import format_config_banner, format_epoch_summary, format_startup_message, format_test_summary, serialize_value, should_print_startup
@@ -648,7 +649,7 @@ class Trainer:
             total=total,
             desc=description,
             disable=not is_primary(),
-            dynamic_ncols=True,
+            ncols=resolve_progress_bar_ncols(),
             leave=False,
             colour="#4caf50" if is_training else "#00bcd4",
             smoothing=0.1,

@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from .progress import set_progress_postfix_str
+
 
 @dataclass(slots=True)
 class MetricAccumulator:
@@ -67,14 +69,6 @@ def _format_metric(value: float) -> str:
     return f"{value:.2f}"
 
 
-def _set_progress_postfix_str(progress: Any, text: str) -> None:
-    if hasattr(progress, "set_postfix_str"):
-        progress.set_postfix_str(text)
-        return
-    if hasattr(progress, "set_postfix"):
-        progress.set_postfix(text)
-
-
 def _reduce_progress_state(
     *,
     accumulator: MetricAccumulator,
@@ -116,7 +110,7 @@ def update_progress_bar(
         for key, value in reduced_sums.items()
         if reduced_examples > 0
     ]
-    _set_progress_postfix_str(progress, ", ".join(postfix_parts))
+    set_progress_postfix_str(progress, ", ".join(postfix_parts))
 
 
 def finalize_summary(
