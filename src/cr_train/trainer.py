@@ -132,7 +132,7 @@ class Trainer:
         )
 
     def step(self) -> dict[str, Any]:
-        """Run one training epoch, validation, and checkpoint the result."""
+        """Run one training epoch and validation."""
         if self.current_epoch >= self.epochs:
             raise RuntimeError(
                 f"all epochs are already consumed ({self.current_epoch}/{self.epochs})"
@@ -169,24 +169,13 @@ class Trainer:
                 }
             )
 
-        checkpoint_path = self._save_checkpoint(epoch_index + 1)
         elapsed_sec = time.perf_counter() - step_started_at
-        if is_primary():
-            self._write_record(
-                {
-                    "kind": "checkpoint",
-                    "epoch": epoch_index + 1,
-                    "path": checkpoint_path,
-                    "elapsed_sec": elapsed_sec,
-                }
-            )
 
         self.current_epoch += 1
         result = {
             "epoch": epoch_index + 1,
             "train": train_summary,
             "val": validation_summary,
-            "checkpoint_path": str(checkpoint_path),
             "elapsed_sec": elapsed_sec,
         }
         if is_primary():
@@ -215,6 +204,106 @@ class Trainer:
         if is_primary():
             tqdm.write(format_test_summary(result))
         return result
+
+    def save_checkpoint(self, path: str | Path | None = None) -> Path:
+        """Persist model, optimizer, and runtime counters for resuming training."""
+        self._write_config_once()
+        checkpoint_path = self._resolve_artifact_path(
+            path,
+            default_name=f"epoch-{self.current_epoch:04d}.pt",
+        )
+        if not is_primary():
+            return checkpoint_path
+
+        checkpoint = {
+            "epoch": self.current_epoch,
+            "global_step": self.global_step,
+            "model": self._model_state_owner().state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+        }
+        torch.save(checkpoint, checkpoint_path)
+        self._write_record(
+            {
+                "kind": "checkpoint_save",
+                "path": checkpoint_path,
+                "epoch": self.current_epoch,
+                "global_step": self.global_step,
+            }
+        )
+        return checkpoint_path
+
+    def load_checkpoint(self, path: str | Path) -> dict[str, Any]:
+        """Restore model, optimizer, and runtime counters from a checkpoint file."""
+        checkpoint_path = Path(path)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        if not isinstance(checkpoint, Mapping):
+            raise TypeError("checkpoint must be a mapping produced by save_checkpoint()")
+        if "model" not in checkpoint:
+            raise KeyError("checkpoint is missing the 'model' state dict")
+        if "optimizer" not in checkpoint:
+            raise KeyError("checkpoint is missing the 'optimizer' state dict")
+
+        self._model_state_owner().load_state_dict(checkpoint["model"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.current_epoch = int(checkpoint.get("epoch", 0))
+        self.global_step = int(checkpoint.get("global_step", 0))
+
+        self._write_config_once()
+        if is_primary():
+            self._write_record(
+                {
+                    "kind": "checkpoint_load",
+                    "path": checkpoint_path,
+                    "epoch": self.current_epoch,
+                    "global_step": self.global_step,
+                }
+            )
+        return {
+            "path": checkpoint_path,
+            "epoch": self.current_epoch,
+            "global_step": self.global_step,
+        }
+
+    def save_weights(self, path: str | Path | None = None) -> Path:
+        """Persist model weights without optimizer or runtime state."""
+        weights_path = self._resolve_artifact_path(
+            path,
+            default_name=f"model-epoch-{self.current_epoch:04d}.pt",
+        )
+        if not is_primary():
+            return weights_path
+
+        torch.save(self._model_state_owner().state_dict(), weights_path)
+        return weights_path
+
+    def load_weights(self, path: str | Path, *, strict: bool = True) -> None:
+        """Restore model weights from a weights file or checkpoint file."""
+        loaded = torch.load(Path(path), map_location=self.device)
+        state_dict: Any = loaded
+        if isinstance(loaded, Mapping) and "model" in loaded and "optimizer" in loaded:
+            state_dict = loaded["model"]
+        self._model_state_owner().load_state_dict(state_dict, strict=strict)
+
+    def predict(self, batch: Mapping[str, Any]) -> Any:
+        """Run inference for a single batch without mutating training mode."""
+        moved_batch = move_batch_to_device(dict(batch), self.device)
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                return self.model(moved_batch["sar"], moved_batch["cloudy"])
+        finally:
+            self.model.train(was_training)
+
+    def get_state(self) -> dict[str, Any]:
+        """Return the trainer runtime counters and execution context."""
+        return {
+            "epoch": self.current_epoch,
+            "epochs": self.epochs,
+            "global_step": self.global_step,
+            "device": self.device,
+            "distributed": is_distributed(),
+        }
 
     @staticmethod
     def _validate_max_samples(name: str, value: int | None) -> None:
@@ -263,6 +352,11 @@ class Trainer:
 
     def _ensure_output_dir(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _resolve_artifact_path(self, path: str | Path | None, *, default_name: str) -> Path:
+        artifact_path = Path(path) if path is not None else self.output_dir / default_name
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        return artifact_path
 
     def _reset_metrics_file(self) -> None:
         if not is_primary():
@@ -583,21 +677,6 @@ class Trainer:
         assert dist is not None
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         return int(tensor.item())
-
-    def _save_checkpoint(self, next_epoch: int) -> Path:
-        checkpoint_path = self.output_dir / f"epoch-{next_epoch:04d}.pt"
-        if not is_primary():
-            return checkpoint_path
-
-        self._ensure_output_dir()
-        checkpoint = {
-            "epoch": next_epoch,
-            "global_step": self.global_step,
-            "model": self._model_state_owner().state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-        }
-        torch.save(checkpoint, checkpoint_path)
-        return checkpoint_path
 
     def _write_record(self, record: Mapping[str, Any]) -> None:
         self._ensure_output_dir()

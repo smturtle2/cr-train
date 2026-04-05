@@ -40,7 +40,7 @@
 - **Deterministic block sampling** -- one-seed system (`seed`) for exact reproducibility
 - **Smart cache warmup** -- fills only missing HF streaming row-group blocks and reuses them across plans
 - **Distributed training** -- automatic DDP wrapping, rank-aware block partitioning, all-reduce metrics
-- **JSONL experiment tracking** -- every epoch, validation, checkpoint, and startup event recorded to `metrics.jsonl`
+- **JSONL experiment tracking** -- every train/validation epoch and startup event recorded to `metrics.jsonl`
 - **Zero config data** -- ingests directly from [`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr) via `load_dataset(..., streaming=True)`; no manual download needed
 
 ---
@@ -164,12 +164,12 @@ Most users only need `from cr_train import Trainer`. Once you construct it, `Tra
 - resolves dataset metadata and local cache state
 - warms only the splits needed for the current call
 - builds iterable dataloaders and rank-aware block partitioning
-- writes `metrics.jsonl` and `epoch-NNNN.pt` checkpoints
+- writes `metrics.jsonl`
 - shows running-average loss and metrics with batch-level tqdm during training, then prints elapsed time at epoch end
-- saves checkpoints as `epoch-NNNN.pt` containing `model`, `optimizer`, `epoch`, and `global_step` state dicts
 - appends metrics to `metrics.jsonl` in the output directory (one JSON object per line)
 
 You do not need any cache or dataloader setup code for the normal training flow.
+Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoint()`, `save_weights()`, `load_weights()`, `predict()`, and `get_state()` when you need them.
 
 ---
 
@@ -189,7 +189,7 @@ You do not need any cache or dataloader setup code for the normal training flow.
 | `batch_size` | `int` | `4` | Batch size for all DataLoaders. |
 | `epochs` | `int` | `1` | Total training epochs. Call `step()` once per epoch. |
 | `seed` | `int` | `42` | Seed controlling deterministic block selection and epoch-wise block/row shuffle order. |
-| `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and checkpoint files. |
+| `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and the default `save_checkpoint()` / `save_weights()` output files. |
 | `cache_dir` | `str \| Path \| None` | `None` | Block cache root. `None` = `~/.cache/cr-train`. |
 | `num_workers` | `int \| "auto"` | `"auto"` | DataLoader worker count. `"auto"` resolves to `min(4, max(1, os.cpu_count() // 4))`. |
 | `multiprocessing_context` | `str \| None` | `None` | Explicit worker start method. When `num_workers > 0` on CUDA, `Trainer` defaults this to `"spawn"` for safer worker startup. |
@@ -199,7 +199,7 @@ You do not need any cache or dataloader setup code for the normal training flow.
 
 ### `Trainer.step() -> dict`
 
-Runs one training epoch + validation + checkpoint. Returns:
+Runs one training epoch + validation. Returns:
 
 ```python
 {
@@ -218,7 +218,6 @@ Runs one training epoch + validation + checkpoint. Returns:
         "num_samples": 256,
         "num_batches": 64,
     },
-    "checkpoint_path": "runs/sen12mscr/epoch-0001.pt",
     "elapsed_sec": 12.3,
 }
 ```
@@ -234,6 +233,52 @@ Runs test evaluation with the current model state. Returns:
     "metrics": {"mae": 0.0295},
     "num_samples": 256,
     "num_batches": 64,
+}
+```
+
+### `Trainer.save_checkpoint(path: str | Path | None = None) -> Path`
+
+Writes a resumable checkpoint containing `model`, `optimizer`, `epoch`, and `global_step`.
+When `path` is omitted, the file is written to `<output_dir>/epoch-XXXX.pt` using the current completed epoch.
+
+### `Trainer.load_checkpoint(path: str | Path) -> dict`
+
+Restores `model`, `optimizer`, `epoch`, and `global_step` from a checkpoint file and returns:
+
+```python
+{
+    "path": Path("runs/sen12mscr/epoch-0005.pt"),
+    "epoch": 5,
+    "global_step": 2560,
+}
+```
+
+### `Trainer.save_weights(path: str | Path | None = None) -> Path`
+
+Writes model weights only. When `path` is omitted, the file is written to
+`<output_dir>/model-epoch-XXXX.pt`.
+
+### `Trainer.load_weights(path: str | Path, *, strict: bool = True) -> None`
+
+Restores model weights without touching optimizer state or runtime counters.
+Accepts either a weights-only file from `save_weights()` or a checkpoint file from `save_checkpoint()`.
+
+### `Trainer.predict(batch: Mapping[str, Any]) -> Any`
+
+Runs a single forward pass in `eval()` + `no_grad()` mode and then restores the previous training mode.
+`batch` should provide at least `sar` and `cloudy` tensors.
+
+### `Trainer.get_state() -> dict`
+
+Returns the current runtime state:
+
+```python
+{
+    "epoch": 5,
+    "epochs": 10,
+    "global_step": 2560,
+    "device": torch.device("cuda:0"),
+    "distributed": False,
 }
 ```
 
@@ -274,7 +319,7 @@ torchrun --nproc_per_node=2 examples/train_sen12mscr.py \
 
 - Data is sharded across ranks via deterministic block partitioning
 - Metrics are all-reduced across all processes
-- Only rank 0 writes `metrics.jsonl` and checkpoint files
+- Only rank 0 writes `metrics.jsonl` and explicit `save_*()` output files
 - Cache warmup runs on all ranks with file-lock coordination
 
 ---

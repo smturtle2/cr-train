@@ -1,7 +1,7 @@
 """SEN12MS-CR training example built around ``Trainer``.
 
 Create a model, optimizer, and loss, then let ``Trainer`` handle dataset access,
-cache warmup, dataloaders, metrics, and checkpoints.
+cache warmup, dataloaders, and metrics.
 
 Usage:
     uv run python examples/train_sen12mscr.py \\
@@ -17,7 +17,7 @@ Usage:
 Output:
     Each epoch prints a human-readable summary (loss, metrics, elapsed time)
     and writes structured JSON to stdout for pipeline consumption.
-    Checkpoints are saved to <output-dir>/epoch-NNNN.pt.
+    Call trainer.save_checkpoint() explicitly if you want a resumable snapshot.
 """
 
 from __future__ import annotations
@@ -107,6 +107,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--hidden-channels", type=int, default=64)
+    parser.add_argument(
+        "--train-crop-size",
+        type=parse_max_samples,
+        default=128,
+        help="Random train crop size, or 'none' to disable cropping.",
+    )
+    parser.add_argument(
+        "--train-random-flip",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable random train flips.",
+    )
+    parser.add_argument(
+        "--train-random-rot90",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable random 90-degree train rotations.",
+    )
     return parser.parse_args()
 
 
@@ -149,6 +167,9 @@ def main() -> None:
         seed=args.seed,
         output_dir=args.output_dir,
         cache_dir=args.cache_dir,
+        train_crop_size=args.train_crop_size,
+        train_random_flip=args.train_random_flip,
+        train_random_rot90=args.train_random_rot90,
     )
 
     # Training loop — Trainer prints epoch summaries automatically

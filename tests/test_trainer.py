@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 import importlib
 import json
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -148,6 +150,33 @@ class FakeDDP(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
+
+
+def _clone_model_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().clone()
+        for name, tensor in module.state_dict().items()
+    }
+
+
+def _assert_nested_equal(left, right) -> None:
+    if isinstance(left, torch.Tensor):
+        assert isinstance(right, torch.Tensor)
+        torch.testing.assert_close(left, right)
+        return
+    if isinstance(left, Mapping):
+        assert isinstance(right, Mapping)
+        assert set(left.keys()) == set(right.keys())
+        for key in left:
+            _assert_nested_equal(left[key], right[key])
+        return
+    if isinstance(left, (list, tuple)):
+        assert type(left) is type(right)
+        assert len(left) == len(right)
+        for left_item, right_item in zip(left, right):
+            _assert_nested_equal(left_item, right_item)
+        return
+    assert left == right
 
 
 def loss_fn(prediction: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -302,8 +331,6 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     ]
     startup_records = [record for record in metrics_records if record["kind"] == "startup"]
     startup_stages = [record["stage"] for record in startup_records]
-    checkpoint_record = next(record for record in metrics_records if record["kind"] == "checkpoint")
-
     batch_bars = [
         instance
         for instance in FakeTqdm.instances
@@ -320,14 +347,14 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert epoch_summary["elapsed_sec"] > 0.0
     assert epoch_summary["train"]["loss"] >= 0.0
     assert "mae" in epoch_summary["train"]["metrics"]
-    assert epoch_summary["checkpoint_path"].endswith("epoch-0001.pt")
-    assert Path(epoch_summary["checkpoint_path"]).exists()
+    assert "checkpoint_path" not in epoch_summary
+    assert not (output_dir / "epoch-0001.pt").exists()
 
     assert test_summary["epoch"] == 1
     assert "mae" in test_summary["metrics"]
     assert epoch_summary["train"]["num_batches"] == (2 * BLOCK_SIZE) // 8
     assert "batches_per_sec" in epoch_summary["train"]
-    assert checkpoint_record["elapsed_sec"] > 0.0
+    assert all(record["kind"] != "checkpoint" for record in metrics_records)
     assert "old-record" not in metrics_path.read_text(encoding="utf-8")
 
     assert "dataset_seed" not in config_record
@@ -397,6 +424,185 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
         trainer.step()
 
 
+def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    _patch_split_cache(
+        monkeypatch,
+        tmp_path,
+        {
+            "train": _make_block_splits(4),
+            "validation": _make_block_splits(4),
+            "test": _make_block_splits(4),
+        },
+    )
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        metrics={"mae": mae_metric},
+        max_train_samples=2 * BLOCK_SIZE,
+        max_val_samples=BLOCK_SIZE,
+        max_test_samples=BLOCK_SIZE,
+        epochs=1,
+        batch_size=8,
+        seed=11,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer.step()
+    original_model_state = _clone_model_state_dict(model)
+    original_optimizer_state = copy.deepcopy(trainer.optimizer.state_dict())
+    checkpoint_path = trainer.save_checkpoint()
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+    for state in trainer.optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                value.zero_()
+    trainer.current_epoch = 0
+    trainer.global_step = 0
+
+    load_summary = trainer.load_checkpoint(checkpoint_path)
+    metrics_records = [
+        json.loads(line)
+        for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert checkpoint_path == output_dir / "epoch-0001.pt"
+    assert checkpoint_path.exists()
+    assert load_summary == {
+        "path": checkpoint_path,
+        "epoch": 1,
+        "global_step": (2 * BLOCK_SIZE) // 8,
+    }
+    assert trainer.current_epoch == 1
+    assert trainer.global_step == (2 * BLOCK_SIZE) // 8
+    _assert_nested_equal(_clone_model_state_dict(model), original_model_state)
+    _assert_nested_equal(trainer.optimizer.state_dict(), original_optimizer_state)
+    assert [record["kind"] for record in metrics_records if record["kind"].startswith("checkpoint")] == [
+        "checkpoint_save",
+        "checkpoint_load",
+    ]
+
+
+def test_trainer_save_and_load_weights_preserves_runtime_state(monkeypatch, tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    _patch_split_cache(
+        monkeypatch,
+        tmp_path,
+        {
+            "train": _make_block_splits(4),
+            "validation": _make_block_splits(4),
+            "test": _make_block_splits(4),
+        },
+    )
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        metrics={"mae": mae_metric},
+        max_train_samples=2 * BLOCK_SIZE,
+        max_val_samples=BLOCK_SIZE,
+        max_test_samples=BLOCK_SIZE,
+        epochs=1,
+        batch_size=8,
+        seed=13,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer.step()
+    weights_path = trainer.save_weights()
+    original_model_state = _clone_model_state_dict(model)
+    expected_epoch = trainer.current_epoch
+    expected_global_step = trainer.global_step
+    first_state_tensor = next(
+        value
+        for state in trainer.optimizer.state.values()
+        for value in state.values()
+        if isinstance(value, torch.Tensor)
+    )
+    first_state_tensor.fill_(123.0)
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(5.0)
+
+    trainer.load_weights(weights_path)
+
+    assert weights_path == output_dir / "model-epoch-0001.pt"
+    assert weights_path.exists()
+    assert trainer.current_epoch == expected_epoch
+    assert trainer.global_step == expected_global_step
+    _assert_nested_equal(_clone_model_state_dict(model), original_model_state)
+    torch.testing.assert_close(first_state_tensor, torch.full_like(first_state_tensor, 123.0))
+
+
+def test_trainer_predict_preserves_training_mode(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+    trainer.model.train(True)
+
+    batch = {
+        "sar": torch.randn(2, 2, 8, 8),
+        "cloudy": torch.randn(2, 13, 8, 8),
+        "target": torch.randn(2, 13, 8, 8),
+        "meta": {"scene": ["a", "b"]},
+    }
+    prediction = trainer.predict(batch)
+
+    assert prediction.shape == (2, 13, 8, 8)
+    assert prediction.requires_grad is False
+    assert trainer.model.training is True
+
+
+def test_trainer_get_state_reports_runtime_values(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        epochs=3,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+    trainer.current_epoch = 2
+    trainer.global_step = 17
+
+    assert trainer.get_state() == {
+        "epoch": 2,
+        "epochs": 3,
+        "global_step": 17,
+        "device": torch.device("cpu"),
+        "distributed": False,
+    }
+
+
 def test_trainer_rejects_optimizer_from_other_model() -> None:
     model = TinyModel()
     other_model = TinyModel()
@@ -456,6 +662,52 @@ def test_trainer_wraps_model_for_distributed_without_device_bootstrap_bug(monkey
     assert isinstance(trainer.model, FakeDDP)
     assert trainer.model.module is model
     assert trainer.device.type == "cpu"
+
+
+def test_trainer_checkpoint_apis_use_unwrapped_model_state_in_distributed_mode(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.trainer as trainer_mod
+
+    monkeypatch.setattr(trainer_mod, "is_distributed", lambda: True)
+    monkeypatch.setattr(trainer_mod, "DDP", FakeDDP)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+    trainer.current_epoch = 3
+    trainer.global_step = 21
+
+    with torch.no_grad():
+        trainer.model.module.body.weight.fill_(0.25)
+        trainer.model.module.body.bias.fill_(0.5)
+
+    checkpoint_path = trainer.save_checkpoint(tmp_path / "manual-checkpoint.pt")
+    weights_path = trainer.save_weights(tmp_path / "manual-weights.pt")
+    checkpoint_payload = torch.load(checkpoint_path, map_location="cpu")
+    weights_payload = torch.load(weights_path, map_location="cpu")
+
+    assert "module.body.weight" not in checkpoint_payload["model"]
+    assert "module.body.weight" not in weights_payload
+
+    restored_model = TinyModel()
+    restored_trainer = Trainer(
+        restored_model,
+        torch.optim.AdamW(restored_model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=tmp_path / "restore-run",
+        cache_dir=tmp_path / "cache-restore",
+    )
+    load_summary = restored_trainer.load_checkpoint(checkpoint_path)
+
+    assert load_summary["epoch"] == 3
+    assert load_summary["global_step"] == 21
+    torch.testing.assert_close(restored_model.body.weight, model.body.weight)
+    torch.testing.assert_close(restored_model.body.bias, model.body.bias)
 
 
 def test_trainer_resolves_spawn_context_on_cuda_workers(monkeypatch, tmp_path: Path) -> None:
