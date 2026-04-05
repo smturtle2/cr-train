@@ -11,6 +11,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import torch
 from datasets import load_dataset
 
 from cr_train.data import (
@@ -250,6 +251,72 @@ def test_build_collate_fn_batches_rows() -> None:
     assert batch["cloudy"].shape == (2, 13, 256, 256)
     assert batch["target"].shape == (2, 13, 256, 256)
     assert batch["meta"]["patch"] == ["p000", "p001"]
+
+
+def test_build_collate_fn_applies_spatial_transforms_consistently(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    randint_values = iter((5, 7))
+    random_values = iter((0.4, 0.6))
+    monkeypatch.setattr(dataset_mod.random, "randint", lambda _lo, _hi: next(randint_values))
+    monkeypatch.setattr(dataset_mod.random, "random", lambda: next(random_values))
+    monkeypatch.setattr(dataset_mod.random, "randrange", lambda _stop: 1)
+
+    row = _make_row(0)
+    collate = build_collate_fn(
+        crop_size=128,
+        crop_mode="random",
+        random_flip=True,
+        random_rot90=True,
+    )
+    batch = collate([row])
+    decoded = decode_row(row)
+
+    expected_sar = torch.from_numpy(decoded["sar"][:, 5:133, 7:135].copy())
+    expected_sar = torch.flip(expected_sar, dims=(-2,))
+    expected_sar = torch.rot90(expected_sar, k=1, dims=(-2, -1))
+
+    expected_cloudy = torch.from_numpy(decoded["cloudy"][:, 5:133, 7:135].copy())
+    expected_cloudy = torch.flip(expected_cloudy, dims=(-2,))
+    expected_cloudy = torch.rot90(expected_cloudy, k=1, dims=(-2, -1))
+
+    expected_target = torch.from_numpy(decoded["target"][:, 5:133, 7:135].copy())
+    expected_target = torch.flip(expected_target, dims=(-2,))
+    expected_target = torch.rot90(expected_target, k=1, dims=(-2, -1))
+
+    assert batch["sar"].shape == (1, 2, 128, 128)
+    assert batch["cloudy"].shape == (1, 13, 128, 128)
+    assert batch["target"].shape == (1, 13, 128, 128)
+    torch.testing.assert_close(batch["sar"][0], expected_sar)
+    torch.testing.assert_close(batch["cloudy"][0], expected_cloudy)
+    torch.testing.assert_close(batch["target"][0], expected_target)
+
+
+def test_build_collate_fn_center_crop_reduces_spatial_size() -> None:
+    row = _make_row(1)
+    collate = build_collate_fn(crop_size=128, crop_mode="center")
+    batch = collate([row])
+    decoded = decode_row(row)
+
+    expected = torch.from_numpy(decoded["cloudy"][:, 64:192, 64:192].copy())
+
+    assert batch["cloudy"].shape == (1, 13, 128, 128)
+    torch.testing.assert_close(batch["cloudy"][0], expected)
+
+
+def test_build_collate_fn_rejects_oversized_crop() -> None:
+    collate = build_collate_fn(crop_size=512, crop_mode="random")
+
+    with pytest.raises(ValueError, match="crop_size"):
+        collate([_make_row(0)])
+
+
+def test_build_collate_fn_requires_crop_size_for_random_or_center_crop() -> None:
+    with pytest.raises(ValueError, match="crop_size"):
+        build_collate_fn(crop_mode="random")
+
+    with pytest.raises(ValueError, match="crop_size"):
+        build_collate_fn(crop_mode="center")
 
 
 def test_block_payload_round_trip_uses_mmap_layout(tmp_path: Path) -> None:
@@ -879,3 +946,46 @@ def test_build_dataloader_defaults_to_non_persistent_workers(monkeypatch) -> Non
     assert loader is not None
     assert captured["dataset"] is prepared.dataset
     assert captured["kwargs"]["persistent_workers"] is False
+
+
+def test_build_dataloader_passes_spatial_transform_options(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    captured: dict[str, Any] = {}
+
+    def fake_build_collate_fn(**kwargs):
+        captured["collate_kwargs"] = kwargs
+        return "fake-collate"
+
+    class FakeDataLoader:
+        def __init__(self, dataset, **kwargs):
+            captured["dataset"] = dataset
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(dataset_mod, "build_collate_fn", fake_build_collate_fn)
+    monkeypatch.setattr(dataset_mod, "DataLoader", FakeDataLoader)
+
+    prepared = PreparedSplit(dataset=SimpleNamespace(name="dataset"), num_examples=4)
+    loader = build_dataloader(
+        prepared,
+        batch_size=2,
+        num_workers=0,
+        training=True,
+        seed=5,
+        epoch=0,
+        crop_size=128,
+        crop_mode="random",
+        random_flip=True,
+        random_rot90=True,
+    )
+
+    assert loader is not None
+    assert captured["dataset"] is prepared.dataset
+    assert captured["collate_kwargs"] == {
+        "include_metadata": True,
+        "crop_size": 128,
+        "crop_mode": "random",
+        "random_flip": True,
+        "random_rot90": True,
+    }
+    assert captured["kwargs"]["collate_fn"] == "fake-collate"

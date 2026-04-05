@@ -64,6 +64,9 @@ class Trainer:
         seed: int = 42,
         output_dir: str | Path = "runs/default",
         cache_dir: str | Path | None = None,
+        train_crop_size: int | None = None,
+        train_random_flip: bool = False,
+        train_random_rot90: bool = False,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
@@ -75,6 +78,8 @@ class Trainer:
             raise ValueError("batch_size must be greater than zero")
         if epochs <= 0:
             raise ValueError("epochs must be greater than zero")
+        if train_crop_size is not None and train_crop_size <= 0:
+            raise ValueError("train_crop_size must be greater than zero when provided")
 
         self._validate_max_samples("max_train_samples", max_train_samples)
         self._validate_max_samples("max_val_samples", max_val_samples)
@@ -95,6 +100,9 @@ class Trainer:
         self.batch_size = batch_size
         self.epochs = epochs
         self.seed = seed
+        self.train_crop_size = train_crop_size
+        self.train_random_flip = bool(train_random_flip)
+        self.train_random_rot90 = bool(train_random_rot90)
 
         self.num_workers = resolve_num_workers("auto")
         self.output_dir = Path(output_dir)
@@ -259,6 +267,9 @@ class Trainer:
                 "batch_size": self.batch_size,
                 "epochs": self.epochs,
                 "num_workers": self.num_workers,
+                "train_crop_size": self.train_crop_size,
+                "train_random_flip": self.train_random_flip,
+                "train_random_rot90": self.train_random_rot90,
             }
         )
         tqdm.write(format_config_banner(
@@ -367,6 +378,10 @@ class Trainer:
                 persistent_workers=self.persistent_workers,
                 prefetch_factor=self.prefetch_factor,
                 drop_last=self.drop_last,
+                crop_size=self.train_crop_size if training else None,
+                crop_mode="random" if training and self.train_crop_size is not None else "none",
+                random_flip=self.train_random_flip if training else False,
+                random_rot90=self.train_random_rot90 if training else False,
             ),
             max_samples=max_samples,
         )

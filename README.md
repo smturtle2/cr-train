@@ -89,6 +89,9 @@ trainer = Trainer(
     epochs=2,
     seed=42,
     output_dir="runs/sen12mscr",
+    train_crop_size=128,
+    train_random_flip=True,
+    train_random_rot90=True,
 )
 
 for _ in range(trainer.epochs):
@@ -130,10 +133,14 @@ uv run python examples/train_sen12mscr.py \
   --max-test-samples 256 \
   --batch-size 4 \
   --epochs 2 \
+  --train-crop-size 128 \
+  --train-random-flip \
+  --train-random-rot90 \
   --output-dir runs/sen12mscr-example
 ```
 
 Pass `--max-train-samples none` (or `full`) to cache and train on the entire split.
+The training augmentations apply only to the train split; validation and test stay at the original `256x256`.
 
 ### Sampling algorithm visualization
 
@@ -184,6 +191,9 @@ You do not need any cache or dataloader setup code for the normal training flow.
 | `seed` | `int` | `42` | Seed controlling deterministic block selection and epoch-wise block/row shuffle order. |
 | `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and checkpoint files. |
 | `cache_dir` | `str \| Path \| None` | `None` | Block cache root. `None` = `~/.cache/cr-train`. |
+| `train_crop_size` | `int \| None` | `None` | Apply random square crops of this size to train batches before they leave the collate step. |
+| `train_random_flip` | `bool` | `False` | Apply independent random vertical/horizontal flips to train batches. |
+| `train_random_rot90` | `bool` | `False` | Apply random `0/90/180/270` degree rotations to train batches. |
 
 ### `Trainer.step() -> dict`
 

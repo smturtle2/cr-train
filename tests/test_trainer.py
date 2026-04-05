@@ -5,6 +5,7 @@ import json
 import re
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -330,6 +331,9 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert "old-record" not in metrics_path.read_text(encoding="utf-8")
 
     assert "dataset_seed" not in config_record
+    assert config_record["train_crop_size"] is None
+    assert config_record["train_random_flip"] is False
+    assert config_record["train_random_rot90"] is False
     assert warmup_splits_after_step == {"train", "validation", "test"}
     assert "warm split cache" in startup_stages
     assert "load local cache" in startup_stages
@@ -401,6 +405,18 @@ def test_trainer_rejects_optimizer_from_other_model() -> None:
             model,
             torch.optim.AdamW(other_model.parameters(), lr=1e-3),
             loss_fn,
+        )
+
+
+def test_trainer_rejects_non_positive_train_crop_size() -> None:
+    model = TinyModel()
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            torch.optim.AdamW(model.parameters(), lr=1e-3),
+            loss_fn,
+            train_crop_size=0,
         )
 
 
@@ -490,3 +506,65 @@ def test_trainer_reuses_prepared_split_state_across_epochs(monkeypatch, tmp_path
 
     assert trainer.persistent_workers is False
     assert resolve_counts == {"train": 1, "validation": 1, "test": 1}
+
+
+def test_trainer_passes_spatial_transform_options_only_to_train_loader(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.trainer as trainer_mod
+
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+
+    captured: list[dict[str, object]] = []
+
+    def fake_run_startup_stage(_startup_callback, **kwargs):
+        return kwargs["operation"]()
+
+    def fake_build_dataloader(prepared, **kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(dataset=prepared.dataset, sampler=None)
+
+    monkeypatch.setattr(trainer_mod, "run_startup_stage", fake_run_startup_stage)
+    monkeypatch.setattr(trainer_mod, "build_dataloader", fake_build_dataloader)
+    monkeypatch.setattr(
+        trainer_mod,
+        "prepare_split_from_state",
+        lambda _state, **_kwargs: SimpleNamespace(
+            dataset=SimpleNamespace(name="dataset"),
+            num_examples=8,
+        ),
+    )
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        batch_size=4,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+        train_crop_size=128,
+        train_random_flip=True,
+        train_random_rot90=True,
+    )
+    trainer._resolve_prepared_split_state = lambda *, split, max_samples: SimpleNamespace(split=split, max_samples=max_samples)
+
+    trainer._build_loader(
+        split="train",
+        max_samples=BLOCK_SIZE,
+        training=True,
+        epoch_index=0,
+    )
+    trainer._build_loader(
+        split="validation",
+        max_samples=BLOCK_SIZE,
+        training=False,
+        epoch_index=0,
+    )
+
+    assert captured[0]["crop_size"] == 128
+    assert captured[0]["crop_mode"] == "random"
+    assert captured[0]["random_flip"] is True
+    assert captured[0]["random_rot90"] is True
+    assert captured[1]["crop_size"] is None
+    assert captured[1]["crop_mode"] == "none"
+    assert captured[1]["random_flip"] is False
+    assert captured[1]["random_rot90"] is False

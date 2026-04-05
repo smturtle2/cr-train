@@ -42,6 +42,17 @@ class PreparedSplitState:
     row_counts_by_key: dict[str, int]
 
 
+@dataclass(slots=True, frozen=True)
+class _SpatialTransformParams:
+    top: int
+    left: int
+    height: int
+    width: int
+    flip_vertical: bool = False
+    flip_horizontal: bool = False
+    rot90_k: int = 0
+
+
 def resolve_num_workers(num_workers: int | str) -> int:
     """Resolve DataLoader worker count from an int or ``'auto'``."""
     if isinstance(num_workers, int):
@@ -352,6 +363,97 @@ def _normalize_optical_tensor(image: torch.Tensor) -> None:
     image.clamp_(*_OPTICAL_CLAMP_RANGE).mul_(_OPTICAL_SCALE)
 
 
+def _normalize_crop_mode(crop_mode: str) -> str:
+    if not isinstance(crop_mode, str):
+        raise TypeError("crop_mode must be a string")
+    normalized = crop_mode.strip().lower()
+    if normalized not in {"none", "random", "center"}:
+        raise ValueError("crop_mode must be one of 'none', 'random', or 'center'")
+    return normalized
+
+
+def _resolve_transformed_shape(
+    chw_shape: tuple[int, int, int],
+    *,
+    crop_size: int | None,
+    crop_mode: str,
+) -> tuple[int, int, int]:
+    if crop_mode == "none":
+        return chw_shape
+    if crop_size is None:
+        raise ValueError("crop_size must be provided when crop_mode is not 'none'")
+    if crop_size <= 0:
+        raise ValueError("crop_size must be greater than zero")
+    _, height, width = chw_shape
+    if crop_size > height or crop_size > width:
+        raise ValueError(
+            f"crop_size {crop_size} exceeds input spatial size {(height, width)!r}"
+        )
+    return (chw_shape[0], crop_size, crop_size)
+
+
+def _has_spatial_transform(*, crop_mode: str, random_flip: bool, random_rot90: bool) -> bool:
+    return crop_mode != "none" or random_flip or random_rot90
+
+
+def _sample_spatial_transform_params(
+    *,
+    height: int,
+    width: int,
+    crop_size: int | None,
+    crop_mode: str,
+    random_flip: bool,
+    random_rot90: bool,
+) -> _SpatialTransformParams:
+    if crop_mode == "none":
+        top = 0
+        left = 0
+        target_height = height
+        target_width = width
+    else:
+        if crop_size is None:
+            raise ValueError("crop_size must be provided when crop_mode is not 'none'")
+        if crop_size <= 0:
+            raise ValueError("crop_size must be greater than zero")
+        if crop_size > height or crop_size > width:
+            raise ValueError(
+                f"crop_size {crop_size} exceeds input spatial size {(height, width)!r}"
+            )
+        if crop_mode == "center":
+            top = (height - crop_size) // 2
+            left = (width - crop_size) // 2
+        else:
+            top = random.randint(0, height - crop_size)
+            left = random.randint(0, width - crop_size)
+        target_height = crop_size
+        target_width = crop_size
+
+    return _SpatialTransformParams(
+        top=top,
+        left=left,
+        height=target_height,
+        width=target_width,
+        flip_vertical=bool(random_flip and random.random() < 0.5),
+        flip_horizontal=bool(random_flip and random.random() < 0.5),
+        rot90_k=random.randrange(4) if random_rot90 else 0,
+    )
+
+
+def _apply_spatial_transform(image: torch.Tensor, params: _SpatialTransformParams) -> torch.Tensor:
+    transformed = image[
+        :,
+        params.top:params.top + params.height,
+        params.left:params.left + params.width,
+    ]
+    if params.flip_vertical:
+        transformed = torch.flip(transformed, dims=(-2,))
+    if params.flip_horizontal:
+        transformed = torch.flip(transformed, dims=(-1,))
+    if params.rot90_k:
+        transformed = torch.rot90(transformed, k=params.rot90_k, dims=(-2, -1))
+    return transformed
+
+
 def decode_row(row: dict[str, Any], *, include_metadata: bool = True) -> dict[str, Any]:
     """Decode one cached row into CHW float32 arrays."""
     sar = _decode_image(row["sar"], row["sar_shape"], dtype=np.float32, expected_channels=SAR_CHANNELS)
@@ -433,8 +535,20 @@ def _decode_image_into(
         dest.mul_(scale)
 
 
-def build_collate_fn(*, include_metadata: bool = True):
+def build_collate_fn(
+    *,
+    include_metadata: bool = True,
+    crop_size: int | None = None,
+    crop_mode: str = "none",
+    random_flip: bool = False,
+    random_rot90: bool = False,
+):
     """Build the batch collate function used by DataLoader workers."""
+    normalized_crop_mode = _normalize_crop_mode(crop_mode)
+    if crop_size is not None and crop_size <= 0:
+        raise ValueError("crop_size must be greater than zero when provided")
+    if normalized_crop_mode != "none" and crop_size is None:
+        raise ValueError("crop_size must be provided when crop_mode is not 'none'")
 
     def collate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if not rows:
@@ -443,38 +557,100 @@ def build_collate_fn(*, include_metadata: bool = True):
         first = rows[0]
         sar_chw = _resolve_chw_shape(first["sar_shape"], SAR_CHANNELS)
         opt_chw = _resolve_chw_shape(first["opt_shape"], OPTICAL_CHANNELS)
+        transformed_sar_chw = _resolve_transformed_shape(
+            sar_chw,
+            crop_size=crop_size,
+            crop_mode=normalized_crop_mode,
+        )
+        transformed_opt_chw = _resolve_transformed_shape(
+            opt_chw,
+            crop_size=crop_size,
+            crop_mode=normalized_crop_mode,
+        )
+        use_spatial_transform = _has_spatial_transform(
+            crop_mode=normalized_crop_mode,
+            random_flip=random_flip,
+            random_rot90=random_rot90,
+        )
+        if use_spatial_transform and sar_chw[1:] != opt_chw[1:]:
+            raise ValueError(
+                "spatial transforms require matching SAR and optical spatial dimensions"
+            )
 
         batch_size = len(rows)
-        sar_batch = torch.empty((batch_size, *sar_chw), dtype=torch.float32)
-        cloudy_batch = torch.empty((batch_size, *opt_chw), dtype=torch.float32)
-        target_batch = torch.empty((batch_size, *opt_chw), dtype=torch.float32)
+        sar_batch = torch.empty((batch_size, *transformed_sar_chw), dtype=torch.float32)
+        cloudy_batch = torch.empty((batch_size, *transformed_opt_chw), dtype=torch.float32)
+        target_batch = torch.empty((batch_size, *transformed_opt_chw), dtype=torch.float32)
 
         metadata = {"season": [], "scene": [], "patch": []} if include_metadata else None
         for i, row in enumerate(rows):
-            _decode_image_into(
-                sar_batch[i],
-                row["sar"],
-                row["sar_shape"],
-                src_dtype=torch.float32,
-                expected_channels=SAR_CHANNELS,
-            )
-            _normalize_sar_tensor(sar_batch[i])
-            _decode_image_into(
-                cloudy_batch[i],
-                row["cloudy"],
-                row["opt_shape"],
-                src_dtype=torch.int16,
-                expected_channels=OPTICAL_CHANNELS,
-            )
-            _normalize_optical_tensor(cloudy_batch[i])
-            _decode_image_into(
-                target_batch[i],
-                row["target"],
-                row["opt_shape"],
-                src_dtype=torch.int16,
-                expected_channels=OPTICAL_CHANNELS,
-            )
-            _normalize_optical_tensor(target_batch[i])
+            if use_spatial_transform:
+                params = _sample_spatial_transform_params(
+                    height=opt_chw[1],
+                    width=opt_chw[2],
+                    crop_size=crop_size,
+                    crop_mode=normalized_crop_mode,
+                    random_flip=random_flip,
+                    random_rot90=random_rot90,
+                )
+
+                sar_image = torch.empty(sar_chw, dtype=torch.float32)
+                _decode_image_into(
+                    sar_image,
+                    row["sar"],
+                    row["sar_shape"],
+                    src_dtype=torch.float32,
+                    expected_channels=SAR_CHANNELS,
+                )
+                _normalize_sar_tensor(sar_image)
+                sar_batch[i].copy_(_apply_spatial_transform(sar_image, params))
+
+                cloudy_image = torch.empty(opt_chw, dtype=torch.float32)
+                _decode_image_into(
+                    cloudy_image,
+                    row["cloudy"],
+                    row["opt_shape"],
+                    src_dtype=torch.int16,
+                    expected_channels=OPTICAL_CHANNELS,
+                )
+                _normalize_optical_tensor(cloudy_image)
+                cloudy_batch[i].copy_(_apply_spatial_transform(cloudy_image, params))
+
+                target_image = torch.empty(opt_chw, dtype=torch.float32)
+                _decode_image_into(
+                    target_image,
+                    row["target"],
+                    row["opt_shape"],
+                    src_dtype=torch.int16,
+                    expected_channels=OPTICAL_CHANNELS,
+                )
+                _normalize_optical_tensor(target_image)
+                target_batch[i].copy_(_apply_spatial_transform(target_image, params))
+            else:
+                _decode_image_into(
+                    sar_batch[i],
+                    row["sar"],
+                    row["sar_shape"],
+                    src_dtype=torch.float32,
+                    expected_channels=SAR_CHANNELS,
+                )
+                _normalize_sar_tensor(sar_batch[i])
+                _decode_image_into(
+                    cloudy_batch[i],
+                    row["cloudy"],
+                    row["opt_shape"],
+                    src_dtype=torch.int16,
+                    expected_channels=OPTICAL_CHANNELS,
+                )
+                _normalize_optical_tensor(cloudy_batch[i])
+                _decode_image_into(
+                    target_batch[i],
+                    row["target"],
+                    row["opt_shape"],
+                    src_dtype=torch.int16,
+                    expected_channels=OPTICAL_CHANNELS,
+                )
+                _normalize_optical_tensor(target_batch[i])
             if metadata is not None:
                 metadata["season"].append(str(row.get("season", "")))
                 metadata["scene"].append(str(row.get("scene", "")))
@@ -501,12 +677,22 @@ def build_dataloader(
     persistent_workers: bool = False,
     prefetch_factor: int = 2,
     drop_last: bool = False,
+    crop_size: int | None = None,
+    crop_mode: str = "none",
+    random_flip: bool = False,
+    random_rot90: bool = False,
 ) -> DataLoader:
     """Create the split DataLoader for the cached iterable dataset."""
     del seed, epoch
     dataloader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
-        "collate_fn": build_collate_fn(include_metadata=include_metadata),
+        "collate_fn": build_collate_fn(
+            include_metadata=include_metadata,
+            crop_size=crop_size,
+            crop_mode=crop_mode,
+            random_flip=random_flip,
+            random_rot90=random_rot90,
+        ),
         "num_workers": num_workers,
         "pin_memory": pin_memory and torch.cuda.is_available(),
         "worker_init_fn": seed_worker,
