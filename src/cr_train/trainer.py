@@ -34,6 +34,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 LossFn = Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int]
 MetricFn = Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int]
+_MULTIPROCESSING_CONTEXT_CHOICES = {"fork", "spawn", "forkserver"}
 
 
 @dataclass(slots=True)
@@ -64,6 +65,8 @@ class Trainer:
         seed: int = 42,
         output_dir: str | Path = "runs/default",
         cache_dir: str | Path | None = None,
+        num_workers: int | str = "auto",
+        multiprocessing_context: str | None = None,
         train_crop_size: int | None = 128,
         train_random_flip: bool = True,
         train_random_rot90: bool = True,
@@ -104,7 +107,7 @@ class Trainer:
         self.train_random_flip = bool(train_random_flip)
         self.train_random_rot90 = bool(train_random_rot90)
 
-        self.num_workers = resolve_num_workers("auto")
+        self.num_workers = resolve_num_workers(num_workers)
         self.output_dir = Path(output_dir)
         self.metrics_path = self.output_dir / "metrics.jsonl"
         self.cache_root = resolve_cache_root(cache_dir)
@@ -124,6 +127,9 @@ class Trainer:
         self.device = self._infer_module_device(self.model)
         self._wrap_model_for_ddp_if_needed()
         self.device = self._infer_module_device(self._model_state_owner())
+        self.multiprocessing_context = self._resolve_multiprocessing_context(
+            multiprocessing_context
+        )
 
     def step(self) -> dict[str, Any]:
         """Run one training epoch, validation, and checkpoint the result."""
@@ -235,6 +241,23 @@ class Trainer:
             return buffer.device
         return torch.device("cpu")
 
+    def _resolve_multiprocessing_context(self, value: str | None) -> str | None:
+        normalized: str | None = None
+        if value is not None:
+            normalized = value.strip().lower()
+            if normalized not in _MULTIPROCESSING_CONTEXT_CHOICES:
+                supported = ", ".join(sorted(_MULTIPROCESSING_CONTEXT_CHOICES))
+                raise ValueError(
+                    f"multiprocessing_context must be one of {supported}, or None"
+                )
+        if self.num_workers <= 0:
+            return None
+        if normalized is not None:
+            return normalized
+        if self.device.type == "cuda":
+            return "spawn"
+        return None
+
     def _seed_epoch(self, epoch_index: int) -> None:
         seed_everything(self.seed + epoch_index)
 
@@ -267,6 +290,7 @@ class Trainer:
                 "batch_size": self.batch_size,
                 "epochs": self.epochs,
                 "num_workers": self.num_workers,
+                "multiprocessing_context": self.multiprocessing_context,
                 "train_crop_size": self.train_crop_size,
                 "train_random_flip": self.train_random_flip,
                 "train_random_rot90": self.train_random_rot90,
@@ -281,6 +305,8 @@ class Trainer:
             epochs=self.epochs,
             seed=self.seed,
             device=self.device,
+            num_workers=self.num_workers,
+            multiprocessing_context=self.multiprocessing_context,
         ))
 
     def _wrap_model_for_ddp_if_needed(self) -> None:
@@ -375,6 +401,7 @@ class Trainer:
                 epoch=epoch_index,
                 include_metadata=self.include_metadata,
                 pin_memory=self.pin_memory,
+                multiprocessing_context=self.multiprocessing_context,
                 persistent_workers=self.persistent_workers,
                 prefetch_factor=self.prefetch_factor,
                 drop_last=self.drop_last,

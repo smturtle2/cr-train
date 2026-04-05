@@ -191,9 +191,11 @@ You do not need any cache or dataloader setup code for the normal training flow.
 | `seed` | `int` | `42` | Seed controlling deterministic block selection and epoch-wise block/row shuffle order. |
 | `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and checkpoint files. |
 | `cache_dir` | `str \| Path \| None` | `None` | Block cache root. `None` = `~/.cache/cr-train`. |
-| `train_crop_size` | `int \| None` | `None` | Apply random square crops of this size to train batches before they leave the collate step. |
-| `train_random_flip` | `bool` | `False` | Apply independent random vertical/horizontal flips to train batches. |
-| `train_random_rot90` | `bool` | `False` | Apply random `0/90/180/270` degree rotations to train batches. |
+| `num_workers` | `int \| "auto"` | `"auto"` | DataLoader worker count. `"auto"` resolves to `min(4, max(1, os.cpu_count() // 4))`. |
+| `multiprocessing_context` | `str \| None` | `None` | Explicit worker start method. When `num_workers > 0` on CUDA, `Trainer` defaults this to `"spawn"` for safer worker startup. |
+| `train_crop_size` | `int \| None` | `128` | Apply random square crops of this size to train batches before they leave the collate step. |
+| `train_random_flip` | `bool` | `True` | Apply independent random vertical/horizontal flips to train batches. |
+| `train_random_rot90` | `bool` | `True` | Apply random `0/90/180/270` degree rotations to train batches. |
 
 ### `Trainer.step() -> dict`
 
@@ -255,6 +257,7 @@ During warmup, `step()` prepares `train` and `validation`, while `test()` prepar
 
 - Cache warmup shows a tqdm progress bar during block download and prints a one-line `■/□` block timeline on completion.
 - Equal `seed` values keep the same uniform exact-k block-selection membership; train batch order still changes by epoch via `seed + epoch_index`.
+- CUDA runs with worker processes default to the safer `"spawn"` multiprocessing context once `num_workers > 0`.
 - Finished caches are never auto-deleted. Remove them manually from the cache directory to reclaim disk space.
 
 ---

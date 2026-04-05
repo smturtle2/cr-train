@@ -123,6 +123,8 @@ def format_config_banner(
     epochs: int,
     seed: int,
     device: torch.device,
+    num_workers: int,
+    multiprocessing_context: str | None,
 ) -> str:
     sep = f"{_DIM}│{_RESET}"
     header = f"{_BOLD}cr-train{_RESET} {_DIM}── {dataset_name} ── {device}{_RESET}"
@@ -132,7 +134,9 @@ def format_config_banner(
         f"val {_BOLD}{_samples_label(max_val_samples)}{_RESET}  "
         f"test {_BOLD}{_samples_label(max_test_samples)}{_RESET}"
     )
-    config_parts = [f"batch {batch_size}", f"epochs {epochs}", f"seed {seed}"]
+    config_parts = [f"batch {batch_size}", f"epochs {epochs}", f"seed {seed}", f"workers {num_workers}"]
+    if multiprocessing_context is not None:
+        config_parts.append(f"mp {multiprocessing_context}")
     config = f"  {_DIM}config{_RESET}  " + f"  {sep}  ".join(config_parts)
     return f"{header}\n{splits}\n{config}"
 

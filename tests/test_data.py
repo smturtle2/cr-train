@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import pickle
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -67,6 +69,17 @@ def _make_stream_row(index: int) -> dict[str, object]:
         "scene": str(index),
         "patch": f"p{index:03d}",
     }
+
+
+class _RowDataset(torch.utils.data.Dataset[dict[str, object]]):
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = tuple(dict(row) for row in rows)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return dict(self.rows[index])
 
 
 def _load_local_parquet_stream(path: Path):
@@ -251,6 +264,15 @@ def test_build_collate_fn_batches_rows() -> None:
     assert batch["cloudy"].shape == (2, 13, 256, 256)
     assert batch["target"].shape == (2, 13, 256, 256)
     assert batch["meta"]["patch"] == ["p000", "p001"]
+
+
+def test_build_collate_fn_is_picklable() -> None:
+    collate = build_collate_fn(crop_size=128, crop_mode="center")
+
+    restored = pickle.loads(pickle.dumps(collate))
+    batch = restored([_make_row(0)])
+
+    assert batch["cloudy"].shape == (1, 13, 128, 128)
 
 
 def test_build_collate_fn_applies_spatial_transforms_consistently(monkeypatch) -> None:
@@ -946,6 +968,81 @@ def test_build_dataloader_defaults_to_non_persistent_workers(monkeypatch) -> Non
     assert loader is not None
     assert captured["dataset"] is prepared.dataset
     assert captured["kwargs"]["persistent_workers"] is False
+    assert "multiprocessing_context" not in captured["kwargs"]
+
+
+def test_build_dataloader_passes_multiprocessing_context(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    captured: dict[str, Any] = {}
+
+    class FakeDataLoader:
+        def __init__(self, dataset, **kwargs):
+            captured["dataset"] = dataset
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(dataset_mod, "DataLoader", FakeDataLoader)
+
+    prepared = PreparedSplit(dataset=SimpleNamespace(name="dataset"), num_examples=4)
+    loader = build_dataloader(
+        prepared,
+        batch_size=2,
+        num_workers=2,
+        training=False,
+        seed=5,
+        epoch=0,
+        multiprocessing_context="spawn",
+    )
+
+    assert loader is not None
+    assert captured["dataset"] is prepared.dataset
+    assert captured["kwargs"]["multiprocessing_context"] == "spawn"
+
+
+def test_build_dataloader_ignores_multiprocessing_context_without_workers(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    captured: dict[str, Any] = {}
+
+    class FakeDataLoader:
+        def __init__(self, dataset, **kwargs):
+            captured["dataset"] = dataset
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(dataset_mod, "DataLoader", FakeDataLoader)
+
+    prepared = PreparedSplit(dataset=SimpleNamespace(name="dataset"), num_examples=4)
+    loader = build_dataloader(
+        prepared,
+        batch_size=2,
+        num_workers=0,
+        training=False,
+        seed=5,
+        epoch=0,
+        multiprocessing_context="spawn",
+    )
+
+    assert loader is not None
+    assert captured["dataset"] is prepared.dataset
+    assert "multiprocessing_context" not in captured["kwargs"]
+
+
+def test_build_dataloader_supports_spawn_workers() -> None:
+    prepared = PreparedSplit(dataset=_RowDataset([_make_row(0), _make_row(1)]), num_examples=2)
+    loader = build_dataloader(
+        prepared,
+        batch_size=2,
+        num_workers=1,
+        training=False,
+        seed=5,
+        epoch=0,
+        multiprocessing_context="spawn",
+    )
+
+    batch = next(iter(loader))
+
+    assert batch["sar"].shape == (2, 2, 256, 256)
+    assert batch["cloudy"].shape == (2, 13, 256, 256)
 
 
 def test_build_dataloader_passes_spatial_transform_options(monkeypatch) -> None:

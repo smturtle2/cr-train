@@ -331,9 +331,10 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert "old-record" not in metrics_path.read_text(encoding="utf-8")
 
     assert "dataset_seed" not in config_record
-    assert config_record["train_crop_size"] is None
-    assert config_record["train_random_flip"] is False
-    assert config_record["train_random_rot90"] is False
+    assert config_record["multiprocessing_context"] is None
+    assert config_record["train_crop_size"] == 128
+    assert config_record["train_random_flip"] is True
+    assert config_record["train_random_rot90"] is True
     assert warmup_splits_after_step == {"train", "validation", "test"}
     assert "warm split cache" in startup_stages
     assert "load local cache" in startup_stages
@@ -457,6 +458,68 @@ def test_trainer_wraps_model_for_distributed_without_device_bootstrap_bug(monkey
     assert trainer.device.type == "cpu"
 
 
+def test_trainer_resolves_spawn_context_on_cuda_workers(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.trainer as trainer_mod
+
+    monkeypatch.setattr(
+        trainer_mod.Trainer,
+        "_infer_module_device",
+        staticmethod(lambda _module: torch.device("cuda:0")),
+    )
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+        num_workers=2,
+    )
+
+    assert trainer.num_workers == 2
+    assert trainer.multiprocessing_context == "spawn"
+
+
+def test_trainer_respects_explicit_multiprocessing_context(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.trainer as trainer_mod
+
+    monkeypatch.setattr(
+        trainer_mod.Trainer,
+        "_infer_module_device",
+        staticmethod(lambda _module: torch.device("cuda:0")),
+    )
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+        num_workers=2,
+        multiprocessing_context="forkserver",
+    )
+
+    assert trainer.multiprocessing_context == "forkserver"
+
+
+def test_trainer_disables_multiprocessing_context_when_workers_are_disabled(tmp_path: Path) -> None:
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+        num_workers=0,
+        multiprocessing_context="spawn",
+    )
+
+    assert trainer.num_workers == 0
+    assert trainer.multiprocessing_context is None
+
+
 def test_trainer_reuses_prepared_split_state_across_epochs(monkeypatch, tmp_path: Path) -> None:
     import cr_train.data.dataset as dataset_mod
     import cr_train.trainer as trainer_mod
@@ -562,9 +625,11 @@ def test_trainer_passes_spatial_transform_options_only_to_train_loader(monkeypat
 
     assert captured[0]["crop_size"] == 128
     assert captured[0]["crop_mode"] == "random"
+    assert captured[0]["multiprocessing_context"] is None
     assert captured[0]["random_flip"] is True
     assert captured[0]["random_rot90"] is True
     assert captured[1]["crop_size"] is None
     assert captured[1]["crop_mode"] == "none"
+    assert captured[1]["multiprocessing_context"] is None
     assert captured[1]["random_flip"] is False
     assert captured[1]["random_rot90"] is False

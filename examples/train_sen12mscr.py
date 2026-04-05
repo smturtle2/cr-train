@@ -107,22 +107,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--hidden-channels", type=int, default=64)
-    parser.add_argument(
-        "--train-crop-size",
-        type=int,
-        default=None,
-        help="Apply random square crops of this size to training batches before collation.",
-    )
-    parser.add_argument(
-        "--train-random-flip",
-        action="store_true",
-        help="Apply independent random horizontal/vertical flips to training batches.",
-    )
-    parser.add_argument(
-        "--train-random-rot90",
-        action="store_true",
-        help="Apply random 0/90/180/270 degree rotations to training batches.",
-    )
     return parser.parse_args()
 
 
@@ -165,9 +149,6 @@ def main() -> None:
         seed=args.seed,
         output_dir=args.output_dir,
         cache_dir=args.cache_dir,
-        train_crop_size=args.train_crop_size,
-        train_random_flip=args.train_random_flip,
-        train_random_rot90=args.train_random_rot90,
     )
 
     # Training loop — Trainer prints epoch summaries automatically
