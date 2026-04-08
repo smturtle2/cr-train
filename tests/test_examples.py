@@ -4,16 +4,21 @@ import runpy
 import sys
 from pathlib import Path
 
+import torch
+
 
 def test_training_example_loads_without_running_main() -> None:
     example_path = Path(__file__).resolve().parents[1] / "examples" / "train_sen12mscr.py"
     namespace = runpy.run_path(str(example_path), run_name="example_module")
 
     assert "FusionBaseline" in namespace
+    assert "WarmupCosineScheduler" in namespace
+    assert "build_scheduler" in namespace
     assert "main" in namespace
     assert namespace["parse_max_samples"]("none") is None
     assert namespace["parse_max_samples"]("full") is None
     assert namespace["parse_max_samples"]("128") == 128
+    assert namespace["parse_non_negative_int"]("0") == 0
 
 
 def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -> None:
@@ -29,6 +34,12 @@ def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -
             "128",
             "--train-random-flip",
             "--train-random-rot90",
+            "--scheduler",
+            "warmup-cosine",
+            "--warmup-epochs",
+            "2",
+            "--min-lr-scale",
+            "0.2",
         ],
     )
     args = namespace["parse_args"]()
@@ -36,6 +47,33 @@ def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -
     assert args.train_crop_size == 128
     assert args.train_random_flip is True
     assert args.train_random_rot90 is True
+    assert args.scheduler == "warmup-cosine"
+    assert args.warmup_epochs == 2
+    assert args.min_lr_scale == 0.2
+
+
+def test_training_example_builds_custom_scheduler() -> None:
+    example_path = Path(__file__).resolve().parents[1] / "examples" / "train_sen12mscr.py"
+    namespace = runpy.run_path(str(example_path), run_name="example_module")
+    model = namespace["FusionBaseline"]()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    scheduler = namespace["build_scheduler"](
+        optimizer,
+        scheduler_name="warmup-cosine",
+        epochs=4,
+        warmup_epochs=1,
+        min_lr_scale=0.2,
+    )
+
+    assert isinstance(scheduler, namespace["WarmupCosineScheduler"])
+    assert namespace["build_scheduler"](
+        optimizer,
+        scheduler_name="none",
+        epochs=4,
+        warmup_epochs=1,
+        min_lr_scale=0.2,
+    ) is None
 
 
 def test_bitmask_demo_example_loads_without_running_main() -> None:

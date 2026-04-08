@@ -1,7 +1,7 @@
 """SEN12MS-CR training example built around ``Trainer``.
 
-Create a model, optimizer, and loss, then let ``Trainer`` handle dataset access,
-cache warmup, dataloaders, and metrics.
+Create a model, optimizer, loss, and custom scheduler, then let ``Trainer``
+handle dataset access, cache warmup, dataloaders, and metrics.
 
 Usage:
     uv run python examples/train_sen12mscr.py \\
@@ -9,13 +9,15 @@ Usage:
       --max-val-samples 256 \\
       --batch-size 4 \\
       --epochs 2 \\
+      --scheduler warmup-cosine \\
+      --warmup-epochs 1 \\
       --train-crop-size 128 \\
       --train-random-flip \\
       --train-random-rot90 \\
       --output-dir runs/sen12mscr-example
 
 Output:
-    Each epoch prints a human-readable summary (loss, metrics, elapsed time)
+    Each epoch prints a human-readable summary (loss, metrics, lr, elapsed time)
     and writes structured JSON to stdout for pipeline consumption.
     Call trainer.save_checkpoint() explicitly if you want a resumable snapshot.
 """
@@ -23,6 +25,7 @@ Output:
 from __future__ import annotations
 
 import argparse
+import math
 
 import torch
 from torch import nn
@@ -58,6 +61,52 @@ class FusionBaseline(nn.Module):
         return self.head(self.stem(torch.cat([sar, cloudy], dim=1)))
 
 
+class WarmupCosineScheduler(torch.optim.lr_scheduler.LRScheduler):
+    """Example epoch-based scheduler compatible with ``Trainer``."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        total_epochs: int,
+        warmup_epochs: int = 1,
+        warmup_start_factor: float = 0.25,
+        min_lr_scale: float = 0.1,
+    ) -> None:
+        if total_epochs <= 0:
+            raise ValueError("total_epochs must be greater than zero")
+        if warmup_epochs < 0:
+            raise ValueError("warmup_epochs must be zero or greater")
+        if not 0.0 < warmup_start_factor <= 1.0:
+            raise ValueError("warmup_start_factor must be in the range (0, 1]")
+        if not 0.0 <= min_lr_scale <= 1.0:
+            raise ValueError("min_lr_scale must be in the range [0, 1]")
+
+        self.total_epochs = total_epochs
+        self.warmup_epochs = min(warmup_epochs, max(total_epochs - 1, 0))
+        self.warmup_start_factor = warmup_start_factor
+        self.min_lr_scale = min_lr_scale
+        super().__init__(optimizer)
+
+    def _scale_for_epoch(self, epoch_index: int) -> float:
+        if self.total_epochs == 1:
+            return 1.0
+        if self.warmup_epochs > 0 and epoch_index < self.warmup_epochs:
+            if self.warmup_epochs == 1:
+                return 1.0
+            warmup_progress = epoch_index / (self.warmup_epochs - 1)
+            return self.warmup_start_factor + (1.0 - self.warmup_start_factor) * warmup_progress
+
+        decay_denominator = max(1, self.total_epochs - self.warmup_epochs - 1)
+        decay_progress = min(1.0, (epoch_index - self.warmup_epochs) / decay_denominator)
+        cosine_scale = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+        return self.min_lr_scale + (1.0 - self.min_lr_scale) * cosine_scale
+
+    def get_lr(self) -> list[float]:
+        scale = self._scale_for_epoch(self.last_epoch)
+        return [base_lr * scale for base_lr in self.base_lrs]
+
+
 # --- Argument parsing ---
 
 def parse_max_samples(value: str) -> int | None:
@@ -70,6 +119,13 @@ def parse_max_samples(value: str) -> int | None:
     return parsed
 
 
+def parse_non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be zero or greater")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run SEN12MS-CR training with Trainer.",
@@ -78,19 +134,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-train-samples",
         type=parse_max_samples,
-        default=2048,
+        default=64,
         help="Requested train rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
     )
     parser.add_argument(
         "--max-val-samples",
         type=parse_max_samples,
-        default=256,
+        default=64,
         help="Requested validation rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
     )
     parser.add_argument(
         "--max-test-samples",
         type=parse_max_samples,
-        default=256,
+        default=64,
         help="Requested test rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
     )
     parser.add_argument(
@@ -101,12 +157,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--output-dir", default="runs/sen12mscr-example")
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--hidden-channels", type=int, default=64)
+    parser.add_argument(
+        "--scheduler",
+        choices=("none", "warmup-cosine"),
+        default="warmup-cosine",
+        help="Optional epoch-based scheduler to attach to Trainer.",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=parse_non_negative_int,
+        default=1,
+        help="Warmup epochs for the custom warmup+cosine scheduler.",
+    )
+    parser.add_argument(
+        "--min-lr-scale",
+        type=float,
+        default=0.1,
+        help="Final learning-rate scale for the cosine tail.",
+    )
     parser.add_argument(
         "--train-crop-size",
         type=parse_max_samples,
@@ -146,6 +220,26 @@ def mean_absolute_error(prediction: torch.Tensor, batch: dict[str, torch.Tensor]
     return torch.mean(torch.abs(prediction - batch["target"]))
 
 
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    scheduler_name: str,
+    epochs: int,
+    warmup_epochs: int,
+    min_lr_scale: float,
+) -> WarmupCosineScheduler | None:
+    if scheduler_name == "none":
+        return None
+    if scheduler_name != "warmup-cosine":
+        raise ValueError(f"unsupported scheduler: {scheduler_name}")
+    return WarmupCosineScheduler(
+        optimizer,
+        total_epochs=epochs,
+        warmup_epochs=warmup_epochs,
+        min_lr_scale=min_lr_scale,
+    )
+
+
 # --- Main ---
 
 def main() -> None:
@@ -153,12 +247,20 @@ def main() -> None:
     device = resolve_device(args.device)
     model = FusionBaseline(hidden_channels=args.hidden_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = build_scheduler(
+        optimizer,
+        scheduler_name=args.scheduler,
+        epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        min_lr_scale=args.min_lr_scale,
+    )
 
     trainer = Trainer(
         model,
         optimizer,
         reconstruction_loss,
         metrics={"mae": mean_absolute_error},
+        scheduler=scheduler,
         max_train_samples=args.max_train_samples,
         max_val_samples=args.max_val_samples,
         max_test_samples=args.max_test_samples,

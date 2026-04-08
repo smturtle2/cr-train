@@ -135,6 +135,7 @@ def format_config_banner(
     num_workers: int,
     multiprocessing_context: str | None,
     scheduler_name: str | None,
+    scheduler_monitor: str | None,
 ) -> str:
     sep = f"{_DIM}│{_RESET}"
     header = f"{_BOLD}cr-train{_RESET} {_DIM}── {dataset_name} ── {device}{_RESET}"
@@ -149,6 +150,8 @@ def format_config_banner(
         config_parts.append(f"mp {multiprocessing_context}")
     if scheduler_name is not None:
         config_parts.append(f"scheduler {scheduler_name}")
+    if scheduler_monitor is not None:
+        config_parts.append(f"monitor {scheduler_monitor}")
     config = f"  {_DIM}config{_RESET}  " + f"  {sep}  ".join(config_parts)
     return f"{header}\n{splits}\n{config}"
 

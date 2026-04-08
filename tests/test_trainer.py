@@ -168,6 +168,23 @@ class CountingStepLR(torch.optim.lr_scheduler.StepLR):
         super().step(epoch)
 
 
+class CountingReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
+    def __init__(self, optimizer: torch.optim.Optimizer, **kwargs) -> None:
+        self.step_calls = 0
+        self.monitor_values: list[float] = []
+        super().__init__(optimizer, **kwargs)
+        self.step_calls = 0
+        self.monitor_values.clear()
+
+    def step(self, metrics, epoch=None) -> None:
+        self.step_calls += 1
+        self.monitor_values.append(float(metrics))
+        if epoch is None:
+            super().step(metrics)
+            return
+        super().step(metrics, epoch)
+
+
 def _clone_model_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {
         name: tensor.detach().clone()
@@ -201,6 +218,65 @@ def loss_fn(prediction: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.T
 
 def mae_metric(prediction: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     return torch.mean(torch.abs(prediction - batch["target"]))
+
+
+def _make_train_summary(
+    *,
+    loss: float = 0.1,
+    metrics: Mapping[str, float] | None = None,
+) -> dict[str, object]:
+    return {
+        "loss": loss,
+        "metrics": dict(metrics or {}),
+        "num_samples": 8,
+        "num_batches": 1,
+        "samples_per_sec": 1.0,
+        "batches_per_sec": 1.0,
+    }
+
+
+def _make_eval_summary(
+    *,
+    loss: float,
+    metrics: Mapping[str, float] | None = None,
+) -> dict[str, object]:
+    return {
+        "loss": loss,
+        "metrics": dict(metrics or {}),
+        "num_samples": 4,
+        "num_batches": 1,
+    }
+
+
+def _patch_epoch_execution(
+    monkeypatch,
+    *,
+    train_summaries: list[dict[str, object]],
+    validation_summaries: list[dict[str, object]],
+) -> None:
+    train_queue = iter(copy.deepcopy(train_summaries))
+    validation_queue = iter(copy.deepcopy(validation_summaries))
+
+    monkeypatch.setattr(Trainer, "_ensure_training_startup_caches", lambda self: None)
+
+    def fake_run_training_epoch(self, epoch_index: int) -> dict[str, object]:
+        del self, epoch_index
+        return copy.deepcopy(next(train_queue))
+
+    def fake_run_evaluation(
+        self,
+        *,
+        split: str,
+        max_samples: int | None,
+        epoch_index: int,
+        description: str,
+    ) -> dict[str, object]:
+        del self, max_samples, epoch_index, description
+        assert split == "validation"
+        return copy.deepcopy(next(validation_queue))
+
+    monkeypatch.setattr(Trainer, "_run_training_epoch", fake_run_training_epoch)
+    monkeypatch.setattr(Trainer, "_run_evaluation", fake_run_evaluation)
 
 
 class FakeTqdm:
@@ -400,6 +476,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert "dataset_seed" not in config_record
     assert config_record["multiprocessing_context"] is None
     assert config_record["scheduler"] is None
+    assert config_record["scheduler_monitor"] is None
     assert config_record["train_crop_size"] == 128
     assert config_record["train_random_flip"] is True
     assert config_record["train_random_rot90"] is True
@@ -516,7 +593,164 @@ def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(
     assert trainer.get_state()["lr"] == [5e-4]
     assert train_record["lr"] == [1e-3]
     assert config_record["scheduler"] == "CountingStepLR"
+    assert config_record["scheduler_monitor"] is None
     assert any("scheduler CountingStepLR" in message for message in FakeTqdm.writes)
+
+
+def test_trainer_steps_reduce_lr_on_plateau_with_default_val_loss_monitor(
+    monkeypatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "run"
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+    _patch_epoch_execution(
+        monkeypatch,
+        train_summaries=[_make_train_summary(), _make_train_summary()],
+        validation_summaries=[
+            _make_eval_summary(loss=0.5, metrics={"mae": 0.2}),
+            _make_eval_summary(loss=0.6, metrics={"mae": 0.1}),
+        ],
+    )
+
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = CountingReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=0,
+    )
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        metrics={"mae": mae_metric},
+        scheduler=scheduler,
+        epochs=2,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    first_epoch = trainer.step()
+    second_epoch = trainer.step()
+    metrics_records = [
+        json.loads(line)
+        for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    config_record = next(record for record in metrics_records if record["kind"] == "config")
+
+    assert first_epoch["train"]["lr"] == [1e-3]
+    assert second_epoch["train"]["lr"] == [1e-3]
+    assert scheduler.step_calls == 2
+    assert scheduler.monitor_values == [0.5, 0.6]
+    assert trainer.get_state()["lr"] == [5e-4]
+    assert config_record["scheduler"] == "CountingReduceLROnPlateau"
+    assert config_record["scheduler_monitor"] == "val.loss"
+    assert any("monitor val.loss" in message for message in FakeTqdm.writes)
+
+
+def test_trainer_steps_reduce_lr_on_plateau_with_metric_monitor(
+    monkeypatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "run"
+    FakeTqdm.writes.clear()
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+    _patch_epoch_execution(
+        monkeypatch,
+        train_summaries=[_make_train_summary(), _make_train_summary()],
+        validation_summaries=[
+            _make_eval_summary(loss=0.4, metrics={"mae": 0.2}),
+            _make_eval_summary(loss=0.3, metrics={"mae": 0.3}),
+        ],
+    )
+
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = CountingReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=0,
+    )
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        metrics={"mae": mae_metric},
+        scheduler=scheduler,
+        scheduler_monitor="val.metrics.mae",
+        epochs=2,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer.step()
+    trainer.step()
+    metrics_records = [
+        json.loads(line)
+        for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    config_record = next(record for record in metrics_records if record["kind"] == "config")
+
+    assert scheduler.monitor_values == [0.2, 0.3]
+    assert trainer.get_state()["lr"] == [5e-4]
+    assert config_record["scheduler_monitor"] == "val.metrics.mae"
+    assert any("monitor val.metrics.mae" in message for message in FakeTqdm.writes)
+
+
+def test_trainer_save_and_load_checkpoint_round_trip_with_reduce_lr_on_plateau(
+    monkeypatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "run"
+    FakeTqdm.writes.clear()
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+    _patch_epoch_execution(
+        monkeypatch,
+        train_summaries=[_make_train_summary(), _make_train_summary()],
+        validation_summaries=[
+            _make_eval_summary(loss=0.5),
+            _make_eval_summary(loss=0.6),
+        ],
+    )
+
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = CountingReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=0,
+    )
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        scheduler=scheduler,
+        epochs=2,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer.step()
+    trainer.step()
+    original_optimizer_state = copy.deepcopy(trainer.optimizer.state_dict())
+    original_scheduler_state = copy.deepcopy(trainer.scheduler.state_dict())
+    checkpoint_path = trainer.save_checkpoint()
+
+    trainer.scheduler.step(2.0)
+    trainer.optimizer.param_groups[0]["lr"] = 0.25
+    trainer.current_epoch = 0
+    trainer.global_step = 0
+
+    trainer.load_checkpoint(checkpoint_path)
+
+    _assert_nested_equal(trainer.optimizer.state_dict(), original_optimizer_state)
+    _assert_nested_equal(trainer.scheduler.state_dict(), original_scheduler_state)
+    assert trainer.get_state()["lr"] == [5e-4]
 
 
 def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path) -> None:
@@ -850,7 +1084,19 @@ def test_trainer_rejects_scheduler_from_other_optimizer() -> None:
         )
 
 
-def test_trainer_rejects_reduce_lr_on_plateau_scheduler() -> None:
+def test_trainer_rejects_scheduler_monitor_without_scheduler() -> None:
+    model = TinyModel()
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            torch.optim.AdamW(model.parameters(), lr=1e-3),
+            loss_fn,
+            scheduler_monitor="val.loss",
+        )
+
+
+def test_trainer_rejects_scheduler_monitor_for_non_plateau_scheduler() -> None:
     model = TinyModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
@@ -859,7 +1105,29 @@ def test_trainer_rejects_reduce_lr_on_plateau_scheduler() -> None:
             model,
             optimizer,
             loss_fn,
+            scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=1),
+            scheduler_monitor="val.loss",
+        )
+
+
+@pytest.mark.parametrize(
+    "scheduler_monitor",
+    ["train.loss", "test.loss", "val.metrics.unknown", "val.metrics.", "bogus"],
+)
+def test_trainer_rejects_invalid_reduce_lr_on_plateau_monitor(
+    scheduler_monitor: str,
+) -> None:
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            optimizer,
+            loss_fn,
+            metrics={"mae": mae_metric},
             scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer),
+            scheduler_monitor=scheduler_monitor,
         )
 
 

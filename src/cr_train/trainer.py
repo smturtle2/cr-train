@@ -59,6 +59,12 @@ class _PreparedSplitCacheEntry:
     state: PreparedSplitState
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedSchedulerMonitor:
+    path: str
+    metric_name: str | None = None
+
+
 class Trainer:
     """SEN12MS-CR trainer.
 
@@ -73,6 +79,7 @@ class Trainer:
         metrics: Mapping[str, MetricFn] | None = None,
         *,
         scheduler: LRScheduler | None = None,
+        scheduler_monitor: str | None = None,
         max_train_samples: int | None = None,
         max_val_samples: int | None = None,
         max_test_samples: int | None = None,
@@ -95,10 +102,6 @@ class Trainer:
             raise TypeError("loss must be callable")
         if scheduler is not None and not isinstance(scheduler, LRScheduler):
             raise TypeError("scheduler must be a torch.optim.lr_scheduler.LRScheduler instance")
-        if isinstance(scheduler, ReduceLROnPlateau):
-            raise ValueError(
-                "ReduceLROnPlateau is not supported; scheduler.step() must not require metrics"
-            )
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
         if epochs <= 0:
@@ -120,6 +123,12 @@ class Trainer:
                 raise TypeError(f"metric '{name}' must be callable")
         self._validate_optimizer_matches_model()
         self._validate_scheduler_matches_optimizer()
+        self._resolved_scheduler_monitor = self._resolve_scheduler_monitor(scheduler_monitor)
+        self.scheduler_monitor = (
+            self._resolved_scheduler_monitor.path
+            if self._resolved_scheduler_monitor is not None
+            else None
+        )
 
         self.max_train_samples = max_train_samples
         self.max_val_samples = max_val_samples
@@ -186,6 +195,7 @@ class Trainer:
             epoch_index=epoch_index,
             description=f"val {epoch_index + 1}/{self.epochs}",
         )
+        self._step_scheduler(validation_summary=validation_summary)
         if is_primary():
             self._write_record(
                 {
@@ -195,7 +205,6 @@ class Trainer:
                 }
             )
 
-        self._step_scheduler()
         elapsed_sec = time.perf_counter() - step_started_at
 
         self.current_epoch += 1
@@ -362,6 +371,42 @@ class Trainer:
         if self.scheduler.optimizer is not self.optimizer:
             raise ValueError("scheduler must be constructed from the provided optimizer")
 
+    def _resolve_scheduler_monitor(
+        self,
+        value: str | None,
+    ) -> _ResolvedSchedulerMonitor | None:
+        if self.scheduler is None:
+            if value is not None:
+                raise ValueError("scheduler_monitor requires a scheduler")
+            return None
+        if not isinstance(self.scheduler, ReduceLROnPlateau):
+            if value is not None:
+                raise ValueError("scheduler_monitor is only supported for ReduceLROnPlateau")
+            return None
+
+        path = "val.loss" if value is None else value.strip()
+        if not path:
+            raise ValueError("scheduler_monitor must not be empty")
+        if path == "val.loss":
+            return _ResolvedSchedulerMonitor(path=path)
+
+        metrics_prefix = "val.metrics."
+        if not path.startswith(metrics_prefix):
+            raise ValueError(
+                "scheduler_monitor must be 'val.loss' or 'val.metrics.<name>'"
+            )
+
+        metric_name = path[len(metrics_prefix):]
+        if not metric_name:
+            raise ValueError(
+                "scheduler_monitor must be 'val.loss' or 'val.metrics.<name>'"
+            )
+        if metric_name not in self.metric_fns:
+            raise ValueError(
+                f"scheduler_monitor metric '{metric_name}' must match a configured metric"
+            )
+        return _ResolvedSchedulerMonitor(path=path, metric_name=metric_name)
+
     @staticmethod
     def _infer_module_device(module: nn.Module) -> torch.device:
         for parameter in module.parameters():
@@ -388,23 +433,41 @@ class Trainer:
         return None
 
     def _get_learning_rates(self) -> list[float]:
-        learning_rates: list[float] = []
-        for param_group in self.optimizer.param_groups:
-            lr = param_group.get("lr")
-            if lr is None:
-                continue
-            learning_rates.append(float(lr))
-        return learning_rates
+        return [
+            float(lr)
+            for param_group in self.optimizer.param_groups
+            if (lr := param_group.get("lr")) is not None
+        ]
 
     def _scheduler_name(self) -> str | None:
         if self.scheduler is None:
             return None
         return self.scheduler.__class__.__name__
 
-    def _step_scheduler(self) -> None:
+    def _resolve_scheduler_monitor_value(
+        self,
+        validation_summary: Mapping[str, Any],
+    ) -> float:
+        monitor = self._resolved_scheduler_monitor
+        if monitor is None:
+            raise RuntimeError("scheduler monitor is not configured")
+        if monitor.metric_name is None:
+            return float(validation_summary["loss"])
+
+        metrics = validation_summary.get("metrics")
+        if not isinstance(metrics, Mapping) or monitor.metric_name not in metrics:
+            raise KeyError(
+                f"validation summary is missing scheduler monitor '{monitor.path}'"
+            )
+        return float(metrics[monitor.metric_name])
+
+    def _step_scheduler(self, *, validation_summary: Mapping[str, Any]) -> None:
         if self.scheduler is None:
             return
-        self.scheduler.step()
+        if self._resolved_scheduler_monitor is None:
+            self.scheduler.step()
+            return
+        self.scheduler.step(self._resolve_scheduler_monitor_value(validation_summary))
 
     def _seed_epoch(self, epoch_index: int) -> None:
         seed_everything(self.seed + epoch_index)
@@ -445,6 +508,7 @@ class Trainer:
                 "num_workers": self.num_workers,
                 "multiprocessing_context": self.multiprocessing_context,
                 "scheduler": self._scheduler_name(),
+                "scheduler_monitor": self.scheduler_monitor,
                 "train_crop_size": self.train_crop_size,
                 "train_random_flip": self.train_random_flip,
                 "train_random_rot90": self.train_random_rot90,
@@ -463,6 +527,7 @@ class Trainer:
                 num_workers=self.num_workers,
                 multiprocessing_context=self.multiprocessing_context,
                 scheduler_name=self._scheduler_name(),
+                scheduler_monitor=self.scheduler_monitor,
             )
         )
 

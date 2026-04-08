@@ -133,6 +133,8 @@ uv run python examples/train_sen12mscr.py \
   --max-test-samples 256 \
   --batch-size 4 \
   --epochs 2 \
+  --scheduler warmup-cosine \
+  --warmup-epochs 1 \
   --train-crop-size 128 \
   --train-random-flip \
   --train-random-rot90 \
@@ -140,6 +142,7 @@ uv run python examples/train_sen12mscr.py \
 ```
 
 Pass `--max-train-samples none` (or `full`) to cache and train on the entire split.
+The bundled script uses a custom `WarmupCosineScheduler` subclass by default to show the public scheduler API end-to-end; pass `--scheduler none` to disable it.
 The training augmentations apply only to the train split; validation and test stay at the original `256x256`.
 
 ### Sampling algorithm visualization
@@ -183,7 +186,8 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `optimizer` | `Optimizer` | *(required)* | Must be constructed from `model.parameters()`. |
 | `loss` | `Callable` | *(required)* | `(prediction, batch) -> scalar tensor`. |
 | `metrics` | `dict[str, Callable]` | `None` | `{"name": (prediction, batch) -> scalar}`. Logged per epoch. |
-| `scheduler` | `LRScheduler \| None` | `None` | Optional epoch scheduler built from the same optimizer. `Trainer.step()` calls `scheduler.step()` once after validation. `ReduceLROnPlateau` is not supported. |
+| `scheduler` | `LRScheduler \| None` | `None` | Optional scheduler built from the same optimizer. Standard schedulers step once after validation. `ReduceLROnPlateau` is also supported. |
+| `scheduler_monitor` | `str \| None` | `None` | Monitor path for `ReduceLROnPlateau`. Default is `val.loss`. Supported values are `val.loss` and `val.metrics.<name>`. |
 | `max_train_samples` | `int \| None` | `None` | Requested train rows. Converted to block count using the fixed `BLOCK_SIZE=64` accounting unit. `None` = full split. |
 | `max_val_samples` | `int \| None` | `None` | Same for validation. |
 | `max_test_samples` | `int \| None` | `None` | Same for test. |
