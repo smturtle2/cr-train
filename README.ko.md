@@ -107,13 +107,13 @@ print(trainer.test())
 train  ░░░░░…░░█░…░░░█░…  32 blocks (2 048 rows)
 val    ░░░░░░░░░░░█░░░░░…   4 blocks (  244 rows)
 
-Epoch 1/2 ━━━━━━━━━━━━━━━━━━━━ 512/512  loss=0.0423  mae=0.0312  12.3s
-  val  loss=0.0391  mae=0.0298  ckpt=runs/sen12mscr/epoch-0001.pt
+Epoch 1/2  train  loss 0.042  mae 0.031  12.3s
+           val    loss 0.039  mae 0.030
 
-Epoch 2/2 ━━━━━━━━━━━━━━━━━━━━ 512/512  loss=0.0387  mae=0.0295  11.8s
-  val  loss=0.0372  mae=0.0281  ckpt=runs/sen12mscr/epoch-0002.pt
+Epoch 2/2  train  loss 0.039  mae 0.029  11.8s
+           val    loss 0.037  mae 0.028
 
-Test  loss=0.0387  mae=0.0295  (256 samples)
+Test  loss=0.039  mae=0.029  (256 samples)
 ```
 
 </details>

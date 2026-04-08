@@ -378,10 +378,17 @@ def test_format_epoch_summary_prefers_elapsed_time_over_throughput() -> None:
         },
         epochs=2,
     )
+    plain_summary = re.sub(r"\x1b\[[0-9;]*m", "", summary)
+    lines = plain_summary.splitlines()
 
-    assert "12.3s" in summary
-    assert "lr 0.001" in summary
-    assert "samples/s" not in summary
+    assert summary.count("\n") == 1
+    assert "\t" not in summary
+    assert plain_summary.count("Epoch 1/2") == 1
+    assert lines[0].startswith("Epoch 1/2  train")
+    assert re.match(r"^\s+val\s+loss ", lines[1])
+    assert "12.3s" in plain_summary
+    assert "lr 0.001" in plain_summary
+    assert "samples/s" not in plain_summary
 
 
 def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Path) -> None:
@@ -492,8 +499,12 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert any("Epoch 1/" in message for message in FakeTqdm.writes)
     assert any("Test" in message for message in FakeTqdm.writes)
     epoch_message = next(message for message in FakeTqdm.writes if "Epoch 1/" in message)
-    assert "samples/s" not in epoch_message
-    assert re.search(r"\d+\.\d+s", epoch_message)
+    plain_epoch_message = re.sub(r"\x1b\[[0-9;]*m", "", epoch_message)
+    assert epoch_message.count("\n") == 1
+    assert "\t" not in epoch_message
+    assert plain_epoch_message.count("Epoch 1/") == 1
+    assert "samples/s" not in plain_epoch_message
+    assert re.search(r"\d+\.\d+s", plain_epoch_message)
     warmup_messages = [message for message in FakeTqdm.writes if message.startswith("cache ")]
     assert len(warmup_messages) == 3
     assert all("\n" not in message for message in warmup_messages)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ _BOLD = "\033[1m"
 _GREEN = "\033[32m"
 _CYAN = "\033[36m"
 _YELLOW = "\033[33m"
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def serialize_value(value: Any) -> Any:
@@ -116,6 +119,38 @@ def _fmt_learning_rates(values: Any) -> str | None:
     return "[" + ", ".join(formatted) + "]"
 
 
+def _visible_width(text: str) -> int:
+    return len(_ANSI_ESCAPE_RE.sub("", text))
+
+
+def _pad_visible(text: str, width: int) -> str:
+    return text + (" " * max(0, width - _visible_width(text)))
+
+
+def _format_summary_row(
+    *,
+    epoch_label: str,
+    epoch_width: int,
+    split_label: str,
+    split_width: int,
+    loss: float,
+    metrics: Mapping[str, Any],
+    learning_rates: str | None = None,
+    trailer: str | None = None,
+) -> str:
+    parts = [
+        f"{_pad_visible(epoch_label, epoch_width)}  {_pad_visible(split_label, split_width)}",
+        f"loss {_fmt(loss)}",
+    ]
+    for name, value in metrics.items():
+        parts.append(f"{name} {_fmt(float(value))}")
+    if learning_rates is not None:
+        parts.append(f"lr {learning_rates}")
+    if trailer is not None:
+        parts.append(trailer)
+    return "  ".join(parts)
+
+
 def _samples_label(n: int | None) -> str:
     if n is None:
         return "full"
@@ -160,30 +195,35 @@ def format_epoch_summary(result: dict[str, Any], *, epochs: int) -> str:
     epoch = result["epoch"]
     train = result["train"]
     val = result["val"]
-    sep = f" {_DIM}│{_RESET} "
-
-    parts = [f"{_BOLD}Epoch {epoch}/{epochs}{_RESET}"]
-
-    train_parts = [f"{_GREEN}train{_RESET} loss {_fmt(train['loss'])}"]
-    for name, value in train.get("metrics", {}).items():
-        train_parts.append(f"{name} {_fmt(value)}")
-    learning_rates = _fmt_learning_rates(train.get("lr"))
-    if learning_rates is not None:
-        train_parts.append(f"lr {learning_rates}")
-    parts.append(" ".join(train_parts))
-
-    val_parts = [f"{_CYAN}val{_RESET} loss {_fmt(val['loss'])}"]
-    for name, value in val.get("metrics", {}).items():
-        val_parts.append(f"{name} {_fmt(value)}")
-    parts.append(" ".join(val_parts))
-
+    epoch_label = f"{_BOLD}Epoch {epoch}/{epochs}{_RESET}"
+    epoch_width = len(f"Epoch {epochs}/{epochs}")
+    split_width = len("train")
+    trailer: str | None = None
     if "elapsed_sec" in result:
-        parts.append(f"{_DIM}{float(result['elapsed_sec']):.1f}s{_RESET}")
+        trailer = f"{_DIM}{float(result['elapsed_sec']):.1f}s{_RESET}"
     elif "samples_per_sec" in train:
         speed = train["samples_per_sec"]
-        parts.append(f"{_DIM}{speed:.1f} samples/s{_RESET}")
+        trailer = f"{_DIM}{speed:.1f} samples/s{_RESET}"
 
-    return sep.join(parts)
+    train_line = _format_summary_row(
+        epoch_label=epoch_label,
+        epoch_width=epoch_width,
+        split_label=f"{_GREEN}train{_RESET}",
+        split_width=split_width,
+        loss=float(train["loss"]),
+        metrics=train.get("metrics", {}),
+        learning_rates=_fmt_learning_rates(train.get("lr")),
+        trailer=trailer,
+    )
+    val_line = _format_summary_row(
+        epoch_label="",
+        epoch_width=epoch_width,
+        split_label=f"{_CYAN}val{_RESET}",
+        split_width=split_width,
+        loss=float(val["loss"]),
+        metrics=val.get("metrics", {}),
+    )
+    return f"{train_line}\n{val_line}"
 
 
 def format_test_summary(result: dict[str, Any]) -> str:
