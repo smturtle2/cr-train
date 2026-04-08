@@ -183,6 +183,7 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `optimizer` | `Optimizer` | *(required)* | Must be constructed from `model.parameters()`. |
 | `loss` | `Callable` | *(required)* | `(prediction, batch) -> scalar tensor`. |
 | `metrics` | `dict[str, Callable]` | `None` | `{"name": (prediction, batch) -> scalar}`. Logged per epoch. |
+| `scheduler` | `LRScheduler \| None` | `None` | Optional epoch scheduler built from the same optimizer. `Trainer.step()` calls `scheduler.step()` once after validation. `ReduceLROnPlateau` is not supported. |
 | `max_train_samples` | `int \| None` | `None` | Requested train rows. Converted to block count using the fixed `BLOCK_SIZE=64` accounting unit. `None` = full split. |
 | `max_val_samples` | `int \| None` | `None` | Same for validation. |
 | `max_test_samples` | `int \| None` | `None` | Same for test. |
@@ -207,6 +208,7 @@ Runs one training epoch + validation. Returns:
     "train": {
         "loss": 0.0423,
         "metrics": {"mae": 0.0312},
+        "lr": [0.001],
         "num_samples": 2048,
         "num_batches": 512,
         "samples_per_sec": 142.3,
@@ -239,11 +241,14 @@ Runs test evaluation with the current model state. Returns:
 ### `Trainer.save_checkpoint(path: str | Path | None = None) -> Path`
 
 Writes a resumable checkpoint containing `model`, `optimizer`, `epoch`, and `global_step`.
+If a scheduler is configured, its state is included under `scheduler`.
 When `path` is omitted, the file is written to `<output_dir>/epoch-XXXX.pt` using the current completed epoch.
 
 ### `Trainer.load_checkpoint(path: str | Path) -> dict`
 
 Restores `model`, `optimizer`, `epoch`, and `global_step` from a checkpoint file and returns:
+If both the trainer and the checkpoint have a scheduler state, that state is restored too.
+Older checkpoints without `scheduler` remain loadable, but scheduler progression is not reconstructed automatically in that case.
 
 ```python
 {
@@ -260,7 +265,7 @@ Writes model weights only. When `path` is omitted, the file is written to
 
 ### `Trainer.load_weights(path: str | Path, *, strict: bool = True) -> None`
 
-Restores model weights without touching optimizer state or runtime counters.
+Restores model weights without touching optimizer state, scheduler state, or runtime counters.
 Accepts either a weights-only file from `save_weights()` or a checkpoint file from `save_checkpoint()`.
 
 ### `Trainer.predict(batch: Mapping[str, Any]) -> Any`
@@ -277,6 +282,7 @@ Returns the current runtime state:
     "epoch": 5,
     "epochs": 10,
     "global_step": 2560,
+    "lr": [0.0005],
     "device": torch.device("cuda:0"),
     "distributed": False,
 }

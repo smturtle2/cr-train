@@ -10,6 +10,9 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 
 from .data.constants import DATASET_ID
@@ -23,14 +26,25 @@ from .data.dataset import (
     seed_everything,
 )
 from .data.runtime import ensure_split_cache, is_distributed, is_primary
-from .progress import resolve_progress_bar_ncols
 from .data.store import resolve_cache_root
 from .data.source import run_startup_stage
-from .trainer_reporting import format_config_banner, format_epoch_summary, format_startup_message, format_test_summary, serialize_value, should_print_startup
-from .trainer_runtime import MetricAccumulator, compute_loss, compute_metric_values, finalize_summary, prime_iterator, update_progress_bar
-
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+from .progress import resolve_progress_bar_ncols
+from .trainer_reporting import (
+    format_config_banner,
+    format_epoch_summary,
+    format_startup_message,
+    format_test_summary,
+    serialize_value,
+    should_print_startup,
+)
+from .trainer_runtime import (
+    MetricAccumulator,
+    compute_loss,
+    compute_metric_values,
+    finalize_summary,
+    prime_iterator,
+    update_progress_bar,
+)
 
 
 LossFn = Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int]
@@ -58,6 +72,7 @@ class Trainer:
         loss: LossFn,
         metrics: Mapping[str, MetricFn] | None = None,
         *,
+        scheduler: LRScheduler | None = None,
         max_train_samples: int | None = None,
         max_val_samples: int | None = None,
         max_test_samples: int | None = None,
@@ -78,6 +93,12 @@ class Trainer:
             raise TypeError("optimizer must be a torch.optim.Optimizer instance")
         if not callable(loss):
             raise TypeError("loss must be callable")
+        if scheduler is not None and not isinstance(scheduler, LRScheduler):
+            raise TypeError("scheduler must be a torch.optim.lr_scheduler.LRScheduler instance")
+        if isinstance(scheduler, ReduceLROnPlateau):
+            raise ValueError(
+                "ReduceLROnPlateau is not supported; scheduler.step() must not require metrics"
+            )
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
         if epochs <= 0:
@@ -91,12 +112,14 @@ class Trainer:
 
         self.model = model
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.loss_fn = loss
         self.metric_fns = dict(metrics or {})
         for name, metric_fn in self.metric_fns.items():
             if not callable(metric_fn):
                 raise TypeError(f"metric '{name}' must be callable")
         self._validate_optimizer_matches_model()
+        self._validate_scheduler_matches_optimizer()
 
         self.max_train_samples = max_train_samples
         self.max_val_samples = max_val_samples
@@ -145,7 +168,9 @@ class Trainer:
         self._write_config_once()
         self._ensure_training_startup_caches()
 
+        train_lrs = self._get_learning_rates()
         train_summary = self._run_training_epoch(epoch_index)
+        train_summary["lr"] = train_lrs
         if is_primary():
             self._write_record(
                 {
@@ -170,6 +195,7 @@ class Trainer:
                 }
             )
 
+        self._step_scheduler()
         elapsed_sec = time.perf_counter() - step_started_at
 
         self.current_epoch += 1
@@ -222,6 +248,8 @@ class Trainer:
             "model": self._model_state_owner().state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
+        if self.scheduler is not None:
+            checkpoint["scheduler"] = self.scheduler.state_dict()
         torch.save(checkpoint, checkpoint_path)
         self._write_record(
             {
@@ -246,6 +274,10 @@ class Trainer:
 
         self._model_state_owner().load_state_dict(checkpoint["model"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
+        # Legacy checkpoints predate scheduler support, so keep the caller's
+        # scheduler state unchanged when no scheduler payload is available.
+        if self.scheduler is not None and "scheduler" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler"])
         self.current_epoch = int(checkpoint.get("epoch", 0))
         self.global_step = int(checkpoint.get("global_step", 0))
 
@@ -302,6 +334,7 @@ class Trainer:
             "epoch": self.current_epoch,
             "epochs": self.epochs,
             "global_step": self.global_step,
+            "lr": self._get_learning_rates(),
             "device": self.device,
             "distributed": is_distributed(),
         }
@@ -322,6 +355,12 @@ class Trainer:
             raise ValueError("optimizer must contain model parameters")
         if not optimizer_param_ids.issubset(model_param_ids):
             raise ValueError("optimizer must be constructed from the provided model parameters")
+
+    def _validate_scheduler_matches_optimizer(self) -> None:
+        if self.scheduler is None:
+            return
+        if self.scheduler.optimizer is not self.optimizer:
+            raise ValueError("scheduler must be constructed from the provided optimizer")
 
     @staticmethod
     def _infer_module_device(module: nn.Module) -> torch.device:
@@ -347,6 +386,25 @@ class Trainer:
         if self.device.type == "cuda":
             return "spawn"
         return None
+
+    def _get_learning_rates(self) -> list[float]:
+        learning_rates: list[float] = []
+        for param_group in self.optimizer.param_groups:
+            lr = param_group.get("lr")
+            if lr is None:
+                continue
+            learning_rates.append(float(lr))
+        return learning_rates
+
+    def _scheduler_name(self) -> str | None:
+        if self.scheduler is None:
+            return None
+        return self.scheduler.__class__.__name__
+
+    def _step_scheduler(self) -> None:
+        if self.scheduler is None:
+            return
+        self.scheduler.step()
 
     def _seed_epoch(self, epoch_index: int) -> None:
         seed_everything(self.seed + epoch_index)
@@ -386,23 +444,27 @@ class Trainer:
                 "epochs": self.epochs,
                 "num_workers": self.num_workers,
                 "multiprocessing_context": self.multiprocessing_context,
+                "scheduler": self._scheduler_name(),
                 "train_crop_size": self.train_crop_size,
                 "train_random_flip": self.train_random_flip,
                 "train_random_rot90": self.train_random_rot90,
             }
         )
-        tqdm.write(format_config_banner(
-            dataset_name=DATASET_ID,
-            max_train_samples=self.max_train_samples,
-            max_val_samples=self.max_val_samples,
-            max_test_samples=self.max_test_samples,
-            batch_size=self.batch_size,
-            epochs=self.epochs,
-            seed=self.seed,
-            device=self.device,
-            num_workers=self.num_workers,
-            multiprocessing_context=self.multiprocessing_context,
-        ))
+        tqdm.write(
+            format_config_banner(
+                dataset_name=DATASET_ID,
+                max_train_samples=self.max_train_samples,
+                max_val_samples=self.max_val_samples,
+                max_test_samples=self.max_test_samples,
+                batch_size=self.batch_size,
+                epochs=self.epochs,
+                seed=self.seed,
+                device=self.device,
+                num_workers=self.num_workers,
+                multiprocessing_context=self.multiprocessing_context,
+                scheduler_name=self._scheduler_name(),
+            )
+        )
 
     def _wrap_model_for_ddp_if_needed(self) -> None:
         if not is_distributed() or isinstance(self.model, DDP):

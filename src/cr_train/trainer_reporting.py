@@ -103,8 +103,17 @@ def _fmt(value: float) -> str:
     if abs(value) < 0.0001:
         return f"{value:.2e}"
     if abs(value) < 10:
-        return f"{value:.4f}"
+        return f"{value:.3f}"
     return f"{value:.2f}"
+
+
+def _fmt_learning_rates(values: Any) -> str | None:
+    if not isinstance(values, list) or not values:
+        return None
+    formatted = [_fmt(float(value)) for value in values]
+    if len(formatted) == 1:
+        return formatted[0]
+    return "[" + ", ".join(formatted) + "]"
 
 
 def _samples_label(n: int | None) -> str:
@@ -125,6 +134,7 @@ def format_config_banner(
     device: torch.device,
     num_workers: int,
     multiprocessing_context: str | None,
+    scheduler_name: str | None,
 ) -> str:
     sep = f"{_DIM}│{_RESET}"
     header = f"{_BOLD}cr-train{_RESET} {_DIM}── {dataset_name} ── {device}{_RESET}"
@@ -137,6 +147,8 @@ def format_config_banner(
     config_parts = [f"batch {batch_size}", f"epochs {epochs}", f"seed {seed}", f"workers {num_workers}"]
     if multiprocessing_context is not None:
         config_parts.append(f"mp {multiprocessing_context}")
+    if scheduler_name is not None:
+        config_parts.append(f"scheduler {scheduler_name}")
     config = f"  {_DIM}config{_RESET}  " + f"  {sep}  ".join(config_parts)
     return f"{header}\n{splits}\n{config}"
 
@@ -152,6 +164,9 @@ def format_epoch_summary(result: dict[str, Any], *, epochs: int) -> str:
     train_parts = [f"{_GREEN}train{_RESET} loss {_fmt(train['loss'])}"]
     for name, value in train.get("metrics", {}).items():
         train_parts.append(f"{name} {_fmt(value)}")
+    learning_rates = _fmt_learning_rates(train.get("lr"))
+    if learning_rates is not None:
+        train_parts.append(f"lr {learning_rates}")
     parts.append(" ".join(train_parts))
 
     val_parts = [f"{_CYAN}val{_RESET} loss {_fmt(val['loss'])}"]

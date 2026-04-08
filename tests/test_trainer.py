@@ -154,6 +154,20 @@ class FakeDDP(torch.nn.Module):
         return self.module(*args, **kwargs)
 
 
+class CountingStepLR(torch.optim.lr_scheduler.StepLR):
+    def __init__(self, optimizer: torch.optim.Optimizer, *, step_size: int, gamma: float) -> None:
+        self.step_calls = 0
+        super().__init__(optimizer, step_size=step_size, gamma=gamma)
+        self.step_calls = 0
+
+    def step(self, epoch=None) -> None:
+        self.step_calls += 1
+        if epoch is None:
+            super().step()
+            return
+        super().step(epoch)
+
+
 def _clone_model_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {
         name: tensor.detach().clone()
@@ -277,6 +291,7 @@ def test_format_epoch_summary_prefers_elapsed_time_over_throughput() -> None:
             "train": {
                 "loss": 0.0423,
                 "metrics": {"mae": 0.0312},
+                "lr": [1e-3],
                 "samples_per_sec": 142.3,
             },
             "val": {
@@ -289,6 +304,7 @@ def test_format_epoch_summary_prefers_elapsed_time_over_throughput() -> None:
     )
 
     assert "12.3s" in summary
+    assert "lr 0.001" in summary
     assert "samples/s" not in summary
 
 
@@ -363,11 +379,13 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
         if any("cache " in desc for desc in instance.desc_history)
     ]
     config_record = next(record for record in metrics_records if record["kind"] == "config")
+    train_record = next(record for record in metrics_records if record["kind"] == "train_epoch")
 
     assert epoch_summary["epoch"] == 1
     assert epoch_summary["elapsed_sec"] > 0.0
     assert epoch_summary["train"]["loss"] >= 0.0
     assert "mae" in epoch_summary["train"]["metrics"]
+    assert epoch_summary["train"]["lr"] == [1e-3]
     assert "checkpoint_path" not in epoch_summary
     assert not (output_dir / "epoch-0001.pt").exists()
 
@@ -377,9 +395,11 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert "batches_per_sec" in epoch_summary["train"]
     assert all(record["kind"] != "checkpoint" for record in metrics_records)
     assert "old-record" not in metrics_path.read_text(encoding="utf-8")
+    assert train_record["lr"] == [1e-3]
 
     assert "dataset_seed" not in config_record
     assert config_record["multiprocessing_context"] is None
+    assert config_record["scheduler"] is None
     assert config_record["train_crop_size"] == 128
     assert config_record["train_random_flip"] is True
     assert config_record["train_random_rot90"] is True
@@ -447,6 +467,58 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
         trainer.step()
 
 
+def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "run"
+    _patch_split_cache(
+        monkeypatch,
+        tmp_path,
+        {
+            "train": _make_block_splits(4),
+            "validation": _make_block_splits(4),
+            "test": _make_block_splits(4),
+        },
+    )
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = CountingStepLR(optimizer, step_size=1, gamma=0.5)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        scheduler=scheduler,
+        max_train_samples=2 * BLOCK_SIZE,
+        max_val_samples=BLOCK_SIZE,
+        max_test_samples=BLOCK_SIZE,
+        epochs=2,
+        batch_size=8,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    epoch_summary = trainer.step()
+    metrics_records = [
+        json.loads(line)
+        for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    config_record = next(record for record in metrics_records if record["kind"] == "config")
+    train_record = next(record for record in metrics_records if record["kind"] == "train_epoch")
+
+    assert scheduler.step_calls == 1
+    assert epoch_summary["train"]["lr"] == [1e-3]
+    assert trainer.get_state()["lr"] == [5e-4]
+    assert train_record["lr"] == [1e-3]
+    assert config_record["scheduler"] == "CountingStepLR"
+    assert any("scheduler CountingStepLR" in message for message in FakeTqdm.writes)
+
+
 def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
     FakeTqdm.instances.clear()
@@ -465,11 +537,14 @@ def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
     model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = CountingStepLR(optimizer, step_size=1, gamma=0.5)
     trainer = Trainer(
         model,
-        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        optimizer,
         loss_fn,
         metrics={"mae": mae_metric},
+        scheduler=scheduler,
         max_train_samples=2 * BLOCK_SIZE,
         max_val_samples=BLOCK_SIZE,
         max_test_samples=BLOCK_SIZE,
@@ -483,6 +558,7 @@ def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path
     trainer.step()
     original_model_state = _clone_model_state_dict(model)
     original_optimizer_state = copy.deepcopy(trainer.optimizer.state_dict())
+    original_scheduler_state = copy.deepcopy(trainer.scheduler.state_dict())
     checkpoint_path = trainer.save_checkpoint()
 
     with torch.no_grad():
@@ -492,6 +568,7 @@ def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path
         for key, value in state.items():
             if isinstance(value, torch.Tensor):
                 value.zero_()
+    trainer.scheduler.step()
     trainer.current_epoch = 0
     trainer.global_step = 0
 
@@ -512,10 +589,65 @@ def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path
     assert trainer.global_step == (2 * BLOCK_SIZE) // 8
     _assert_nested_equal(_clone_model_state_dict(model), original_model_state)
     _assert_nested_equal(trainer.optimizer.state_dict(), original_optimizer_state)
+    _assert_nested_equal(trainer.scheduler.state_dict(), original_scheduler_state)
     assert [record["kind"] for record in metrics_records if record["kind"].startswith("checkpoint")] == [
         "checkpoint_save",
         "checkpoint_load",
     ]
+
+
+def test_trainer_load_checkpoint_keeps_scheduler_state_when_legacy_checkpoint_has_no_scheduler(
+    monkeypatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "run"
+    _patch_split_cache(
+        monkeypatch,
+        tmp_path,
+        {
+            "train": _make_block_splits(4),
+            "validation": _make_block_splits(4),
+            "test": _make_block_splits(4),
+        },
+    )
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = CountingStepLR(optimizer, step_size=1, gamma=0.5)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        scheduler=scheduler,
+        max_train_samples=2 * BLOCK_SIZE,
+        max_val_samples=BLOCK_SIZE,
+        max_test_samples=BLOCK_SIZE,
+        epochs=1,
+        batch_size=8,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer.step()
+    legacy_checkpoint_path = output_dir / "legacy-checkpoint.pt"
+    torch.save(
+        {
+            "epoch": trainer.current_epoch,
+            "global_step": trainer.global_step,
+            "model": trainer._model_state_owner().state_dict(),
+            "optimizer": trainer.optimizer.state_dict(),
+        },
+        legacy_checkpoint_path,
+    )
+
+    trainer.scheduler.step()
+    expected_scheduler_state = copy.deepcopy(trainer.scheduler.state_dict())
+
+    trainer.load_checkpoint(legacy_checkpoint_path)
+
+    _assert_nested_equal(trainer.scheduler.state_dict(), expected_scheduler_state)
 
 
 def test_trainer_save_and_load_weights_preserves_runtime_state(monkeypatch, tmp_path: Path) -> None:
@@ -576,6 +708,71 @@ def test_trainer_save_and_load_weights_preserves_runtime_state(monkeypatch, tmp_
     torch.testing.assert_close(first_state_tensor, torch.full_like(first_state_tensor, 123.0))
 
 
+def test_trainer_load_weights_from_checkpoint_preserves_scheduler_and_runtime(
+    monkeypatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "run"
+    _patch_split_cache(
+        monkeypatch,
+        tmp_path,
+        {
+            "train": _make_block_splits(4),
+            "validation": _make_block_splits(4),
+            "test": _make_block_splits(4),
+        },
+    )
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = CountingStepLR(optimizer, step_size=1, gamma=0.5)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        scheduler=scheduler,
+        max_train_samples=2 * BLOCK_SIZE,
+        max_val_samples=BLOCK_SIZE,
+        max_test_samples=BLOCK_SIZE,
+        epochs=1,
+        batch_size=8,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer.step()
+    checkpoint_path = trainer.save_checkpoint()
+    original_model_state = _clone_model_state_dict(model)
+    first_state_tensor = next(
+        value
+        for state in trainer.optimizer.state.values()
+        for value in state.values()
+        if isinstance(value, torch.Tensor)
+    )
+    first_state_tensor.fill_(123.0)
+
+    trainer.scheduler.step()
+    expected_scheduler_state = copy.deepcopy(trainer.scheduler.state_dict())
+    expected_lr = trainer.get_state()["lr"]
+    trainer.current_epoch = 11
+    trainer.global_step = 29
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(5.0)
+
+    trainer.load_weights(checkpoint_path)
+
+    _assert_nested_equal(_clone_model_state_dict(model), original_model_state)
+    _assert_nested_equal(trainer.scheduler.state_dict(), expected_scheduler_state)
+    assert trainer.current_epoch == 11
+    assert trainer.global_step == 29
+    assert trainer.get_state()["lr"] == expected_lr
+    torch.testing.assert_close(first_state_tensor, torch.full_like(first_state_tensor, 123.0))
+
+
 def test_trainer_predict_preserves_training_mode(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
@@ -621,6 +818,7 @@ def test_trainer_get_state_reports_runtime_values(monkeypatch, tmp_path: Path) -
         "epoch": 2,
         "epochs": 3,
         "global_step": 17,
+        "lr": [1e-3],
         "device": torch.device("cpu"),
         "distributed": False,
     }
@@ -635,6 +833,33 @@ def test_trainer_rejects_optimizer_from_other_model() -> None:
             model,
             torch.optim.AdamW(other_model.parameters(), lr=1e-3),
             loss_fn,
+        )
+
+
+def test_trainer_rejects_scheduler_from_other_optimizer() -> None:
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    other_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            optimizer,
+            loss_fn,
+            scheduler=torch.optim.lr_scheduler.StepLR(other_optimizer, step_size=1),
+        )
+
+
+def test_trainer_rejects_reduce_lr_on_plateau_scheduler() -> None:
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            optimizer,
+            loss_fn,
+            scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer),
         )
 
 
