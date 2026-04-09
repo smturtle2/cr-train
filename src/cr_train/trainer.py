@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import torch
 from torch import nn
@@ -51,6 +53,16 @@ from .trainer_runtime import (
 LossFn = Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int]
 MetricFn = Callable[[Any, Mapping[str, Any]], torch.Tensor | float | int]
 _MULTIPROCESSING_CONTEXT_CHOICES = {"fork", "spawn", "forkserver"}
+_SCHEDULER_TIMING_CHOICES = {
+    "after_validation",
+    "before_optimizer_step",
+    "after_optimizer_step",
+}
+SchedulerTiming = Literal[
+    "after_validation",
+    "before_optimizer_step",
+    "after_optimizer_step",
+]
 
 
 @dataclass(slots=True)
@@ -64,6 +76,12 @@ class _PreparedSplitCacheEntry:
 class _ResolvedSchedulerMonitor:
     path: str
     metric_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedSchedulerConfig:
+    timing: SchedulerTiming
+    monitor: _ResolvedSchedulerMonitor | None = None
 
 
 class Trainer:
@@ -80,11 +98,13 @@ class Trainer:
         metrics: Mapping[str, MetricFn] | None = None,
         *,
         scheduler: LRScheduler | None = None,
+        scheduler_timing: SchedulerTiming = "after_validation",
         scheduler_monitor: str | None = None,
         max_train_samples: int | None = None,
         max_val_samples: int | None = None,
         max_test_samples: int | None = None,
         batch_size: int = 4,
+        accum_steps: int = 1,
         epochs: int = 1,
         seed: int = 42,
         output_dir: str | Path = "runs/default",
@@ -105,6 +125,8 @@ class Trainer:
             raise TypeError("scheduler must be a torch.optim.lr_scheduler.LRScheduler instance")
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+        if accum_steps <= 0:
+            raise ValueError("accum_steps must be greater than zero")
         if epochs <= 0:
             raise ValueError("epochs must be greater than zero")
         if train_crop_size is not None and train_crop_size <= 0:
@@ -124,10 +146,14 @@ class Trainer:
                 raise TypeError(f"metric '{name}' must be callable")
         self._validate_optimizer_matches_model()
         self._validate_scheduler_matches_optimizer()
-        self._resolved_scheduler_monitor = self._resolve_scheduler_monitor(scheduler_monitor)
+        self._scheduler_config = self._resolve_scheduler_config(
+            scheduler_timing=scheduler_timing,
+            scheduler_monitor=scheduler_monitor,
+        )
+        self.scheduler_timing = self._scheduler_config.timing
         self.scheduler_monitor = (
-            self._resolved_scheduler_monitor.path
-            if self._resolved_scheduler_monitor is not None
+            self._scheduler_config.monitor.path
+            if self._scheduler_config.monitor is not None
             else None
         )
 
@@ -135,6 +161,7 @@ class Trainer:
         self.max_val_samples = max_val_samples
         self.max_test_samples = max_test_samples
         self.batch_size = batch_size
+        self.accum_steps = accum_steps
         self.epochs = epochs
         self.seed = seed
         self.train_crop_size = train_crop_size
@@ -182,6 +209,7 @@ class Trainer:
         train_started_at = time.perf_counter()
         train_summary = self._run_training_epoch(epoch_index)
         train_elapsed_sec = time.perf_counter() - train_started_at
+        train_lrs = train_summary.get("lr", train_lrs)
         train_summary["lr"] = train_lrs
         if is_primary():
             self._write_record(
@@ -208,7 +236,7 @@ class Trainer:
             description=f"val {epoch_index + 1}/{self.epochs}",
         )
         validation_elapsed_sec = time.perf_counter() - validation_started_at
-        self._step_scheduler(validation_summary=validation_summary)
+        self._step_scheduler_after_validation(validation_summary)
         if is_primary():
             self._write_record(
                 {
@@ -399,19 +427,53 @@ class Trainer:
         if self.scheduler.optimizer is not self.optimizer:
             raise ValueError("scheduler must be constructed from the provided optimizer")
 
+    def _resolve_scheduler_timing(self, value: SchedulerTiming) -> SchedulerTiming:
+        normalized = value.strip().lower()
+        if normalized not in _SCHEDULER_TIMING_CHOICES:
+            supported = ", ".join(sorted(_SCHEDULER_TIMING_CHOICES))
+            raise ValueError(f"scheduler_timing must be one of {supported}")
+        return cast(SchedulerTiming, normalized)
+
+    def _resolve_scheduler_config(
+        self,
+        *,
+        scheduler_timing: SchedulerTiming,
+        scheduler_monitor: str | None,
+    ) -> _ResolvedSchedulerConfig:
+        timing = self._resolve_scheduler_timing(scheduler_timing)
+        if self.scheduler is None:
+            if scheduler_monitor is not None:
+                raise ValueError("scheduler_monitor requires a scheduler")
+            if timing != "after_validation":
+                raise ValueError(
+                    "scheduler_timing requires a scheduler unless it is 'after_validation'"
+                )
+            return _ResolvedSchedulerConfig(timing=timing)
+
+        if scheduler_monitor is not None and timing != "after_validation":
+            raise ValueError(
+                "scheduler_monitor is only supported when scheduler_timing is 'after_validation'"
+            )
+
+        if isinstance(self.scheduler, ReduceLROnPlateau):
+            if timing != "after_validation":
+                raise ValueError(
+                    "ReduceLROnPlateau requires scheduler_timing='after_validation'"
+                )
+            return _ResolvedSchedulerConfig(
+                timing=timing,
+                monitor=self._resolve_scheduler_monitor(scheduler_monitor),
+            )
+
+        if scheduler_monitor is not None:
+            raise ValueError("scheduler_monitor is only supported for ReduceLROnPlateau")
+
+        return _ResolvedSchedulerConfig(timing=timing)
+
     def _resolve_scheduler_monitor(
         self,
         value: str | None,
-    ) -> _ResolvedSchedulerMonitor | None:
-        if self.scheduler is None:
-            if value is not None:
-                raise ValueError("scheduler_monitor requires a scheduler")
-            return None
-        if not isinstance(self.scheduler, ReduceLROnPlateau):
-            if value is not None:
-                raise ValueError("scheduler_monitor is only supported for ReduceLROnPlateau")
-            return None
-
+    ) -> _ResolvedSchedulerMonitor:
         path = "val.loss" if value is None else value.strip()
         if not path:
             raise ValueError("scheduler_monitor must not be empty")
@@ -475,27 +537,43 @@ class Trainer:
     def _resolve_scheduler_monitor_value(
         self,
         validation_summary: Mapping[str, Any],
+        monitor: _ResolvedSchedulerMonitor,
     ) -> float:
-        monitor = self._resolved_scheduler_monitor
-        if monitor is None:
-            raise RuntimeError("scheduler monitor is not configured")
         if monitor.metric_name is None:
             return float(validation_summary["loss"])
-
-        metrics = validation_summary.get("metrics")
-        if not isinstance(metrics, Mapping) or monitor.metric_name not in metrics:
-            raise KeyError(
-                f"validation summary is missing scheduler monitor '{monitor.path}'"
-            )
+        metrics = validation_summary["metrics"]
         return float(metrics[monitor.metric_name])
 
-    def _step_scheduler(self, *, validation_summary: Mapping[str, Any]) -> None:
-        if self.scheduler is None:
+    def _step_scheduler_before_optimizer(self) -> None:
+        if self.scheduler is None or self._scheduler_config.timing != "before_optimizer_step":
             return
-        if self._resolved_scheduler_monitor is None:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    r"Detected call of `lr_scheduler\.step\(\)` before "
+                    r"`optimizer\.step\(\)`\..*"
+                ),
+                category=UserWarning,
+            )
+            self.scheduler.step()
+
+    def _step_scheduler_after_optimizer(self) -> None:
+        if self.scheduler is None or self._scheduler_config.timing != "after_optimizer_step":
+            return
+        self.scheduler.step()
+
+    def _step_scheduler_after_validation(
+        self,
+        validation_summary: Mapping[str, Any],
+    ) -> None:
+        if self.scheduler is None or self._scheduler_config.timing != "after_validation":
+            return
+        monitor = self._scheduler_config.monitor
+        if monitor is None:
             self.scheduler.step()
             return
-        self.scheduler.step(self._resolve_scheduler_monitor_value(validation_summary))
+        self.scheduler.step(self._resolve_scheduler_monitor_value(validation_summary, monitor))
 
     def _seed_epoch(self, epoch_index: int) -> None:
         seed_everything(self.seed + epoch_index)
@@ -532,10 +610,12 @@ class Trainer:
                 "max_test_samples": self.max_test_samples,
                 "seed": self.seed,
                 "batch_size": self.batch_size,
+                "accum_steps": self.accum_steps,
                 "epochs": self.epochs,
                 "num_workers": self.num_workers,
                 "multiprocessing_context": self.multiprocessing_context,
                 "scheduler": self._scheduler_name(),
+                "scheduler_timing": self.scheduler_timing,
                 "scheduler_monitor": self.scheduler_monitor,
                 "train_crop_size": self.train_crop_size,
                 "train_random_flip": self.train_random_flip,
@@ -549,12 +629,14 @@ class Trainer:
                 max_val_samples=self.max_val_samples,
                 max_test_samples=self.max_test_samples,
                 batch_size=self.batch_size,
+                accum_steps=self.accum_steps,
                 epochs=self.epochs,
                 seed=self.seed,
                 device=self.device,
                 num_workers=self.num_workers,
                 multiprocessing_context=self.multiprocessing_context,
                 scheduler_name=self._scheduler_name(),
+                scheduler_timing=self.scheduler_timing,
                 scheduler_monitor=self.scheduler_monitor,
             )
         )
@@ -630,7 +712,7 @@ class Trainer:
         max_samples: int | None,
         training: bool,
         epoch_index: int,
-    ) -> tuple[Any, int | None]:
+    ) -> tuple[Any, int]:
         state = self._resolve_prepared_split_state(split=split, max_samples=max_samples)
         prepared = prepare_split_from_state(
             state,
@@ -674,12 +756,43 @@ class Trainer:
         num_examples: int,
         batch_size: int,
         training: bool,
-    ) -> int | None:
+    ) -> int:
         if num_examples <= 0:
             return 0
         if training and self.drop_last:
             return num_examples // batch_size
         return (num_examples + batch_size - 1) // batch_size
+
+    def _should_step_optimizer(self, *, batch_index: int, total_batches: int) -> bool:
+        is_accum_boundary = (batch_index + 1) % self.accum_steps == 0
+        is_last_batch = batch_index + 1 == total_batches
+        return is_accum_boundary or is_last_batch
+
+    def _accum_window_size(self, *, batch_index: int, total_batches: int) -> int:
+        window_start = batch_index - (batch_index % self.accum_steps)
+        return min(self.accum_steps, total_batches - window_start)
+
+    def _gradient_sync_context(self, *, sync_gradients: bool):
+        if sync_gradients or not isinstance(self.model, DDP):
+            return nullcontext()
+        return self.model.no_sync()
+
+    def _run_optimizer_update(
+        self,
+        *,
+        first_update_lrs: list[float] | None,
+    ) -> list[float]:
+        if self.scheduler_timing == "before_optimizer_step":
+            self._step_scheduler_before_optimizer()
+
+        applied_lrs = self._get_learning_rates() if first_update_lrs is None else first_update_lrs
+        self.optimizer.step()
+
+        if self.scheduler_timing == "after_optimizer_step":
+            self._step_scheduler_after_optimizer()
+
+        self.global_step += 1
+        return applied_lrs
 
     def _run_training_epoch(self, epoch_index: int) -> dict[str, Any]:
         loader, total_batches = self._build_loader(
@@ -701,22 +814,36 @@ class Trainer:
 
         accumulator = MetricAccumulator()
         start_time = time.perf_counter()
+        first_update_lrs: list[float] | None = None
         batch_iterator = self._prime_loader(split="train", loader=loader, max_samples=self.max_train_samples)
         progress = self._create_progress_bar(
             total=total_batches,
             description=f"train {epoch_index + 1}/{self.epochs}",
         )
         try:
-            for batch in batch_iterator:
+            self.optimizer.zero_grad(set_to_none=True)
+            for batch_index, batch in enumerate(batch_iterator):
                 moved_batch = move_batch_to_device(batch, self.device)
-                self.optimizer.zero_grad(set_to_none=True)
-                model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
-                loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
-                loss.backward()
-                self.optimizer.step()
+                sync_gradients = self._should_step_optimizer(
+                    batch_index=batch_index,
+                    total_batches=total_batches,
+                )
+                accum_window_size = self._accum_window_size(
+                    batch_index=batch_index,
+                    total_batches=total_batches,
+                )
+                with self._gradient_sync_context(sync_gradients=sync_gradients):
+                    model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
+                    loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
+                    (loss / accum_window_size).backward()
+
+                if sync_gradients:
+                    first_update_lrs = self._run_optimizer_update(
+                        first_update_lrs=first_update_lrs
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 batch_size = int(moved_batch["sar"].shape[0])
-                self.global_step += 1
 
                 metric_values = compute_metric_values(self.metric_fns, model_output, moved_batch)
                 batch_values = {"loss": loss.item(), **metric_values}
@@ -743,6 +870,8 @@ class Trainer:
         )
         if summary["num_samples"] == 0:
             raise RuntimeError("training epoch produced no batches")
+        if first_update_lrs is not None:
+            summary["lr"] = first_update_lrs
         return summary
 
     def _run_evaluation(

@@ -229,12 +229,14 @@ def format_config_banner(
     max_val_samples: int | None,
     max_test_samples: int | None,
     batch_size: int,
+    accum_steps: int,
     epochs: int,
     seed: int,
     device: torch.device,
     num_workers: int,
     multiprocessing_context: str | None,
     scheduler_name: str | None,
+    scheduler_timing: str,
     scheduler_monitor: str | None,
 ) -> str:
     header = f"{_BOLD}cr-train{_RESET} {_DIM}── {dataset_name} ── {device}{_RESET}"
@@ -244,11 +246,18 @@ def format_config_banner(
         f"val {_BOLD}{_samples_label(max_val_samples)}{_RESET}  "
         f"test {_BOLD}{_samples_label(max_test_samples)}{_RESET}"
     )
-    config_parts = [f"batch {batch_size}", f"epochs {epochs}", f"seed {seed}", f"workers {num_workers}"]
+    config_parts = [
+        f"batch {batch_size}",
+        f"accum {accum_steps}",
+        f"epochs {epochs}",
+        f"seed {seed}",
+        f"workers {num_workers}",
+    ]
     if multiprocessing_context is not None:
         config_parts.append(f"mp {multiprocessing_context}")
     if scheduler_name is not None:
         config_parts.append(f"scheduler {scheduler_name}")
+        config_parts.append(f"timing {scheduler_timing}")
     if scheduler_monitor is not None:
         config_parts.append(f"monitor {scheduler_monitor}")
     config = f"  {_DIM}config{_RESET}  " + _summary_separator().join(config_parts)

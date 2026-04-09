@@ -19,6 +19,7 @@ def test_training_example_loads_without_running_main() -> None:
     assert namespace["parse_max_samples"]("full") is None
     assert namespace["parse_max_samples"]("128") == 128
     assert namespace["parse_non_negative_int"]("0") == 0
+    assert namespace["parse_positive_int"]("4") == 4
 
 
 def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -> None:
@@ -32,10 +33,14 @@ def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -
             "train_sen12mscr.py",
             "--train-crop-size",
             "128",
+            "--accum-steps",
+            "4",
             "--train-random-flip",
             "--train-random-rot90",
             "--scheduler",
             "warmup-cosine",
+            "--scheduler-timing",
+            "before_optimizer_step",
             "--warmup-epochs",
             "2",
             "--min-lr-scale",
@@ -45,9 +50,11 @@ def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -
     args = namespace["parse_args"]()
 
     assert args.train_crop_size == 128
+    assert args.accum_steps == 4
     assert args.train_random_flip is True
     assert args.train_random_rot90 is True
     assert args.scheduler == "warmup-cosine"
+    assert args.scheduler_timing == "before_optimizer_step"
     assert args.warmup_epochs == 2
     assert args.min_lr_scale == 0.2
 
@@ -74,6 +81,55 @@ def test_training_example_builds_custom_scheduler() -> None:
         warmup_epochs=1,
         min_lr_scale=0.2,
     ) is None
+
+
+def test_training_example_parser_defaults_scheduler_timing_to_after_validation(
+    monkeypatch,
+) -> None:
+    example_path = Path(__file__).resolve().parents[1] / "examples" / "train_sen12mscr.py"
+    namespace = runpy.run_path(str(example_path), run_name="example_module")
+
+    monkeypatch.setattr(sys, "argv", ["train_sen12mscr.py"])
+    args = namespace["parse_args"]()
+
+    assert args.scheduler_timing == "after_validation"
+
+
+def test_training_example_main_forwards_scheduler_timing(monkeypatch, tmp_path: Path) -> None:
+    example_path = Path(__file__).resolve().parents[1] / "examples" / "train_sen12mscr.py"
+    namespace = runpy.run_path(str(example_path), run_name="example_module")
+    trainer_kwargs: dict[str, object] = {}
+
+    class FakeTrainer:
+        def __init__(self, model, optimizer, loss, **kwargs) -> None:
+            del model, optimizer, loss
+            trainer_kwargs.update(kwargs)
+
+        def step(self) -> dict[str, object]:
+            return {}
+
+        def test(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_sen12mscr.py",
+            "--epochs",
+            "1",
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--scheduler-timing",
+            "after_optimizer_step",
+        ],
+    )
+    main = namespace["main"]
+    main.__globals__["Trainer"] = FakeTrainer
+
+    main()
+
+    assert trainer_kwargs["scheduler_timing"] == "after_optimizer_step"
 
 
 def test_bitmask_demo_example_loads_without_running_main() -> None:

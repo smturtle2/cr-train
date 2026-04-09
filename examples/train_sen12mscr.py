@@ -8,8 +8,10 @@ Usage:
       --max-train-samples 2048 \\
       --max-val-samples 256 \\
       --batch-size 4 \\
+      --accum-steps 4 \\
       --epochs 2 \\
       --scheduler warmup-cosine \\
+      --scheduler-timing after_validation \\
       --warmup-epochs 1 \\
       --train-crop-size 128 \\
       --train-random-flip \\
@@ -126,6 +128,13 @@ def parse_non_negative_int(value: str) -> int:
     return parsed
 
 
+def parse_positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run SEN12MS-CR training with Trainer.",
@@ -156,6 +165,12 @@ def parse_args() -> argparse.Namespace:
         help="Seed controlling block selection and epoch-wise block/row shuffle order.",
     )
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--accum-steps",
+        type=parse_positive_int,
+        default=1,
+        help="Number of micro-batches to accumulate before each optimizer update.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -168,6 +183,15 @@ def parse_args() -> argparse.Namespace:
         choices=("none", "warmup-cosine"),
         default="warmup-cosine",
         help="Optional epoch-based scheduler to attach to Trainer.",
+    )
+    parser.add_argument(
+        "--scheduler-timing",
+        choices=("after_validation", "before_optimizer_step", "after_optimizer_step"),
+        default="after_validation",
+        help=(
+            "When Trainer should call scheduler.step(). "
+            "Keep the bundled warmup-cosine example at the default epoch-based after_validation timing."
+        ),
     )
     parser.add_argument(
         "--warmup-epochs",
@@ -261,10 +285,12 @@ def main() -> None:
         reconstruction_loss,
         metrics={"mae": mean_absolute_error},
         scheduler=scheduler,
+        scheduler_timing=args.scheduler_timing,
         max_train_samples=args.max_train_samples,
         max_val_samples=args.max_val_samples,
         max_test_samples=args.max_test_samples,
         batch_size=args.batch_size,
+        accum_steps=args.accum_steps,
         epochs=args.epochs,
         seed=args.seed,
         output_dir=args.output_dir,

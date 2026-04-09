@@ -161,6 +161,31 @@ class FakeDDP(torch.nn.Module):
         return self.module(*args, **kwargs)
 
 
+class TrackingDDP(torch.nn.Module):
+    def __init__(self, module: torch.nn.Module, device_ids=None) -> None:
+        super().__init__()
+        self.module = module
+        self.device_ids = device_ids
+        self.no_sync_calls = 0
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+    def no_sync(self):
+        parent = self
+
+        class _NoSyncContext:
+            def __enter__(self) -> None:
+                parent.no_sync_calls += 1
+                return None
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                del exc_type, exc, tb
+                return False
+
+        return _NoSyncContext()
+
+
 class CountingStepLR(torch.optim.lr_scheduler.StepLR):
     def __init__(self, optimizer: torch.optim.Optimizer, *, step_size: int, gamma: float) -> None:
         self.step_calls = 0
@@ -190,6 +215,54 @@ class CountingReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
             super().step(metrics)
             return
         super().step(metrics, epoch)
+
+
+class CountingSGD(torch.optim.SGD):
+    def __init__(self, params, **kwargs) -> None:
+        self.step_calls = 0
+        super().__init__(params, **kwargs)
+        self.step_calls = 0
+
+    def step(self, closure=None):
+        self.step_calls += 1
+        return super().step(closure)
+
+
+class RecordingSGD(torch.optim.SGD):
+    def __init__(self, params, *, events: list[str], **kwargs) -> None:
+        self.events = events
+        self.step_calls = 0
+        super().__init__(params, **kwargs)
+        self.step_calls = 0
+
+    def step(self, closure=None):
+        self.step_calls += 1
+        self.events.append("optimizer")
+        return super().step(closure)
+
+
+class RecordingStepLR(torch.optim.lr_scheduler.StepLR):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        events: list[str],
+        step_size: int,
+        gamma: float,
+    ) -> None:
+        self.events = events
+        self.step_calls = 0
+        super().__init__(optimizer, step_size=step_size, gamma=gamma)
+        self.step_calls = 0
+        self.events.clear()
+
+    def step(self, epoch=None) -> None:
+        self.step_calls += 1
+        self.events.append("scheduler")
+        if epoch is None:
+            super().step()
+            return
+        super().step(epoch)
 
 
 def _clone_model_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -253,6 +326,32 @@ def _make_eval_summary(
         "num_samples": 4,
         "num_batches": 1,
     }
+
+
+def _make_training_batch(indices: list[int]) -> dict[str, torch.Tensor]:
+    sample_ids = torch.tensor(indices, dtype=torch.float32).view(len(indices), 1, 1, 1)
+    sar = torch.cat([sample_ids, sample_ids + 1.0], dim=1)
+    cloudy = torch.cat([sample_ids + float(channel) for channel in range(13)], dim=1)
+    target = (cloudy * 0.25) + sample_ids
+    return {
+        "sar": sar,
+        "cloudy": cloudy,
+        "target": target,
+        "meta": {"scene": [f"scene-{index}" for index in indices]},
+    }
+
+
+def _patch_training_batches(monkeypatch, *, batches: list[dict[str, torch.Tensor]]) -> None:
+    def fake_build_loader(self, *, split: str, max_samples: int | None, training: bool, epoch_index: int):
+        del self, max_samples, epoch_index
+        assert split == "train"
+        assert training is True
+        return copy.deepcopy(batches), len(batches)
+
+    monkeypatch.setattr(Trainer, "_build_loader", fake_build_loader)
+    monkeypatch.setattr(Trainer, "_set_sampler_epoch", lambda self, loader, epoch_index: None)
+    monkeypatch.setattr(Trainer, "_prime_loader", lambda self, *, split, loader, max_samples: iter(loader))
+    monkeypatch.setattr(Trainer, "_handle_startup_event", lambda self, event: None)
 
 
 def _patch_epoch_execution(
@@ -607,7 +706,9 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert "dataset_seed" not in config_record
     assert config_record["multiprocessing_context"] is None
     assert config_record["scheduler"] is None
+    assert config_record["scheduler_timing"] == "after_validation"
     assert config_record["scheduler_monitor"] is None
+    assert config_record["accum_steps"] == 1
     assert config_record["train_crop_size"] == 128
     assert config_record["train_random_flip"] is True
     assert config_record["train_random_rot90"] is True
@@ -759,8 +860,358 @@ def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(
     assert trainer.get_state()["lr"] == [5e-4]
     assert train_record["lr"] == [1e-3]
     assert config_record["scheduler"] == "CountingStepLR"
+    assert config_record["scheduler_timing"] == "after_validation"
     assert config_record["scheduler_monitor"] is None
     assert any("scheduler CountingStepLR" in message for message in FakeTqdm.writes)
+    assert any("timing after_validation" in message for message in FakeTqdm.writes)
+
+
+def test_trainer_steps_scheduler_before_optimizer_step_once_per_update(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+            _make_training_batch([6, 7]),
+        ],
+    )
+
+    events: list[str] = []
+    model = TinyModel()
+    optimizer = RecordingSGD(model.parameters(), events=events, lr=1e-3)
+    scheduler = RecordingStepLR(optimizer, events=events, step_size=1, gamma=0.5)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        scheduler=scheduler,
+        scheduler_timing="before_optimizer_step",
+        accum_steps=2,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    summary = trainer._run_training_epoch(0)
+
+    assert events == ["scheduler", "optimizer", "scheduler", "optimizer"]
+    assert scheduler.step_calls == 2
+    assert optimizer.step_calls == 2
+    assert summary["num_batches"] == 4
+    assert trainer.global_step == 2
+    assert trainer.get_state()["lr"] == [2.5e-4]
+
+
+def test_trainer_steps_scheduler_after_optimizer_step_once_per_update(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+            _make_training_batch([6, 7]),
+        ],
+    )
+
+    events: list[str] = []
+    model = TinyModel()
+    optimizer = RecordingSGD(model.parameters(), events=events, lr=1e-3)
+    scheduler = RecordingStepLR(optimizer, events=events, step_size=1, gamma=0.5)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        scheduler=scheduler,
+        scheduler_timing="after_optimizer_step",
+        accum_steps=2,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    summary = trainer._run_training_epoch(0)
+
+    assert events == ["optimizer", "scheduler", "optimizer", "scheduler"]
+    assert scheduler.step_calls == 2
+    assert optimizer.step_calls == 2
+    assert summary["num_batches"] == 4
+    assert trainer.global_step == 2
+    assert trainer.get_state()["lr"] == [2.5e-4]
+
+
+def test_trainer_steps_after_optimizer_scheduler_for_final_partial_window(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+            _make_training_batch([6, 7]),
+            _make_training_batch([8, 9]),
+        ],
+    )
+
+    events: list[str] = []
+    model = TinyModel()
+    optimizer = RecordingSGD(model.parameters(), events=events, lr=1e-3)
+    scheduler = RecordingStepLR(optimizer, events=events, step_size=1, gamma=0.5)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        scheduler=scheduler,
+        scheduler_timing="after_optimizer_step",
+        accum_steps=2,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer._run_training_epoch(0)
+
+    assert scheduler.step_calls == 3
+    assert optimizer.step_calls == 3
+    assert events[-2:] == ["optimizer", "scheduler"]
+
+
+def test_trainer_reports_first_effective_learning_rate_for_before_optimizer_scheduler(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    monkeypatch.setattr(Trainer, "_ensure_training_startup_caches", lambda self: None)
+    monkeypatch.setattr(
+        Trainer,
+        "_run_evaluation",
+        lambda self, *, split, max_samples, epoch_index, description: _make_eval_summary(loss=0.1),
+    )
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+        ],
+    )
+
+    output_dir = tmp_path / "run"
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = CountingStepLR(optimizer, step_size=1, gamma=0.5)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        scheduler=scheduler,
+        scheduler_timing="before_optimizer_step",
+        accum_steps=2,
+        epochs=1,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    result = trainer.step()
+    metrics_records = [
+        json.loads(line)
+        for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    config_record = next(record for record in metrics_records if record["kind"] == "config")
+    train_record = next(record for record in metrics_records if record["kind"] == "train_epoch")
+
+    assert result["train"]["lr"] == [5e-4]
+    assert train_record["lr"] == [5e-4]
+    assert config_record["scheduler_timing"] == "before_optimizer_step"
+    assert trainer.get_state()["lr"] == [5e-4]
+
+
+def test_trainer_accum_steps_count_optimizer_updates_not_micro_batches(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+            _make_training_batch([6, 7]),
+        ],
+    )
+
+    model = TinyModel()
+    optimizer = CountingSGD(model.parameters(), lr=1e-3)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        accum_steps=2,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    summary = trainer._run_training_epoch(0)
+
+    assert summary["num_samples"] == 8
+    assert summary["num_batches"] == 4
+    assert trainer.global_step == 2
+    assert optimizer.step_calls == 2
+
+
+def test_trainer_flushes_last_partial_accumulation_window(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+            _make_training_batch([6, 7]),
+            _make_training_batch([8, 9]),
+        ],
+    )
+
+    model = TinyModel()
+    optimizer = CountingSGD(model.parameters(), lr=1e-3)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        accum_steps=2,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    summary = trainer._run_training_epoch(0)
+
+    assert summary["num_samples"] == 10
+    assert summary["num_batches"] == 5
+    assert trainer.global_step == 3
+    assert optimizer.step_calls == 3
+
+
+def test_trainer_accumulated_updates_match_equivalent_larger_batches(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+
+    baseline_model = TinyModel()
+    accumulated_model = TinyModel()
+    accumulated_model.load_state_dict(copy.deepcopy(baseline_model.state_dict()))
+    baseline_trainer = Trainer(
+        baseline_model,
+        torch.optim.SGD(baseline_model.parameters(), lr=1e-3),
+        loss_fn,
+        accum_steps=1,
+        output_dir=tmp_path / "baseline-run",
+        cache_dir=tmp_path / "baseline-cache",
+    )
+    accumulated_trainer = Trainer(
+        accumulated_model,
+        torch.optim.SGD(accumulated_model.parameters(), lr=1e-3),
+        loss_fn,
+        accum_steps=2,
+        output_dir=tmp_path / "accum-run",
+        cache_dir=tmp_path / "accum-cache",
+    )
+
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1, 2, 3]),
+            _make_training_batch([4, 5, 6, 7]),
+        ],
+    )
+    baseline_summary = baseline_trainer._run_training_epoch(0)
+
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+            _make_training_batch([6, 7]),
+        ],
+    )
+    accumulated_summary = accumulated_trainer._run_training_epoch(0)
+
+    _assert_nested_equal(
+        _clone_model_state_dict(baseline_model),
+        _clone_model_state_dict(accumulated_model),
+    )
+    assert baseline_summary["num_batches"] == 2
+    assert accumulated_summary["num_batches"] == 4
+    assert baseline_trainer.global_step == 2
+    assert accumulated_trainer.global_step == 2
+
+
+def test_trainer_uses_no_sync_on_non_update_micro_batches(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "DDP", TrackingDDP)
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+            _make_training_batch([6, 7]),
+        ],
+    )
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        CountingSGD(model.parameters(), lr=1e-3),
+        loss_fn,
+        accum_steps=2,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+    trainer.model = TrackingDDP(trainer.model)
+
+    summary = trainer._run_training_epoch(0)
+
+    assert isinstance(trainer.model, TrackingDDP)
+    assert trainer.model.no_sync_calls == 2
+    assert summary["num_batches"] == 4
+    assert trainer.global_step == 2
 
 
 def test_trainer_steps_reduce_lr_on_plateau_with_default_val_loss_monitor(
@@ -813,6 +1264,7 @@ def test_trainer_steps_reduce_lr_on_plateau_with_default_val_loss_monitor(
     assert scheduler.monitor_values == [0.5, 0.6]
     assert trainer.get_state()["lr"] == [5e-4]
     assert config_record["scheduler"] == "CountingReduceLROnPlateau"
+    assert config_record["scheduler_timing"] == "after_validation"
     assert config_record["scheduler_monitor"] == "val.loss"
     assert any("monitor val.loss" in message for message in FakeTqdm.writes)
 
@@ -863,6 +1315,7 @@ def test_trainer_steps_reduce_lr_on_plateau_with_metric_monitor(
 
     assert scheduler.monitor_values == [0.2, 0.3]
     assert trainer.get_state()["lr"] == [5e-4]
+    assert config_record["scheduler_timing"] == "after_validation"
     assert config_record["scheduler_monitor"] == "val.metrics.mae"
     assert any("monitor val.metrics.mae" in message for message in FakeTqdm.writes)
 
@@ -1262,6 +1715,18 @@ def test_trainer_rejects_scheduler_monitor_without_scheduler() -> None:
         )
 
 
+def test_trainer_rejects_non_default_scheduler_timing_without_scheduler() -> None:
+    model = TinyModel()
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            torch.optim.AdamW(model.parameters(), lr=1e-3),
+            loss_fn,
+            scheduler_timing="before_optimizer_step",
+        )
+
+
 def test_trainer_rejects_scheduler_monitor_for_non_plateau_scheduler() -> None:
     model = TinyModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -1273,6 +1738,55 @@ def test_trainer_rejects_scheduler_monitor_for_non_plateau_scheduler() -> None:
             loss_fn,
             scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=1),
             scheduler_monitor="val.loss",
+        )
+
+
+def test_trainer_rejects_scheduler_monitor_for_non_validation_timing() -> None:
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            optimizer,
+            loss_fn,
+            scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=1),
+            scheduler_timing="before_optimizer_step",
+            scheduler_monitor="val.loss",
+        )
+
+
+@pytest.mark.parametrize(
+    "scheduler_timing",
+    ["before_optimizer_step", "after_optimizer_step"],
+)
+def test_trainer_rejects_reduce_lr_on_plateau_for_non_validation_timing(
+    scheduler_timing: str,
+) -> None:
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            optimizer,
+            loss_fn,
+            scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer),
+            scheduler_timing=scheduler_timing,
+        )
+
+
+def test_trainer_rejects_invalid_scheduler_timing() -> None:
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            optimizer,
+            loss_fn,
+            scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=1),
+            scheduler_timing="invalid-timing",  # type: ignore[arg-type]
         )
 
 
@@ -1306,6 +1820,18 @@ def test_trainer_rejects_non_positive_train_crop_size() -> None:
             torch.optim.AdamW(model.parameters(), lr=1e-3),
             loss_fn,
             train_crop_size=0,
+        )
+
+
+def test_trainer_rejects_non_positive_accum_steps() -> None:
+    model = TinyModel()
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            torch.optim.AdamW(model.parameters(), lr=1e-3),
+            loss_fn,
+            accum_steps=0,
         )
 
 

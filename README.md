@@ -86,6 +86,7 @@ trainer = Trainer(
     max_val_samples=256,
     max_test_samples=256,
     batch_size=4,
+    accum_steps=4,  # 4 micro-batches per optimizer update
     epochs=2,
     seed=42,
     output_dir="runs/sen12mscr",
@@ -132,8 +133,10 @@ uv run python examples/train_sen12mscr.py \
   --max-val-samples 256 \
   --max-test-samples 256 \
   --batch-size 4 \
+  --accum-steps 4 \
   --epochs 2 \
   --scheduler warmup-cosine \
+  --scheduler-timing after_validation \
   --warmup-epochs 1 \
   --train-crop-size 128 \
   --train-random-flip \
@@ -142,7 +145,9 @@ uv run python examples/train_sen12mscr.py \
 ```
 
 Pass `--max-train-samples none` (or `full`) to cache and train on the entire split.
+Use `--accum-steps N` to accumulate gradients across `N` micro-batches before each optimizer update; `global_step` in `get_state()` and checkpoints counts optimizer updates, not micro-batches.
 The bundled script uses a custom `WarmupCosineScheduler` subclass by default to show the public scheduler API end-to-end; pass `--scheduler none` to disable it.
+Use `--scheduler-timing after_validation|before_optimizer_step|after_optimizer_step` to control when `Trainer` calls `scheduler.step()`. The bundled warmup-cosine example stays on the default epoch-based `after_validation` timing.
 The training augmentations apply only to the train split; validation and test stay at the original `256x256`.
 
 ### Sampling algorithm visualization
@@ -187,11 +192,13 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `loss` | `Callable` | *(required)* | `(prediction, batch) -> scalar tensor`. |
 | `metrics` | `dict[str, Callable]` | `None` | `{"name": (prediction, batch) -> scalar}`. Logged per epoch. |
 | `scheduler` | `LRScheduler \| None` | `None` | Optional scheduler built from the same optimizer. Standard schedulers step once after validation. `ReduceLROnPlateau` is also supported. |
+| `scheduler_timing` | `str` | `"after_validation"` | When `Trainer` calls `scheduler.step()`. Supported values: `after_validation`, `before_optimizer_step`, `after_optimizer_step`. Keep epoch-based schedulers such as the bundled warmup-cosine example on the default `after_validation` timing. |
 | `scheduler_monitor` | `str \| None` | `None` | Monitor path for `ReduceLROnPlateau`. Default is `val.loss`. Supported values are `val.loss` and `val.metrics.<name>`. |
 | `max_train_samples` | `int \| None` | `None` | Requested train rows. Converted to block count using the fixed `BLOCK_SIZE=64` accounting unit. `None` = full split. |
 | `max_val_samples` | `int \| None` | `None` | Same for validation. |
 | `max_test_samples` | `int \| None` | `None` | Same for test. |
 | `batch_size` | `int` | `4` | Batch size for all DataLoaders. |
+| `accum_steps` | `int` | `1` | Number of micro-batches to accumulate before each optimizer update. `global_step` counts these optimizer updates, not individual micro-batches. |
 | `epochs` | `int` | `1` | Total training epochs. Call `step()` once per epoch. |
 | `seed` | `int` | `42` | Seed controlling deterministic block selection and epoch-wise block/row shuffle order. |
 | `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and the default `save_checkpoint()` / `save_weights()` output files. |
@@ -245,12 +252,14 @@ Runs test evaluation with the current model state. Returns:
 ### `Trainer.save_checkpoint(path: str | Path | None = None) -> Path`
 
 Writes a resumable checkpoint containing `model`, `optimizer`, `epoch`, and `global_step`.
+`global_step` counts completed optimizer updates rather than individual forward/backward micro-batches.
 If a scheduler is configured, its state is included under `scheduler`.
 When `path` is omitted, the file is written to `<output_dir>/epoch-XXXX.pt` using the current completed epoch.
 
 ### `Trainer.load_checkpoint(path: str | Path) -> dict`
 
 Restores `model`, `optimizer`, `epoch`, and `global_step` from a checkpoint file and returns:
+For accumulation runs, the restored `global_step` is still the count of completed optimizer updates.
 If both the trainer and the checkpoint have a scheduler state, that state is restored too.
 Older checkpoints without `scheduler` remain loadable, but scheduler progression is not reconstructed automatically in that case.
 
@@ -279,7 +288,8 @@ Runs a single forward pass in `eval()` + `no_grad()` mode and then restores the 
 
 ### `Trainer.get_state() -> dict`
 
-Returns the current runtime state:
+Returns the current runtime state.
+`global_step` is the number of completed optimizer updates.
 
 ```python
 {
