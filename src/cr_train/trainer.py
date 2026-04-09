@@ -31,9 +31,10 @@ from .data.source import run_startup_stage
 from .progress import resolve_progress_bar_ncols
 from .trainer_reporting import (
     format_config_banner,
-    format_epoch_summary,
     format_startup_message,
     format_test_summary,
+    format_train_epoch_row,
+    format_val_epoch_row,
     serialize_value,
     should_print_startup,
 )
@@ -178,7 +179,9 @@ class Trainer:
         self._ensure_training_startup_caches()
 
         train_lrs = self._get_learning_rates()
+        train_started_at = time.perf_counter()
         train_summary = self._run_training_epoch(epoch_index)
+        train_elapsed_sec = time.perf_counter() - train_started_at
         train_summary["lr"] = train_lrs
         if is_primary():
             self._write_record(
@@ -188,13 +191,23 @@ class Trainer:
                     **train_summary,
                 }
             )
+            tqdm.write(
+                format_train_epoch_row(
+                    epoch=epoch_index + 1,
+                    epochs=self.epochs,
+                    train=train_summary,
+                    elapsed_sec=train_elapsed_sec,
+                )
+            )
 
+        validation_started_at = time.perf_counter()
         validation_summary = self._run_evaluation(
             split="validation",
             max_samples=self.max_val_samples,
             epoch_index=epoch_index,
             description=f"val {epoch_index + 1}/{self.epochs}",
         )
+        validation_elapsed_sec = time.perf_counter() - validation_started_at
         self._step_scheduler(validation_summary=validation_summary)
         if is_primary():
             self._write_record(
@@ -203,6 +216,14 @@ class Trainer:
                     "epoch": epoch_index + 1,
                     **validation_summary,
                 }
+            )
+            tqdm.write(
+                format_val_epoch_row(
+                    epochs=self.epochs,
+                    val=validation_summary,
+                    train_learning_rates=train_lrs,
+                    elapsed_sec=validation_elapsed_sec,
+                )
             )
 
         elapsed_sec = time.perf_counter() - step_started_at
@@ -214,19 +235,20 @@ class Trainer:
             "val": validation_summary,
             "elapsed_sec": elapsed_sec,
         }
-        if is_primary():
-            tqdm.write(format_epoch_summary(result, epochs=self.epochs))
         return result
 
     def test(self) -> dict[str, Any]:
         """Run the test split with the current model state."""
         self._write_config_once()
+        test_lrs = self._get_learning_rates()
+        test_started_at = time.perf_counter()
         test_summary = self._run_evaluation(
             split="test",
             max_samples=self.max_test_samples,
             epoch_index=max(self.current_epoch - 1, 0),
             description="test",
         )
+        test_elapsed_sec = time.perf_counter() - test_started_at
         if is_primary():
             self._write_record(
                 {
@@ -238,7 +260,13 @@ class Trainer:
 
         result = {"epoch": self.current_epoch, **test_summary}
         if is_primary():
-            tqdm.write(format_test_summary(result))
+            tqdm.write(
+                format_test_summary(
+                    result,
+                    learning_rates=test_lrs,
+                    elapsed_sec=test_elapsed_sec,
+                )
+            )
         return result
 
     def save_checkpoint(self, path: str | Path | None = None) -> Path:
@@ -700,6 +728,7 @@ class Trainer:
                     reduce_int=self._reduce_int,
                     reduce_sum=self._reduce_sum,
                     distributed=is_distributed(),
+                    learning_rates=self._get_learning_rates(),
                 )
         finally:
             progress.close()

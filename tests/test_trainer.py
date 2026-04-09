@@ -17,7 +17,14 @@ from cr_train import Trainer
 from cr_train.data import BLOCK_SIZE
 from cr_train.progress import resolve_progress_bar_ncols
 from cr_train.data.store import resolve_block_cache_paths
-from cr_train.trainer_reporting import format_cache_summary, format_epoch_summary
+from cr_train.trainer_reporting import (
+    format_cache_summary,
+    format_epoch_summary,
+    format_startup_message,
+    format_test_summary,
+    format_train_epoch_row,
+    format_val_epoch_row,
+)
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -315,6 +322,12 @@ class FakeTqdm:
         return None
 
 
+def _elapsed_column_start(text: str) -> int:
+    match = re.search(r"\d+\.\d+s$", text)
+    assert match is not None
+    return match.start()
+
+
 def test_top_level_package_exports_trainer_as_primary_entry_point() -> None:
     package = importlib.import_module("cr_train")
     namespace: dict[str, object] = {}
@@ -336,12 +349,29 @@ def test_format_cache_summary_compacts_square_timeline_on_one_line() -> None:
             "timeline": ("█░" * 20),
         }
     )
+    plain_summary = re.sub(r"\x1b\[[0-9;]*m", "", summary)
 
     assert "\n" not in summary
-    assert "1.2s" in summary
-    assert "■□" in summary
+    assert "1.2s" in plain_summary
+    assert "■□" in plain_summary
     assert "█" not in summary and "░" not in summary
     assert "…" in summary
+    assert "cache train │ warm │ selected: 20, fill: 3/3 │ 1.2s" in plain_summary
+
+
+def test_format_startup_message_uses_dim_separator() -> None:
+    summary = format_startup_message(
+        {
+            "split": "train",
+            "stage": "build dataloader",
+            "status": "error",
+            "max_samples": 128,
+            "error": "boom",
+        }
+    )
+    plain_summary = re.sub(r"\x1b\[[0-9;]*m", "", summary)
+
+    assert plain_summary == "startup │ split=train │ stage=build dataloader │ max_samples=128 │ error=boom"
 
 
 def test_resolve_progress_bar_ncols_leaves_one_column_headroom(monkeypatch) -> None:
@@ -367,14 +397,16 @@ def test_format_epoch_summary_prefers_elapsed_time_over_throughput() -> None:
             "train": {
                 "loss": 0.0423,
                 "metrics": {"mae": 0.0312},
-                "lr": [1e-3],
+                "lr": [1.234567e-5],
                 "samples_per_sec": 142.3,
             },
             "val": {
                 "loss": 0.0391,
                 "metrics": {"mae": 0.0298},
             },
-            "elapsed_sec": 12.34,
+            "train_elapsed_sec": 12.34,
+            "val_elapsed_sec": 2.43,
+            "elapsed_sec": 14.77,
         },
         epochs=2,
     )
@@ -383,12 +415,102 @@ def test_format_epoch_summary_prefers_elapsed_time_over_throughput() -> None:
 
     assert summary.count("\n") == 1
     assert "\t" not in summary
-    assert plain_summary.count("Epoch 1/2") == 1
-    assert lines[0].startswith("Epoch 1/2  train")
-    assert re.match(r"^\s+val\s+loss ", lines[1])
-    assert "12.3s" in plain_summary
-    assert "lr 0.001" in plain_summary
+    assert len(re.findall(r"Epoch\s+1/\s+2", plain_summary)) == 1
+    assert re.match(r"^Epoch\s+1/\s+2 │ train", lines[0])
+    assert re.match(r"^\s+│ val\s+│ loss ", lines[1])
+    assert re.search(r"loss\s+0\.0423", plain_summary)
+    assert re.search(r"mae\s+0\.0312", plain_summary)
+    assert re.search(r"val\s+│\s+loss\s+0\.0391\s+│\s+mae\s+0\.0298", plain_summary)
+    assert lines[0].endswith("12.3s")
+    assert lines[1].endswith("2.4s")
+    assert re.search(r"lr\s+1\.2346e-5", plain_summary)
+    assert "lr " not in lines[1]
+    assert _elapsed_column_start(lines[0]) == _elapsed_column_start(lines[1])
     assert "samples/s" not in plain_summary
+    assert " │ " in lines[0]
+    assert " │ " in lines[1]
+
+
+def test_format_epoch_rows_align_validation_elapsed_without_learning_rate() -> None:
+    train_line = format_train_epoch_row(
+        epoch=1,
+        epochs=2,
+        train={
+            "loss": 0.0423,
+            "metrics": {"mae": 0.0312},
+            "lr": [1e-3],
+        },
+        elapsed_sec=12.34,
+    )
+    val_line = format_val_epoch_row(
+        epochs=2,
+        val={
+            "loss": 0.0391,
+            "metrics": {"mae": 0.0298},
+        },
+        train_learning_rates=[1e-3],
+        elapsed_sec=2.43,
+    )
+    plain_train_line = re.sub(r"\x1b\[[0-9;]*m", "", train_line)
+    plain_val_line = re.sub(r"\x1b\[[0-9;]*m", "", val_line)
+
+    assert re.match(r"^Epoch\s+1/\s+2 │ train", plain_train_line)
+    assert re.match(r"^\s+│ val\s+│ loss ", plain_val_line)
+    assert re.search(r"lr\s+1e-3", plain_train_line)
+    assert "lr " not in plain_val_line
+    assert plain_train_line.endswith("12.3s")
+    assert plain_val_line.endswith("2.4s")
+    assert _elapsed_column_start(plain_train_line) == _elapsed_column_start(plain_val_line)
+    assert plain_train_line.count(" │ ") == plain_val_line.count(" │ ")
+
+
+def test_format_epoch_rows_keep_elapsed_aligned_across_learning_rate_width_changes() -> None:
+    shorter_lr_line = format_train_epoch_row(
+        epoch=4,
+        epochs=10,
+        train={
+            "loss": 0.1074,
+            "metrics": {"mae": 0.1074},
+            "lr": [8.682e-4],
+        },
+        elapsed_sec=4.3,
+    )
+    longer_lr_line = format_train_epoch_row(
+        epoch=3,
+        epochs=10,
+        train={
+            "loss": 0.1407,
+            "metrics": {"mae": 0.1407},
+            "lr": [9.6575e-4],
+        },
+        elapsed_sec=4.3,
+    )
+    plain_shorter_lr_line = re.sub(r"\x1b\[[0-9;]*m", "", shorter_lr_line)
+    plain_longer_lr_line = re.sub(r"\x1b\[[0-9;]*m", "", longer_lr_line)
+
+    assert re.search(r"lr\s+8\.682e-4", plain_shorter_lr_line)
+    assert re.search(r"lr\s+9\.6575e-4", plain_longer_lr_line)
+    assert _elapsed_column_start(plain_shorter_lr_line) == _elapsed_column_start(plain_longer_lr_line)
+    assert plain_shorter_lr_line.count(" │ ") == plain_longer_lr_line.count(" │ ")
+
+
+def test_format_test_summary_uses_fixed_decimal_metrics() -> None:
+    summary = format_test_summary(
+        {
+            "loss": 0.03912,
+            "metrics": {"mae": 0.0},
+            "num_samples": 256,
+        },
+        learning_rates=[1e-3],
+        elapsed_sec=2.14,
+    )
+    plain_summary = re.sub(r"\x1b\[[0-9;]*m", "", summary)
+
+    assert re.match(r"^\s+│ Test\s+│ loss ", plain_summary)
+    assert re.search(r"loss\s+0\.0391", plain_summary)
+    assert re.search(r"mae\s+0\.0000", plain_summary)
+    assert "lr " not in plain_summary
+    assert plain_summary.endswith("│ 2.1s")
 
 
 def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Path) -> None:
@@ -456,6 +578,8 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
         for instance in FakeTqdm.instances
         if str(instance.desc).startswith(("train", "val", "test"))
     ]
+    train_bars = [instance for instance in batch_bars if str(instance.desc).startswith("train")]
+    eval_bars = [instance for instance in batch_bars if str(instance.desc).startswith(("val", "test"))]
     warmup_bars = [
         instance
         for instance in FakeTqdm.instances
@@ -494,17 +618,37 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert "wait first batch" in startup_stages
     assert "start epoch" in startup_stages
 
-    assert len(FakeTqdm.writes) >= 6
+    assert len(FakeTqdm.writes) >= 7
+    plain_writes = [re.sub(r"\x1b\[[0-9;]*m", "", message) for message in FakeTqdm.writes]
     assert any("cr-train" in message for message in FakeTqdm.writes)
-    assert any("Epoch 1/" in message for message in FakeTqdm.writes)
+    assert any(re.search(r"Epoch\s+1/\s+1", message) for message in plain_writes)
     assert any("Test" in message for message in FakeTqdm.writes)
-    epoch_message = next(message for message in FakeTqdm.writes if "Epoch 1/" in message)
-    plain_epoch_message = re.sub(r"\x1b\[[0-9;]*m", "", epoch_message)
-    assert epoch_message.count("\n") == 1
-    assert "\t" not in epoch_message
-    assert plain_epoch_message.count("Epoch 1/") == 1
-    assert "samples/s" not in plain_epoch_message
-    assert re.search(r"\d+\.\d+s", plain_epoch_message)
+    train_message_index = next(i for i, message in enumerate(plain_writes) if re.match(r"^Epoch\s+1/\s+1 │ train", message))
+    val_message_index = next(i for i, message in enumerate(plain_writes) if re.match(r"^\s+│ val\s+│ loss ", message))
+    test_message_index = next(i for i, message in enumerate(plain_writes) if re.match(r"^\s+│ Test\s+│ loss ", message))
+    train_message = FakeTqdm.writes[train_message_index]
+    val_message = FakeTqdm.writes[val_message_index]
+    test_message = FakeTqdm.writes[test_message_index]
+    plain_train_message = plain_writes[train_message_index]
+    plain_val_message = plain_writes[val_message_index]
+    plain_test_message = plain_writes[test_message_index]
+
+    assert train_message_index < val_message_index
+    assert train_message.count("\n") == 0
+    assert val_message.count("\n") == 0
+    assert "\t" not in train_message
+    assert "\t" not in val_message
+    assert len(re.findall(r"Epoch\s+1/\s+1", plain_train_message)) == 1
+    assert re.search(r"lr\s+1e-3", plain_train_message)
+    assert "lr " not in plain_val_message
+    assert "lr " not in plain_test_message
+    assert "samples/s" not in plain_train_message
+    assert " │ " in plain_train_message
+    assert " │ " in plain_val_message
+    assert " │ " in plain_test_message
+    assert _elapsed_column_start(plain_train_message) == _elapsed_column_start(plain_val_message)
+    assert _elapsed_column_start(plain_val_message) == _elapsed_column_start(plain_test_message)
+    assert test_message.count("\n") == 0
     warmup_messages = [message for message in FakeTqdm.writes if message.startswith("cache ")]
     assert len(warmup_messages) == 3
     assert all("\n" not in message for message in warmup_messages)
@@ -522,7 +666,18 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert all(bar.ncols == 79 for bar in warmup_bars)
 
     assert len(batch_bars) == 3
-    assert any(any("loss" in values and "mae" in values for values in bar.postfixes) for bar in batch_bars)
+    assert len(train_bars) == 1
+    assert len(eval_bars) == 2
+    assert any(
+        any(
+            re.search(r"loss: -?\d+\.\d{4}", values)
+            and re.search(r"mae: -?\d+\.\d{4}", values)
+            for values in bar.postfixes
+        )
+        for bar in batch_bars
+    )
+    assert all(any("lr: 1e-3" in values for values in bar.postfixes) for bar in train_bars)
+    assert all(all("lr:" not in values for values in bar.postfixes) for bar in eval_bars)
     assert all(all("batches/s" not in values for values in bar.postfixes) for bar in batch_bars)
     assert all(all(value == 1 for value in bar.updates) for bar in batch_bars)
     assert all(bar.ncols == 79 for bar in batch_bars)

@@ -107,13 +107,13 @@ print(trainer.test())
 train  ░░░░░…░░█░…░░░█░…  32 blocks (2 048 rows)
 val    ░░░░░░░░░░░█░░░░░…   4 blocks (  244 rows)
 
-Epoch 1/2  train  loss 0.042  mae 0.031  12.3s
-           val    loss 0.039  mae 0.030
+Epoch   1/  2 │ train │ loss    0.0423 │ mae    0.0312 │ lr      1e-3 │ 12.3s
+              │ val   │ loss    0.0391 │ mae    0.0298 │              │ 2.4s
 
-Epoch 2/2  train  loss 0.039  mae 0.029  11.8s
-           val    loss 0.037  mae 0.028
+Epoch   2/  2 │ train │ loss    0.0390 │ mae    0.0294 │ lr      1e-3 │ 11.8s
+              │ val   │ loss    0.0372 │ mae    0.0281 │              │ 2.3s
 
-Test  loss=0.039  mae=0.029  (256 samples)
+              │ Test  │ loss    0.0390 │ mae    0.0290 │              │ 2.1s
 ```
 
 </details>
@@ -168,7 +168,7 @@ Most users only need `from cr_train import Trainer`. Once you construct it, `Tra
 - warms only the splits needed for the current call
 - builds iterable dataloaders and rank-aware block partitioning
 - writes `metrics.jsonl`
-- shows running-average loss and metrics with batch-level tqdm during training, then prints elapsed time at epoch end
+- shows running-average loss and metrics with batch-level tqdm during training, then prints aligned train/validation summary lines with per-split elapsed time
 - appends metrics to `metrics.jsonl` in the output directory (one JSON object per line)
 
 You do not need any cache or dataloader setup code for the normal training flow.

@@ -20,6 +20,20 @@ _GREEN = "\033[32m"
 _CYAN = "\033[36m"
 _YELLOW = "\033[33m"
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_SUMMARY_VALUE_WIDTH = 9
+_EPOCH_COUNTER_WIDTH = 3
+
+
+def _format_epoch_label(epoch: int, epochs: int) -> str:
+    return f"Epoch {epoch:>{_EPOCH_COUNTER_WIDTH}}/{epochs:>{_EPOCH_COUNTER_WIDTH}}"
+
+
+def _epoch_label_width() -> int:
+    return len(_format_epoch_label(999, 999))
+
+
+def _summary_separator() -> str:
+    return f" {_DIM}│{_RESET} "
 
 
 def serialize_value(value: Any) -> Any:
@@ -57,17 +71,21 @@ def format_cache_summary(event: dict[str, Any]) -> str:
     selected_missing_blocks = int(event.get("selected_missing_blocks", 0))
     resolved_blocks = int(event.get("resolved_blocks", 0))
     prefix = f"cache {split}"
-    elapsed_sec = event.get("elapsed_sec")
     if selected_missing_blocks == 0:
-        summary = f"{prefix} | cache-hit | selected: {selected_block_count}, fill: 0/0"
+        parts = [prefix, "cache-hit", f"selected: {selected_block_count}, fill: 0/0"]
     else:
-        summary = f"{prefix} | warm | selected: {selected_block_count}, fill: {resolved_blocks}/{selected_missing_blocks}"
+        parts = [
+            prefix,
+            "warm",
+            f"selected: {selected_block_count}, fill: {resolved_blocks}/{selected_missing_blocks}",
+        ]
+    elapsed_sec = event.get("elapsed_sec")
     if elapsed_sec is not None:
-        summary = f"{summary} | {float(elapsed_sec):.1f}s"
+        parts.append(f"{float(elapsed_sec):.1f}s")
     timeline = _format_warmup_timeline(event.get("timeline"))
     if timeline is not None:
-        summary = f"{summary} | {timeline}"
-    return summary
+        parts.append(timeline)
+    return _summary_separator().join(parts)
 
 
 def format_startup_message(event: dict[str, Any]) -> str:
@@ -97,23 +115,26 @@ def format_startup_message(event: dict[str, Any]) -> str:
         parts.append(f"cache_only={str(bool(event['cache_only'])).lower()}")
     if event.get("status") == "error" and event.get("error"):
         parts.append(f"error={event['error']}")
-    return " | ".join(parts)
+    return _summary_separator().join(parts)
 
 
-def _fmt(value: float) -> str:
+def format_metric_value(value: float) -> str:
+    return f"{float(value):.4f}"
+
+
+def format_learning_rate(value: float) -> str:
     if value == 0.0:
         return "0"
-    if abs(value) < 0.0001:
-        return f"{value:.2e}"
-    if abs(value) < 10:
-        return f"{value:.3f}"
-    return f"{value:.2f}"
+
+    mantissa, exponent = f"{float(value):.4e}".split("e")
+    mantissa = mantissa.rstrip("0").rstrip(".")
+    return f"{mantissa}e{int(exponent)}"
 
 
-def _fmt_learning_rates(values: Any) -> str | None:
+def format_learning_rates(values: Any) -> str | None:
     if not isinstance(values, list) or not values:
         return None
-    formatted = [_fmt(float(value)) for value in values]
+    formatted = [format_learning_rate(float(value)) for value in values]
     if len(formatted) == 1:
         return formatted[0]
     return "[" + ", ".join(formatted) + "]"
@@ -127,6 +148,45 @@ def _pad_visible(text: str, width: int) -> str:
     return text + (" " * max(0, width - _visible_width(text)))
 
 
+def _left_pad_visible(text: str, width: int) -> str:
+    return (" " * max(0, width - _visible_width(text))) + text
+
+
+def _format_elapsed(elapsed_sec: float | None) -> str | None:
+    if elapsed_sec is None:
+        return None
+    return f"{_DIM}{float(elapsed_sec):.1f}s{_RESET}"
+
+
+def _format_train_trailer(train: Mapping[str, Any], elapsed_sec: float | None) -> str | None:
+    if elapsed_sec is not None:
+        return _format_elapsed(elapsed_sec)
+    if "samples_per_sec" in train:
+        speed = float(train["samples_per_sec"])
+        return f"{_DIM}{speed:.1f} samples/s{_RESET}"
+    return None
+
+
+def _summary_field_width(name: str) -> int:
+    return len(name) + 1 + _SUMMARY_VALUE_WIDTH
+
+
+def _format_value_field(name: str, value: str) -> str:
+    return f"{name} {_left_pad_visible(value, _SUMMARY_VALUE_WIDTH)}"
+
+
+def _format_metric_field(name: str, value: float) -> str:
+    return _format_value_field(name, format_metric_value(value))
+
+
+def _format_learning_rate_field(learning_rates: str) -> str:
+    return _format_value_field("lr", learning_rates)
+
+
+def _format_blank_field(name: str) -> str:
+    return " " * _summary_field_width(name)
+
+
 def _format_summary_row(
     *,
     epoch_label: str,
@@ -135,20 +195,25 @@ def _format_summary_row(
     split_width: int,
     loss: float,
     metrics: Mapping[str, Any],
+    show_learning_rate_field: bool = False,
     learning_rates: str | None = None,
     trailer: str | None = None,
 ) -> str:
     parts = [
-        f"{_pad_visible(epoch_label, epoch_width)}  {_pad_visible(split_label, split_width)}",
-        f"loss {_fmt(loss)}",
+        _pad_visible(epoch_label, epoch_width),
+        _pad_visible(split_label, split_width),
+        _format_metric_field("loss", loss),
     ]
     for name, value in metrics.items():
-        parts.append(f"{name} {_fmt(float(value))}")
-    if learning_rates is not None:
-        parts.append(f"lr {learning_rates}")
+        parts.append(_format_metric_field(name, float(value)))
+    if show_learning_rate_field:
+        if learning_rates is not None:
+            parts.append(_format_learning_rate_field(learning_rates))
+        elif trailer is not None:
+            parts.append(_format_blank_field("lr"))
     if trailer is not None:
         parts.append(trailer)
-    return "  ".join(parts)
+    return _summary_separator().join(parts)
 
 
 def _samples_label(n: int | None) -> str:
@@ -172,7 +237,6 @@ def format_config_banner(
     scheduler_name: str | None,
     scheduler_monitor: str | None,
 ) -> str:
-    sep = f"{_DIM}│{_RESET}"
     header = f"{_BOLD}cr-train{_RESET} {_DIM}── {dataset_name} ── {device}{_RESET}"
     splits = (
         f"  {_DIM}splits{_RESET}  "
@@ -187,53 +251,81 @@ def format_config_banner(
         config_parts.append(f"scheduler {scheduler_name}")
     if scheduler_monitor is not None:
         config_parts.append(f"monitor {scheduler_monitor}")
-    config = f"  {_DIM}config{_RESET}  " + f"  {sep}  ".join(config_parts)
+    config = f"  {_DIM}config{_RESET}  " + _summary_separator().join(config_parts)
     return f"{header}\n{splits}\n{config}"
+
+
+def format_train_epoch_row(
+    *,
+    epoch: int,
+    epochs: int,
+    train: Mapping[str, Any],
+    elapsed_sec: float | None = None,
+) -> str:
+    learning_rates = format_learning_rates(train.get("lr"))
+    return _format_summary_row(
+        epoch_label=f"{_BOLD}{_format_epoch_label(epoch, epochs)}{_RESET}",
+        epoch_width=_epoch_label_width(),
+        split_label=f"{_GREEN}train{_RESET}",
+        split_width=len("train"),
+        loss=float(train["loss"]),
+        metrics=train.get("metrics", {}),
+        show_learning_rate_field=True,
+        learning_rates=learning_rates,
+        trailer=_format_train_trailer(train, elapsed_sec),
+    )
+
+
+def format_val_epoch_row(
+    *,
+    epochs: int,
+    val: Mapping[str, Any],
+    train_learning_rates: Any = None,
+    elapsed_sec: float | None = None,
+) -> str:
+    return _format_summary_row(
+        epoch_label="",
+        epoch_width=_epoch_label_width(),
+        split_label=f"{_CYAN}val{_RESET}",
+        split_width=len("train"),
+        loss=float(val["loss"]),
+        metrics=val.get("metrics", {}),
+        show_learning_rate_field=train_learning_rates is not None,
+        trailer=_format_elapsed(elapsed_sec),
+    )
 
 
 def format_epoch_summary(result: dict[str, Any], *, epochs: int) -> str:
     epoch = result["epoch"]
     train = result["train"]
-    val = result["val"]
-    epoch_label = f"{_BOLD}Epoch {epoch}/{epochs}{_RESET}"
-    epoch_width = len(f"Epoch {epochs}/{epochs}")
-    split_width = len("train")
-    trailer: str | None = None
-    if "elapsed_sec" in result:
-        trailer = f"{_DIM}{float(result['elapsed_sec']):.1f}s{_RESET}"
-    elif "samples_per_sec" in train:
-        speed = train["samples_per_sec"]
-        trailer = f"{_DIM}{speed:.1f} samples/s{_RESET}"
-
-    train_line = _format_summary_row(
-        epoch_label=epoch_label,
-        epoch_width=epoch_width,
-        split_label=f"{_GREEN}train{_RESET}",
-        split_width=split_width,
-        loss=float(train["loss"]),
-        metrics=train.get("metrics", {}),
-        learning_rates=_fmt_learning_rates(train.get("lr")),
-        trailer=trailer,
+    train_line = format_train_epoch_row(
+        epoch=epoch,
+        epochs=epochs,
+        train=train,
+        elapsed_sec=result.get("train_elapsed_sec", result.get("elapsed_sec")),
     )
-    val_line = _format_summary_row(
-        epoch_label="",
-        epoch_width=epoch_width,
-        split_label=f"{_CYAN}val{_RESET}",
-        split_width=split_width,
-        loss=float(val["loss"]),
-        metrics=val.get("metrics", {}),
+    val_line = format_val_epoch_row(
+        epochs=epochs,
+        val=result["val"],
+        train_learning_rates=train.get("lr"),
+        elapsed_sec=result.get("val_elapsed_sec"),
     )
     return f"{train_line}\n{val_line}"
 
 
-def format_test_summary(result: dict[str, Any]) -> str:
-    sep = f" {_DIM}│{_RESET} "
-    parts = [f"{_BOLD}Test{_RESET}"]
-
-    metric_parts = [f"loss {_fmt(result.get('loss', 0.0))}"]
-    for name, value in result.get("metrics", {}).items():
-        metric_parts.append(f"{name} {_fmt(value)}")
-    parts.append(" ".join(metric_parts))
-
-    parts.append(f"{_DIM}{result.get('num_samples', 0):,} samples{_RESET}")
-    return sep.join(parts)
+def format_test_summary(
+    result: dict[str, Any],
+    *,
+    learning_rates: Any = None,
+    elapsed_sec: float | None = None,
+) -> str:
+    return _format_summary_row(
+        epoch_label="",
+        epoch_width=_epoch_label_width(),
+        split_label=f"{_BOLD}Test{_RESET}",
+        split_width=len("train"),
+        loss=float(result.get("loss", 0.0)),
+        metrics=result.get("metrics", {}),
+        show_learning_rate_field=learning_rates is not None,
+        trailer=_format_elapsed(elapsed_sec),
+    )

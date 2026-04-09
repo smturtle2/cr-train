@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from .progress import set_progress_postfix_str
+from .trainer_reporting import format_learning_rates, format_metric_value
 
 
 @dataclass(slots=True)
@@ -55,20 +56,6 @@ def compute_metric_values(metric_fns: Mapping[str, Callable[[Any, Mapping[str, A
     }
 
 
-def _format_metric(value: float) -> str:
-    """메트릭 값을 크기에 맞게 포맷. 작은 값은 자릿수를 늘려 정보 손실을 방지."""
-    abs_value = abs(value)
-    if abs_value == 0.0:
-        return "0"
-    if abs_value < 0.0001:
-        return f"{value:.2e}"
-    if abs_value < 0.01:
-        return f"{value:.5f}"
-    if abs_value < 10:
-        return f"{value:.4f}"
-    return f"{value:.2f}"
-
-
 def _reduce_progress_state(
     *,
     accumulator: MetricAccumulator,
@@ -94,6 +81,7 @@ def update_progress_bar(
     reduce_int: Callable[[int], int],
     reduce_sum: Callable[[float], float],
     distributed: bool,
+    learning_rates: list[float] | None = None,
 ) -> None:
     reduced_examples, reduced_batches, reduced_sums = _reduce_progress_state(
         accumulator=accumulator,
@@ -106,10 +94,12 @@ def update_progress_bar(
         return
     progress.update(1)
     postfix_parts = [
-        f"{key}: {_format_metric(value / reduced_examples)}"
+        f"{key}: {format_metric_value(value / reduced_examples)}"
         for key, value in reduced_sums.items()
         if reduced_examples > 0
     ]
+    if formatted_lrs := format_learning_rates(learning_rates):
+        postfix_parts.append(f"lr: {formatted_lrs}")
     set_progress_postfix_str(progress, ", ".join(postfix_parts))
 
 
