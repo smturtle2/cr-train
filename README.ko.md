@@ -145,6 +145,7 @@ uv run python examples/train_sen12mscr.py \
 ```
 
 `--max-train-samples none` (또는 `full`)을 전달하면 샘플링을 건너뛰고 모든 row-group block을 워밍업한 뒤 전체 split으로 학습합니다.
+한 번 전체 split 워밍업이 완료되면, 이후 실행은 로컬 cache가 불완전해지기 전까지 HF에 다시 확인하지 않고 저장된 source metadata와 split catalog를 재사용합니다.
 `--accum-steps N`을 주면 optimizer step 전에 `N`개의 micro-batch에 대해 gradient를 누적합니다. `get_state()`와 체크포인트의 `global_step`은 micro-batch 수가 아니라 optimizer update 횟수를 뜻합니다.
 번들된 스크립트는 공개 scheduler API 사용 예시를 보여주기 위해 기본으로 커스텀 `WarmupCosineScheduler` subclass를 사용하며, 끄려면 `--scheduler none`을 주면 됩니다.
 `--scheduler-timing after_validation|before_optimizer_step|after_optimizer_step`로 `Trainer`가 `scheduler.step()`을 호출하는 시점을 고를 수 있습니다. 번들된 warmup-cosine 예제는 기본값인 epoch 기반 `after_validation` 타이밍을 그대로 사용합니다.
@@ -322,6 +323,7 @@ from cr_train.data import BLOCK_SIZE, trace_plan_sample
 
 - 캐시 워밍업 시 tqdm 프로그레스 바로 블록 다운로드를 표시하고, 완료 시 한 줄 `■/□` 블록 타임라인을 출력합니다.
 - 부분 요청에서는 동일한 `seed`가 같은 uniform exact-k 블록 선택을 유지하고, 전체 split 요청은 항상 모든 block을 포함합니다.
+- 전체 split이 로컬에서 완전히 검증되면, cache가 불완전해지거나 삭제되기 전까지는 저장된 descriptor/catalog view를 오프라인으로 재사용합니다.
 - CUDA에서 worker process를 사용할 때는 `num_workers > 0`이면 더 안전한 `"spawn"` multiprocessing context를 기본으로 사용합니다.
 - 완료된 캐시는 자동 삭제되지 않습니다. 디스크 공간 회수를 위해 캐시 디렉토리에서 직접 삭제하세요.
 

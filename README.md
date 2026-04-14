@@ -145,6 +145,7 @@ uv run python examples/train_sen12mscr.py \
 ```
 
 Pass `--max-train-samples none` (or `full`) to bypass sampling, warm every row-group block, and train on the entire split.
+After a full split is completely warmed once, later runs reuse the cached source metadata and split catalog without contacting HF again unless the local cache becomes incomplete.
 Use `--accum-steps N` to accumulate gradients across `N` micro-batches before each optimizer update; `global_step` in `get_state()` and checkpoints counts optimizer updates, not micro-batches.
 The bundled script uses a custom `WarmupCosineScheduler` subclass by default to show the public scheduler API end-to-end; pass `--scheduler none` to disable it.
 Use `--scheduler-timing after_validation|before_optimizer_step|after_optimizer_step` to control when `Trainer` calls `scheduler.step()`. The bundled warmup-cosine example stays on the default epoch-based `after_validation` timing.
@@ -322,6 +323,7 @@ During warmup, `step()` prepares `train` and `validation`, while `test()` prepar
 
 - Cache warmup shows a tqdm progress bar during block download and prints a one-line `■/□` block timeline on completion.
 - Equal `seed` values keep the same uniform exact-k block-selection membership for partial requests; full-split requests always include every block.
+- Once a full split has been fully verified locally, later runs reuse the cached descriptor/catalog view offline until the cache becomes incomplete or is deleted.
 - CUDA runs with worker processes default to the safer `"spawn"` multiprocessing context once `num_workers > 0`.
 - Finished caches are never auto-deleted. Remove them manually from the cache directory to reclaim disk space.
 

@@ -44,7 +44,7 @@ from .constants import (
     REMOTE_STREAMING_READ_SERVER_UNAVAILABLE_RETRY_INTERVAL_SEC,
     StartupCallback,
 )
-from .store import freeze_row, read_json, write_json_atomic
+from .store import file_lock, freeze_row, read_json, write_json_atomic
 
 
 T = TypeVar("T")
@@ -120,6 +120,14 @@ def resolve_source_metadata_path(source_root: Path) -> Path:
     return source_root / "source.json"
 
 
+def resolve_source_local_state_path(source_root: Path) -> Path:
+    return source_root / "source.local.json"
+
+
+def resolve_source_local_state_lock_path(source_root: Path) -> Path:
+    return source_root / "source.local.lock"
+
+
 @dataclass(frozen=True, slots=True)
 class BlockDescriptor:
     index: int
@@ -164,6 +172,85 @@ class RemoteRetryPolicy:
 
 
 _DEFAULT_REMOTE_RETRY_POLICY = RemoteRetryPolicy()
+
+
+def _normalize_verified_full_splits(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized = sorted({str(split) for split in value if str(split)})
+    return normalized
+
+
+def _default_source_local_state() -> dict[str, Any]:
+    return {
+        "cache_layout_version": CACHE_LAYOUT_VERSION,
+        "verified_full_splits": [],
+    }
+
+
+def load_source_local_state(source_root: Path) -> dict[str, Any]:
+    path = resolve_source_local_state_path(source_root)
+    if not path.exists():
+        return _default_source_local_state()
+    try:
+        payload = read_json(path)
+    except Exception:
+        return _default_source_local_state()
+    return {
+        "cache_layout_version": CACHE_LAYOUT_VERSION,
+        "verified_full_splits": _normalize_verified_full_splits(payload.get("verified_full_splits")),
+    }
+
+
+def _write_source_local_state(source_root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "cache_layout_version": CACHE_LAYOUT_VERSION,
+        "verified_full_splits": _normalize_verified_full_splits(payload.get("verified_full_splits")),
+    }
+    write_json_atomic(resolve_source_local_state_path(source_root), normalized)
+    return normalized
+
+
+def has_verified_full_splits(source_root: Path) -> bool:
+    return bool(load_source_local_state(source_root)["verified_full_splits"])
+
+
+def is_full_split_verified(source_root: Path, split: str) -> bool:
+    return str(split) in set(load_source_local_state(source_root)["verified_full_splits"])
+
+
+def mark_verified_full_split(source_root: Path, split: str) -> dict[str, Any]:
+    split_name = str(split)
+    lock_path = resolve_source_local_state_lock_path(source_root)
+    with file_lock(lock_path):
+        state = load_source_local_state(source_root)
+        verified = set(state["verified_full_splits"])
+        if split_name in verified:
+            return state
+        verified.add(split_name)
+        return _write_source_local_state(
+            source_root,
+            {
+                "verified_full_splits": sorted(verified),
+            },
+        )
+
+
+def revoke_verified_full_split(source_root: Path, split: str) -> dict[str, Any]:
+    split_name = str(split)
+    lock_path = resolve_source_local_state_lock_path(source_root)
+    with file_lock(lock_path):
+        state = load_source_local_state(source_root)
+        verified = set(state["verified_full_splits"])
+        if split_name not in verified:
+            return state
+        verified.remove(split_name)
+        return _write_source_local_state(
+            source_root,
+            {
+                "verified_full_splits": sorted(verified),
+            },
+        )
 
 
 def _installed_datasets_version() -> str:
@@ -470,6 +557,11 @@ def ensure_source_root(
     retry_policy: RemoteRetryPolicy | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     cached = _find_cached_source(cache_root, dataset_name, revision)
+    if cached is not None:
+        source_root, cached_descriptor = cached
+        if has_verified_full_splits(source_root):
+            _source_descriptor_cache[(dataset_name, revision)] = cached_descriptor
+            return source_root, cached_descriptor
     try:
         descriptor = load_source_descriptor(
             dataset_name,
@@ -773,7 +865,19 @@ def ensure_split_catalog(
     split_sizes = descriptor["split_sizes"]
     if split not in split_sizes:
         raise KeyError(f"split {split!r} does not exist in source descriptor")
-    cached_catalog = read_json(catalog_path) if catalog_path.exists() else None
+    cached_catalog: dict[str, Any] | None = None
+    cached_catalog_error = False
+    if catalog_path.exists():
+        try:
+            cached_catalog = read_json(catalog_path)
+        except Exception:
+            cached_catalog_error = True
+
+    if is_full_split_verified(source_root, split):
+        if cached_catalog is not None:
+            return cached_catalog
+        if cached_catalog_error or not catalog_path.exists():
+            revoke_verified_full_split(source_root, split)
 
     try:
         payload = run_startup_stage(
@@ -897,8 +1001,14 @@ __all__ = [
     "emit_startup_event",
     "ensure_source_root",
     "ensure_split_catalog",
+    "has_verified_full_splits",
+    "is_full_split_verified",
     "load_block_rows",
+    "load_source_local_state",
     "load_row_group_stream",
+    "mark_verified_full_split",
+    "resolve_source_local_state_path",
     "resolve_catalog_path",
+    "revoke_verified_full_split",
     "run_startup_stage",
 ]

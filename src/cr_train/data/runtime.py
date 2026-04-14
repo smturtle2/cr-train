@@ -11,9 +11,11 @@ from tqdm.auto import tqdm
 from .constants import BLOCK_SIZE, WARMUP_DOWNLOAD_SPEED_WINDOW_SEC, WARMUP_SPEED_EMA_ALPHA, WARMUP_TIMELINE_WIDTH
 from .planning import SamplePlan, plan_sample
 from .source import emit_startup_event, ensure_source_root, ensure_split_catalog, load_block_rows, resolve_catalog_path
+from .source import mark_verified_full_split, revoke_verified_full_split
 from ..progress import resolve_progress_bar_ncols, set_progress_postfix_str
 from .store import (
     BlockCachePaths,
+    block_is_cached,
     block_lock_path,
     clear_block_cache_entry,
     find_completed_block_row_count,
@@ -74,6 +76,12 @@ class BlockCacheFillResult:
     downloaded_bytes: int
     written_bytes: int
     elapsed_sec: float
+
+
+@dataclass(frozen=True, slots=True)
+class MissingBlockWarmup:
+    block: dict[str, Any]
+    force_refill: bool = False
 
 
 def _emit_warmup_summary(
@@ -250,33 +258,62 @@ def _resolve_effective_rows(
     return total_rows
 
 
+def _resolve_missing_selected_blocks(
+    sample_plan: SamplePlan,
+    *,
+    catalog: dict[str, Any],
+    cache_paths: BlockCachePaths,
+    completed_by_key: dict[str, int],
+) -> tuple[list[dict[str, Any]], list[MissingBlockWarmup], int]:
+    selected_blocks = _selected_blocks(catalog, sample_plan)
+    missing_blocks: list[MissingBlockWarmup] = []
+    cached_selected_blocks = 0
+    for block in selected_blocks:
+        cache_key = str(block["cache_key"])
+        if cache_key not in completed_by_key:
+            missing_blocks.append(MissingBlockWarmup(block=block, force_refill=False))
+            continue
+        if not block_is_cached(cache_paths, cache_key):
+            completed_by_key.pop(cache_key, None)
+            missing_blocks.append(MissingBlockWarmup(block=block, force_refill=True))
+            continue
+        cached_selected_blocks += 1
+    return selected_blocks, missing_blocks, cached_selected_blocks
+
+
 def _build_warmup_summary(
     sample_plan: SamplePlan,
     *,
     catalog: dict[str, Any],
+    cache_paths: BlockCachePaths,
     completed_by_key: dict[str, int],
-) -> WarmupSummary:
-    selected_blocks = _selected_blocks(catalog, sample_plan)
-    selected_missing_blocks = sum(
-        1 for block in selected_blocks if str(block["cache_key"]) not in completed_by_key
+) -> tuple[WarmupSummary, list[MissingBlockWarmup]]:
+    selected_blocks, missing_blocks, cached_selected_blocks = _resolve_missing_selected_blocks(
+        sample_plan,
+        catalog=catalog,
+        cache_paths=cache_paths,
+        completed_by_key=completed_by_key,
     )
-    cached_selected_blocks = int(sample_plan.required_blocks - selected_missing_blocks)
+    selected_missing_blocks = len(missing_blocks)
     execution_block_count = int(sample_plan.execution_block_count)
     effective_rows = _resolve_effective_rows(
         selected_blocks=selected_blocks,
         completed_by_key=completed_by_key,
         fallback_rows=sample_plan.effective_rows,
     )
-    return WarmupSummary(
-        requested_rows=sample_plan.requested_rows,
-        effective_rows=effective_rows,
-        required_blocks=sample_plan.required_blocks,
-        planner_mode=sample_plan.planner_mode,
-        selected_block_count=sample_plan.required_blocks,
-        cached_selected_blocks=cached_selected_blocks,
-        selected_missing_blocks=selected_missing_blocks,
-        cache_only=selected_missing_blocks == 0,
-        execution_block_count=execution_block_count,
+    return (
+        WarmupSummary(
+            requested_rows=sample_plan.requested_rows,
+            effective_rows=effective_rows,
+            required_blocks=sample_plan.required_blocks,
+            planner_mode=sample_plan.planner_mode,
+            selected_block_count=sample_plan.required_blocks,
+            cached_selected_blocks=cached_selected_blocks,
+            selected_missing_blocks=selected_missing_blocks,
+            cache_only=selected_missing_blocks == 0,
+            execution_block_count=execution_block_count,
+        ),
+        missing_blocks,
     )
 
 
@@ -287,12 +324,13 @@ def _ensure_block_cached(
     split: str,
     cache_paths: BlockCachePaths,
     block: dict[str, Any],
+    force_refill: bool = False,
     startup_callback=None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> BlockCacheFillResult:
     cache_key = str(block["cache_key"])
     completed_row_count = find_completed_block_row_count(cache_paths, cache_key)
-    if completed_row_count is not None:
+    if completed_row_count is not None and not force_refill:
         return BlockCacheFillResult(
             cache_key=cache_key,
             status="hit",
@@ -305,7 +343,7 @@ def _ensure_block_cached(
     started_at = time.perf_counter()
     with file_lock(block_lock_path(cache_paths, cache_key)):
         completed_row_count = find_completed_block_row_count(cache_paths, cache_key)
-        if completed_row_count is not None:
+        if completed_row_count is not None and not force_refill:
             return BlockCacheFillResult(
                 cache_key=cache_key,
                 status="hit_after_lock",
@@ -314,7 +352,7 @@ def _ensure_block_cached(
                 written_bytes=0,
                 elapsed_sec=time.perf_counter() - started_at,
             )
-        legacy_row_count = _load_matching_block_row_count(cache_paths, block)
+        legacy_row_count = _load_matching_block_row_count(cache_paths, block) if not force_refill else None
         if legacy_row_count is not None:
             write_completed_block_marker(cache_paths, cache_key, row_count=legacy_row_count)
             return BlockCacheFillResult(
@@ -373,9 +411,8 @@ def _warm_missing_blocks(
     revision: str | None,
     catalog: dict[str, Any],
     cache_paths: BlockCachePaths,
-    sample_plan: SamplePlan,
     summary: WarmupSummary,
-    completed_by_key: dict[str, int],
+    missing_blocks: list[MissingBlockWarmup],
     startup_callback=None,
 ) -> int:
     progress = tqdm(
@@ -391,10 +428,6 @@ def _warm_missing_blocks(
     )
     progress_state = WarmupProgressState()
     resolved_blocks = 0
-    selected_blocks = _selected_blocks(catalog, sample_plan)
-    missing_blocks = [
-        block for block in selected_blocks if str(block["cache_key"]) not in completed_by_key
-    ]
 
     try:
         _update_warmup_progress(
@@ -404,13 +437,14 @@ def _warm_missing_blocks(
             selected_missing_blocks=summary.selected_missing_blocks,
             selected_block_count=summary.selected_block_count,
         )
-        for block in missing_blocks:
+        for missing_block in missing_blocks:
             result = _ensure_block_cached(
                 dataset_name=dataset_name,
                 revision=revision,
                 split=split,
                 cache_paths=cache_paths,
-                block=block,
+                block=missing_block.block,
+                force_refill=missing_block.force_refill,
                 startup_callback=startup_callback,
                 progress_callback=lambda _row_count, downloaded_bytes_delta: _update_warmup_progress(
                     progress,
@@ -444,6 +478,27 @@ def _warm_missing_blocks(
     return resolved_blocks
 
 
+def _sync_full_split_verification(
+    *,
+    source_root: Path,
+    split: str,
+    sample_plan: SamplePlan,
+    cache_paths: BlockCachePaths,
+    selected_blocks: list[dict[str, Any]],
+) -> None:
+    if sample_plan.planner_mode != "full_split":
+        return
+    all_blocks_complete = all(
+        find_completed_block_row_count(cache_paths, str(block["cache_key"])) is not None
+        and block_is_cached(cache_paths, str(block["cache_key"]))
+        for block in selected_blocks
+    )
+    if all_blocks_complete:
+        mark_verified_full_split(source_root, split)
+        return
+    revoke_verified_full_split(source_root, split)
+
+
 def ensure_split_cache(
     *,
     split: str,
@@ -470,10 +525,25 @@ def ensure_split_cache(
     cache_paths = resolve_block_cache_paths(source_root, split)
     sample_plan = plan_sample(catalog, seed, max_samples, split=split)
     completed_by_key = load_completed_block_index(cache_paths)
-    summary = _build_warmup_summary(sample_plan, catalog=catalog, completed_by_key=completed_by_key)
+    summary, missing_blocks = _build_warmup_summary(
+        sample_plan,
+        catalog=catalog,
+        cache_paths=cache_paths,
+        completed_by_key=completed_by_key,
+    )
+    selected_blocks = _selected_blocks(catalog, sample_plan)
+    if sample_plan.planner_mode == "full_split" and missing_blocks:
+        revoke_verified_full_split(source_root, split)
     _emit_warmup_summary(startup_callback, split=split, status="start", summary=summary)
 
     if summary.cache_only:
+        _sync_full_split_verification(
+            source_root=source_root,
+            split=split,
+            sample_plan=sample_plan,
+            cache_paths=cache_paths,
+            selected_blocks=selected_blocks,
+        )
         timeline = _render_warmup_timeline(
             sample_plan.selected_bitmap,
             stop_block=sample_plan.execution_block_count,
@@ -495,16 +565,22 @@ def ensure_split_cache(
         revision=revision,
         catalog=catalog,
         cache_paths=cache_paths,
-        sample_plan=sample_plan,
         summary=summary,
-        completed_by_key=completed_by_key,
+        missing_blocks=missing_blocks,
         startup_callback=startup_callback,
     )
     completed_by_key = load_completed_block_index(cache_paths)
     actual_effective_rows = _resolve_effective_rows(
-        selected_blocks=_selected_blocks(catalog, sample_plan),
+        selected_blocks=selected_blocks,
         completed_by_key=completed_by_key,
         fallback_rows=sample_plan.effective_rows,
+    )
+    _sync_full_split_verification(
+        source_root=source_root,
+        split=split,
+        sample_plan=sample_plan,
+        cache_paths=cache_paths,
+        selected_blocks=selected_blocks,
     )
     done_summary = WarmupSummary(
         requested_rows=summary.requested_rows,

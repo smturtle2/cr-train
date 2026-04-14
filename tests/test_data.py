@@ -226,6 +226,113 @@ def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list
     }
 
 
+def _patch_remote_source_cache(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    dataset_name: str,
+    split_blocks: dict[str, list[list[dict[str, object]]]],
+) -> dict[str, object]:
+    import cr_train.data.runtime as runtime_mod
+    import cr_train.data.source as source_mod
+
+    catalogs: dict[str, dict[str, object]] = {}
+    rows_by_key: dict[str, list[dict[str, object]]] = {}
+    split_sizes: dict[str, int] = {}
+    for split, blocks in split_blocks.items():
+        catalog, block_rows = _catalog(split, blocks)
+        catalogs[split] = catalog
+        rows_by_key.update(block_rows)
+        split_sizes[split] = int(catalog["total_rows"])
+
+    descriptor = {
+        "dataset_name": dataset_name,
+        "revision": None,
+        "source_signature": hashlib.sha256(dataset_name.encode("utf-8")).hexdigest()[:20],
+        "split_sizes": split_sizes,
+    }
+    source_root = source_mod.resolve_source_root(tmp_path, descriptor["source_signature"])
+    remote_state = {
+        "descriptor_mode": "ok",
+        "catalog_mode": "ok",
+    }
+    descriptor_calls: list[str] = []
+    catalog_calls: list[str] = []
+    load_counts: dict[str, int] = defaultdict(int)
+
+    def fake_load_source_descriptor(
+        dataset_name: str,
+        revision: str | None,
+        *,
+        startup_callback=None,
+        retry_policy=None,
+    ) -> dict[str, object]:
+        del startup_callback, retry_policy
+        assert dataset_name == descriptor["dataset_name"]
+        assert revision is None
+        descriptor_calls.append(dataset_name)
+        if remote_state["descriptor_mode"] != "ok":
+            raise AssertionError("load_source_descriptor should not run")
+        return dict(descriptor)
+
+    def fake_build_catalog(
+        *,
+        dataset_name: str,
+        revision: str | None,
+        split: str,
+        total_rows: int,
+        startup_callback=None,
+        retry_policy=None,
+    ) -> dict[str, object]:
+        del startup_callback, retry_policy
+        assert dataset_name == descriptor["dataset_name"]
+        assert revision is None
+        assert total_rows == split_sizes[split]
+        catalog_calls.append(split)
+        if remote_state["catalog_mode"] != "ok":
+            raise AssertionError("build_catalog should not run")
+        return catalogs[split]
+
+    def fake_load_block_rows(
+        *,
+        dataset_name: str,
+        revision: str | None,
+        split: str,
+        block: dict[str, object],
+        progress_callback=None,
+        startup_callback=None,
+    ) -> list[dict[str, object]]:
+        del startup_callback
+        assert dataset_name == descriptor["dataset_name"]
+        assert revision is None
+        cache_key = str(block["cache_key"])
+        load_counts[cache_key] += 1
+        rows = [dict(row) for row in rows_by_key[cache_key]]
+        if progress_callback is not None:
+            for index, row in enumerate(rows, start=1):
+                downloaded_bytes = sum(
+                    len(value)
+                    for value in row.values()
+                    if isinstance(value, (bytes, bytearray, memoryview))
+                )
+                progress_callback(index, downloaded_bytes)
+        return rows
+
+    monkeypatch.setattr(source_mod, "load_source_descriptor", fake_load_source_descriptor)
+    monkeypatch.setattr(source_mod, "build_catalog", fake_build_catalog)
+    monkeypatch.setattr(runtime_mod, "load_block_rows", fake_load_block_rows)
+    return {
+        "source_root": source_root,
+        "descriptor": descriptor,
+        "catalogs": catalogs,
+        "rows_by_key": rows_by_key,
+        "load_counts": load_counts,
+        "descriptor_calls": descriptor_calls,
+        "catalog_calls": catalog_calls,
+        "remote_state": remote_state,
+    }
+
+
 def test_data_package_public_surface_is_minimal_and_explicit() -> None:
     data_mod = importlib.import_module("cr_train.data")
 
@@ -1050,6 +1157,88 @@ def test_build_catalog_records_shard_index(monkeypatch, parquet_row_group_path: 
     assert catalog["blocks"][11]["row_groups"] == [11]
 
 
+def test_ensure_source_root_skips_remote_descriptor_for_verified_full_source(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.source as source_mod
+
+    dataset_name = "unit/verified-source-root"
+    source_root = source_mod.resolve_source_root(tmp_path, "verified-source-root")
+    descriptor = {
+        "cache_layout_version": source_mod.CACHE_LAYOUT_VERSION,
+        "dataset_name": dataset_name,
+        "revision": None,
+        "source_signature": "verified-source-root",
+        "split_sizes": {"train": 4},
+    }
+    source_mod.write_json_atomic(source_mod.resolve_source_metadata_path(source_root), descriptor)
+    source_mod.write_json_atomic(
+        source_mod.resolve_source_local_state_path(source_root),
+        {
+            "verified_full_splits": ["train"],
+        },
+    )
+    monkeypatch.setattr(
+        source_mod,
+        "load_source_descriptor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("load_source_descriptor should not run")),
+    )
+
+    resolved_root, resolved_descriptor = source_mod.ensure_source_root(
+        dataset_name=dataset_name,
+        revision=None,
+        cache_root=tmp_path,
+    )
+
+    assert resolved_root == source_root
+    assert resolved_descriptor == descriptor
+
+
+def test_ensure_split_catalog_skips_remote_build_for_verified_full_split(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.source as source_mod
+
+    source_root = source_mod.resolve_source_root(tmp_path, "verified-catalog")
+    catalog_payload = {
+        "cache_layout_version": source_mod.CACHE_LAYOUT_VERSION,
+        "split": "train",
+        "total_rows": 4,
+        "total_blocks": 4,
+        "blocks": [
+            {
+                "index": index,
+                "shard_index": index,
+                "cache_key": f"block-{index}",
+                "source_file": f"hf://datasets/unit/verified/train/{index:04d}.parquet",
+                "row_groups": [index],
+            }
+            for index in range(4)
+        ],
+    }
+    source_mod.write_json_atomic(source_mod.resolve_catalog_path(source_root, "train"), catalog_payload)
+    source_mod.write_json_atomic(
+        source_mod.resolve_source_local_state_path(source_root),
+        {
+            "verified_full_splits": ["train"],
+        },
+    )
+    monkeypatch.setattr(
+        source_mod,
+        "build_catalog",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("build_catalog should not run")),
+    )
+
+    resolved_catalog = source_mod.ensure_split_catalog(
+        source_root=source_root,
+        descriptor={
+            "dataset_name": "unit/verified-catalog",
+            "revision": None,
+            "split_sizes": {"train": 4},
+        },
+        split="train",
+        startup_callback=None,
+    )
+
+    assert resolved_catalog == catalog_payload
+
+
 def test_ensure_split_cache_reuses_cached_blocks_across_plans(monkeypatch, tmp_path: Path) -> None:
     split_blocks = {
         "train": _make_block_splits(4),
@@ -1120,6 +1309,103 @@ def test_ensure_split_cache_full_request_warms_all_blocks_and_reports_full_plan(
     assert done_event["resolved_blocks"] == 10
     assert done_event["execution_block_count"] == 10
     assert done_event["timeline"] == ("█" * 10)
+
+
+def test_verified_full_split_skips_hf_bootstrap_after_initial_full_warmup(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.source as source_mod
+
+    dataset_name = "unit/offline-full-cache"
+    patched = _patch_remote_source_cache(
+        monkeypatch,
+        tmp_path,
+        dataset_name=dataset_name,
+        split_blocks={"train": [[_make_row(index)] for index in range(4)]},
+    )
+
+    ensure_split_cache(
+        split="train",
+        dataset_name=dataset_name,
+        revision=None,
+        max_samples=None,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    assert patched["descriptor_calls"] == [dataset_name]
+    assert patched["catalog_calls"] == ["train"]
+    assert sum(patched["load_counts"].values()) == 4
+    assert source_mod.load_source_local_state(patched["source_root"])["verified_full_splits"] == ["train"]
+
+    patched["remote_state"]["descriptor_mode"] = "fail"
+    patched["remote_state"]["catalog_mode"] = "fail"
+
+    ensure_split_cache(
+        split="train",
+        dataset_name=dataset_name,
+        revision=None,
+        max_samples=None,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    state = resolve_prepared_split_state(
+        split="train",
+        dataset_name=dataset_name,
+        revision=None,
+        max_samples=1,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    assert patched["descriptor_calls"] == [dataset_name]
+    assert patched["catalog_calls"] == ["train"]
+    assert sum(patched["load_counts"].values()) == 4
+    assert state.split == "train"
+    assert len(state.selected_blocks) == 1
+
+
+def test_verified_full_split_revokes_and_recovers_after_missing_payload(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.source as source_mod
+
+    dataset_name = "unit/offline-full-repair"
+    patched = _patch_remote_source_cache(
+        monkeypatch,
+        tmp_path,
+        dataset_name=dataset_name,
+        split_blocks={"train": [[_make_row(index)] for index in range(4)]},
+    )
+
+    ensure_split_cache(
+        split="train",
+        dataset_name=dataset_name,
+        revision=None,
+        max_samples=None,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    patched["remote_state"]["descriptor_mode"] = "fail"
+    patched["remote_state"]["catalog_mode"] = "fail"
+
+    cache_paths = resolve_block_cache_paths(patched["source_root"], "train")
+    first_block = patched["catalogs"]["train"]["blocks"][0]
+    cache_key = str(first_block["cache_key"])
+    (block_data_path(cache_paths, cache_key) / "sar.npy").unlink()
+
+    ensure_split_cache(
+        split="train",
+        dataset_name=dataset_name,
+        revision=None,
+        max_samples=None,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    assert patched["descriptor_calls"] == [dataset_name]
+    assert patched["catalog_calls"] == ["train"]
+    assert patched["load_counts"][cache_key] == 2
+    assert block_is_cached(cache_paths, cache_key) is True
+    assert source_mod.load_source_local_state(patched["source_root"])["verified_full_splits"] == ["train"]
 
 
 @pytest.mark.parametrize(
@@ -1258,14 +1544,9 @@ def test_broken_payload_clears_completed_marker_and_next_warmup_refills(monkeypa
         cache_root=tmp_path,
     )
 
-    assert patched["load_counts"][cache_key] == 1
+    assert patched["load_counts"][cache_key] == 2
+    assert block_is_cached(cache_paths, cache_key) is True
     assert find_completed_block_row_count(cache_paths, cache_key) == BLOCK_SIZE
-
-    with pytest.raises(RuntimeError, match=cache_key):
-        load_block(cache_paths, cache_key)
-
-    assert block_is_cached(cache_paths, cache_key) is False
-    assert find_completed_block_row_count(cache_paths, cache_key) is None
 
     ensure_split_cache(
         split="train",
