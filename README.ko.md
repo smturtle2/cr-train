@@ -144,7 +144,7 @@ uv run python examples/train_sen12mscr.py \
   --output-dir runs/sen12mscr-example
 ```
 
-`--max-train-samples none` (또는 `full`)을 전달하면 전체 split을 캐싱하여 학습합니다.
+`--max-train-samples none` (또는 `full`)을 전달하면 샘플링을 건너뛰고 모든 row-group block을 워밍업한 뒤 전체 split으로 학습합니다.
 `--accum-steps N`을 주면 optimizer step 전에 `N`개의 micro-batch에 대해 gradient를 누적합니다. `get_state()`와 체크포인트의 `global_step`은 micro-batch 수가 아니라 optimizer update 횟수를 뜻합니다.
 번들된 스크립트는 공개 scheduler API 사용 예시를 보여주기 위해 기본으로 커스텀 `WarmupCosineScheduler` subclass를 사용하며, 끄려면 `--scheduler none`을 주면 됩니다.
 `--scheduler-timing after_validation|before_optimizer_step|after_optimizer_step`로 `Trainer`가 `scheduler.step()`을 호출하는 시점을 고를 수 있습니다. 번들된 warmup-cosine 예제는 기본값인 epoch 기반 `after_validation` 타이밍을 그대로 사용합니다.
@@ -152,7 +152,7 @@ uv run python examples/train_sen12mscr.py \
 
 ### 샘플링 알고리즘 시각화
 
-uniform exact-k 블록 선택 비트마스크가 어떻게 만들어지는지 확인합니다:
+부분 요청에 대해 uniform exact-k 블록 선택 비트마스크가 어떻게 만들어지는지 확인합니다. 전체 split 요청은 `planner_mode="full_split"`으로 기록되고 모든 block을 순서대로 선택합니다:
 
 ```bash
 uv run python examples/bitmask_sampling_demo.py \
@@ -316,12 +316,12 @@ from cr_train.data import BLOCK_SIZE, trace_plan_sample
 
 ## 내부 구조
 
-`Trainer`는 HuggingFace streaming으로 데이터를 읽고, row group 기준의 재사용 가능한 로컬 block cache를 유지하며, 시작 이벤트를 `metrics.jsonl`에 기록합니다. 같은 `seed`를 쓰면 uniform exact-k 기준의 논리 블록 선택은 유지되고, 학습 block/row 순서는 `seed + epoch_index`에 따라 epoch마다 바뀝니다.
+`Trainer`는 HuggingFace streaming으로 데이터를 읽고, row group 기준의 재사용 가능한 로컬 block cache를 유지하며, 시작 이벤트를 `metrics.jsonl`에 기록합니다. 부분 요청은 `seed` 기반의 결정적 uniform exact-k 논리 블록 선택을 사용하고, 전체 split 요청은 샘플링을 우회해 모든 row-group block을 순서대로 선택합니다. 학습 block/row 순서는 `seed + epoch_index`에 따라 epoch마다 바뀝니다.
 
 워밍업은 호출에 필요한 split만 수행합니다. `step()`은 `train`과 `validation`, `test()`는 `test`를 준비하며, 선택된 row-group block이 이미 로컬에 있지 않을 때만 HuggingFace에서 누락된 블록을 가져옵니다.
 
 - 캐시 워밍업 시 tqdm 프로그레스 바로 블록 다운로드를 표시하고, 완료 시 한 줄 `■/□` 블록 타임라인을 출력합니다.
-- 동일한 `seed`는 같은 uniform exact-k 블록 선택을 유지하며, 학습 배치 순서는 `seed + epoch_index`로 epoch마다 변경됩니다.
+- 부분 요청에서는 동일한 `seed`가 같은 uniform exact-k 블록 선택을 유지하고, 전체 split 요청은 항상 모든 block을 포함합니다.
 - CUDA에서 worker process를 사용할 때는 `num_workers > 0`이면 더 안전한 `"spawn"` multiprocessing context를 기본으로 사용합니다.
 - 완료된 캐시는 자동 삭제되지 않습니다. 디스크 공간 회수를 위해 캐시 디렉토리에서 직접 삭제하세요.
 

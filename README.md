@@ -144,7 +144,7 @@ uv run python examples/train_sen12mscr.py \
   --output-dir runs/sen12mscr-example
 ```
 
-Pass `--max-train-samples none` (or `full`) to cache and train on the entire split.
+Pass `--max-train-samples none` (or `full`) to bypass sampling, warm every row-group block, and train on the entire split.
 Use `--accum-steps N` to accumulate gradients across `N` micro-batches before each optimizer update; `global_step` in `get_state()` and checkpoints counts optimizer updates, not micro-batches.
 The bundled script uses a custom `WarmupCosineScheduler` subclass by default to show the public scheduler API end-to-end; pass `--scheduler none` to disable it.
 Use `--scheduler-timing after_validation|before_optimizer_step|after_optimizer_step` to control when `Trainer` calls `scheduler.step()`. The bundled warmup-cosine example stays on the default epoch-based `after_validation` timing.
@@ -152,7 +152,7 @@ The training augmentations apply only to the train split; validation and test st
 
 ### Sampling algorithm visualization
 
-See how the uniform exact-k block-selection bitmask is built:
+See how the uniform exact-k block-selection bitmask is built for partial requests. Full-split requests report `planner_mode="full_split"` and select every block in order:
 
 ```bash
 uv run python examples/bitmask_sampling_demo.py \
@@ -316,12 +316,12 @@ See [`examples/bitmask_sampling_demo.py`](examples/bitmask_sampling_demo.py) for
 
 ## Architecture
 
-`Trainer` reads the dataset through HuggingFace streaming, keeps a reusable local block cache keyed by row group, and records startup events in `metrics.jsonl`. The same `seed` preserves uniform exact-k logical block membership across runs, while training block and row order still change by epoch through `seed + epoch_index`.
+`Trainer` reads the dataset through HuggingFace streaming, keeps a reusable local block cache keyed by row group, and records startup events in `metrics.jsonl`. Partial requests use deterministic uniform exact-k logical block selection keyed by `seed`, while full-split requests bypass sampling and select every row-group block in order. Training block and row order still change by epoch through `seed + epoch_index`.
 
 During warmup, `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing blocks are fetched from HuggingFace only when the selected row-group blocks are not already cached locally.
 
 - Cache warmup shows a tqdm progress bar during block download and prints a one-line `■/□` block timeline on completion.
-- Equal `seed` values keep the same uniform exact-k block-selection membership; train batch order still changes by epoch via `seed + epoch_index`.
+- Equal `seed` values keep the same uniform exact-k block-selection membership for partial requests; full-split requests always include every block.
 - CUDA runs with worker processes default to the safer `"spawn"` multiprocessing context once `num_workers > 0`.
 - Finished caches are never auto-deleted. Remove them manually from the cache directory to reclaim disk space.
 

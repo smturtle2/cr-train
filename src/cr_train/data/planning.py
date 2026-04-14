@@ -10,6 +10,7 @@ from .constants import BLOCK_SIZE
 
 
 SELECTION_PLANNER_MODE = "uniform_exact_k"
+FULL_SPLIT_PLANNER_MODE = "full_split"
 
 
 @dataclass(slots=True)
@@ -62,6 +63,12 @@ def _select_blocks_uniform_exact_k(
     return selected_blocks, draw_order
 
 
+def _select_all_blocks(total_blocks: int) -> tuple[np.ndarray, np.ndarray]:
+    selected_blocks = np.arange(total_blocks, dtype=np.int64)
+    selected_bitmap = np.ones(total_blocks, dtype=np.bool_)
+    return selected_blocks, selected_bitmap
+
+
 def _resolve_total_blocks(catalog: dict[str, object]) -> int:
     block_row_counts = catalog.get("block_row_counts")
     if isinstance(block_row_counts, list):
@@ -97,6 +104,14 @@ def _estimate_effective_rows(
     return min(total_rows, int(selected_blocks.size) * BLOCK_SIZE)
 
 
+def _resolve_requested_rows(total_rows: int, max_samples: int | None) -> int:
+    return total_rows if max_samples is None else min(max_samples, total_rows)
+
+
+def _is_full_split_request(*, total_rows: int, requested_rows: int) -> bool:
+    return total_rows > 0 and requested_rows >= total_rows
+
+
 def trace_plan_sample(
     catalog: dict[str, object],
     seed: int,
@@ -108,7 +123,7 @@ def trace_plan_sample(
     split_seed = _derive_named_seed(seed, split, "selection")
     total_rows = int(catalog.get("total_rows", 0))
     total_blocks = _resolve_total_blocks(catalog)
-    requested_rows = total_rows if max_samples is None else min(max_samples, total_rows)
+    requested_rows = _resolve_requested_rows(total_rows, max_samples)
     if requested_rows <= 0 or total_blocks == 0:
         return SelectionTrace(
             total_blocks=total_blocks,
@@ -121,22 +136,20 @@ def trace_plan_sample(
             execution_block_count=0,
         )
 
-    required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE)))
-    if required_blocks >= total_blocks:
-        selected_blocks = np.arange(total_blocks, dtype=np.int64)
-        selected_bitmap = np.zeros(total_blocks, dtype=np.bool_)
-        selected_bitmap[selected_blocks] = True
+    if _is_full_split_request(total_rows=total_rows, requested_rows=requested_rows):
+        selected_blocks, selected_bitmap = _select_all_blocks(total_blocks)
         return SelectionTrace(
             total_blocks=total_blocks,
             requested_rows=requested_rows,
-            required_blocks=required_blocks,
-            planner_mode=SELECTION_PLANNER_MODE,
+            required_blocks=total_blocks,
+            planner_mode=FULL_SPLIT_PLANNER_MODE,
             draw_order=selected_blocks.copy(),
             selected_blocks=selected_blocks,
             selected_bitmap=selected_bitmap,
-            execution_block_count=(int(selected_blocks[-1]) + 1) if selected_blocks.size else 0,
+            execution_block_count=total_blocks,
         )
 
+    required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE)))
     selected_blocks, draw_order = _select_blocks_uniform_exact_k(
         required_blocks=required_blocks,
         total_blocks=total_blocks,
@@ -167,7 +180,7 @@ def plan_sample(
     split_seed = _derive_named_seed(seed, split, "selection")
     total_rows = int(catalog.get("total_rows", 0))
     total_blocks = _resolve_total_blocks(catalog)
-    requested_rows = total_rows if max_samples is None else min(max_samples, total_rows)
+    requested_rows = _resolve_requested_rows(total_rows, max_samples)
     if requested_rows <= 0 or total_blocks == 0:
         return SamplePlan(
             requested_rows=0,
@@ -178,6 +191,25 @@ def plan_sample(
             selected_blocks=np.empty((0,), dtype=np.int64),
             selected_bitmap=np.zeros(total_blocks, dtype=np.bool_),
             execution_block_count=0,
+        )
+
+    if _is_full_split_request(total_rows=total_rows, requested_rows=requested_rows):
+        selected_blocks, selected_bitmap = _select_all_blocks(total_blocks)
+        effective_rows = _estimate_effective_rows(
+            catalog,
+            requested_rows=requested_rows,
+            selected_blocks=selected_blocks,
+            total_blocks=total_blocks,
+        )
+        return SamplePlan(
+            requested_rows=requested_rows,
+            effective_rows=effective_rows,
+            required_blocks=total_blocks,
+            total_blocks=total_blocks,
+            planner_mode=FULL_SPLIT_PLANNER_MODE,
+            selected_blocks=selected_blocks,
+            selected_bitmap=selected_bitmap,
+            execution_block_count=total_blocks,
         )
 
     required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE)))

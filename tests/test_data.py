@@ -474,6 +474,23 @@ def test_plan_sample_is_block_reproducible_within_total_block_domain() -> None:
     assert sample_a.execution_block_count == int(sample_a.selected_blocks[-1]) + 1
 
 
+def test_plan_sample_full_request_selects_all_blocks_for_full_split() -> None:
+    catalog = {"total_rows": 10, "total_blocks": 10}
+
+    implicit_full = plan_sample(catalog, seed=7, max_samples=None, split="train")
+    explicit_full = plan_sample(catalog, seed=7, max_samples=999, split="train")
+
+    for sample in (implicit_full, explicit_full):
+        assert sample.requested_rows == 10
+        assert sample.effective_rows == 10
+        assert sample.required_blocks == 10
+        assert sample.total_blocks == 10
+        assert sample.planner_mode == "full_split"
+        assert sample.selected_blocks.tolist() == list(range(10))
+        assert np.all(sample.selected_bitmap)
+        assert sample.execution_block_count == 10
+
+
 def test_trace_plan_sample_reports_uniform_exact_k_metadata() -> None:
     trace = trace_plan_sample({"total_rows": 10 * BLOCK_SIZE}, seed=11, max_samples=3 * BLOCK_SIZE, split="train")
 
@@ -484,6 +501,19 @@ def test_trace_plan_sample_reports_uniform_exact_k_metadata() -> None:
     assert trace.selected_blocks.size == 3
     assert trace.draw_order.size == 3
     assert trace.execution_block_count == int(trace.selected_blocks[-1]) + 1
+
+
+def test_trace_plan_sample_reports_full_split_metadata_for_full_request() -> None:
+    trace = trace_plan_sample({"total_rows": 10, "total_blocks": 10}, seed=11, max_samples=None, split="train")
+
+    assert trace.total_blocks == 10
+    assert trace.requested_rows == 10
+    assert trace.required_blocks == 10
+    assert trace.planner_mode == "full_split"
+    assert trace.draw_order.tolist() == list(range(10))
+    assert trace.selected_blocks.tolist() == list(range(10))
+    assert np.all(trace.selected_bitmap)
+    assert trace.execution_block_count == 10
 
 
 def test_prepare_row_group_stream_activates_internal_row_group_reshard(monkeypatch) -> None:
@@ -1060,6 +1090,36 @@ def test_ensure_split_cache_reuses_cached_blocks_across_plans(monkeypatch, tmp_p
 
     assert len(cached_after_first) == len(first_plan.selected_blocks)
     assert len(cached_after_second) == len(set(first_plan.selected_blocks.tolist()) | set(second_plan.selected_blocks.tolist()))
+
+
+def test_ensure_split_cache_full_request_warms_all_blocks_and_reports_full_plan(monkeypatch, tmp_path: Path) -> None:
+    split_blocks = {"train": [[_make_row(index)] for index in range(10)]}
+    patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
+    startup_events: list[dict[str, object]] = []
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=None,
+        seed=7,
+        cache_root=tmp_path,
+        startup_callback=startup_events.append,
+    )
+
+    done_event = next(
+        event
+        for event in startup_events
+        if event["stage"] == "warm split cache" and event["status"] == "done"
+    )
+
+    assert sum(patched["load_counts"].values()) == 10
+    assert done_event["planner_mode"] == "full_split"
+    assert done_event["selected_block_count"] == 10
+    assert done_event["selected_missing_blocks"] == 10
+    assert done_event["resolved_blocks"] == 10
+    assert done_event["execution_block_count"] == 10
+    assert done_event["timeline"] == ("█" * 10)
 
 
 @pytest.mark.parametrize(
