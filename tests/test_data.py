@@ -681,7 +681,7 @@ def test_load_block_rows_rejects_oversized_shard(monkeypatch) -> None:
     assert "row_groups=[2]" in message
 
 
-def test_load_source_descriptor_retries_retryable_builder_failures(monkeypatch) -> None:
+def test_load_source_descriptor_retries_closed_client_failures_and_resets_hf_state(monkeypatch) -> None:
     import cr_train.data.source as source_mod
 
     class FakeSplitInfo:
@@ -693,6 +693,7 @@ def test_load_source_descriptor_retries_retryable_builder_failures(monkeypatch) 
 
     startup_events: list[dict[str, object]] = []
     sleep_calls: list[float] = []
+    reset_calls: list[str] = []
     call_count = 0
 
     def fake_load_dataset_builder(dataset_name: str, revision: str | None, download_config=None):
@@ -702,10 +703,16 @@ def test_load_source_descriptor_retries_retryable_builder_failures(monkeypatch) 
         assert download_config is not None
         call_count += 1
         if call_count < 3:
-            raise ConnectionError("Server Disconnected")
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
         return FakeBuilder()
 
     monkeypatch.setattr(source_mod, "load_dataset_builder", fake_load_dataset_builder)
+    monkeypatch.setattr(source_mod, "close_session", lambda: reset_calls.append("close_session"))
+    monkeypatch.setattr(
+        source_mod.HfFileSystem,
+        "clear_instance_cache",
+        classmethod(lambda cls: reset_calls.append("clear_instance_cache")),
+    )
     monkeypatch.setattr(source_mod.random, "uniform", lambda _lo, _hi: 0.0)
     monkeypatch.setattr(source_mod.time, "sleep", lambda seconds: sleep_calls.append(seconds))
 
@@ -721,6 +728,13 @@ def test_load_source_descriptor_retries_retryable_builder_failures(monkeypatch) 
     assert len(retry_events) == 2
     assert [event["attempt"] for event in retry_events] == [1, 2]
     assert all(event["operation"] == "load source descriptor" for event in retry_events)
+    assert all(event["recovery"] == "reset_hf_session" for event in retry_events)
+    assert reset_calls == [
+        "close_session",
+        "clear_instance_cache",
+        "close_session",
+        "clear_instance_cache",
+    ]
     assert sleep_calls == [2.0, 4.0]
 
 
@@ -735,6 +749,7 @@ def test_load_row_group_stream_retries_retryable_bootstrap_failures(monkeypatch)
 
     startup_events: list[dict[str, object]] = []
     sleep_calls: list[float] = []
+    reset_calls: list[str] = []
     call_count = 0
 
     def fake_load_dataset(dataset_name: str, revision: str | None, split: str, streaming: bool, columns, download_config=None):
@@ -751,6 +766,12 @@ def test_load_row_group_stream_retries_retryable_bootstrap_failures(monkeypatch)
 
     monkeypatch.setattr(source_mod, "ensure_supported_datasets_version", lambda: None)
     monkeypatch.setattr(source_mod, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(source_mod, "close_session", lambda: reset_calls.append("close_session"))
+    monkeypatch.setattr(
+        source_mod.HfFileSystem,
+        "clear_instance_cache",
+        classmethod(lambda cls: reset_calls.append("clear_instance_cache")),
+    )
     monkeypatch.setattr(source_mod.random, "uniform", lambda _lo, _hi: 0.0)
     monkeypatch.setattr(source_mod.time, "sleep", lambda seconds: sleep_calls.append(seconds))
     monkeypatch.setattr(source_mod, "_prepare_row_group_stream", lambda dataset, retry_policy=None: dataset)
@@ -768,16 +789,23 @@ def test_load_row_group_stream_retries_retryable_bootstrap_failures(monkeypatch)
     assert len(retry_events) == 2
     assert [event["attempt"] for event in retry_events] == [1, 2]
     assert all(event["operation"] == "load row-group stream" for event in retry_events)
+    assert all(event["recovery"] == "reset_hf_session" for event in retry_events)
+    assert reset_calls == [
+        "close_session",
+        "clear_instance_cache",
+        "close_session",
+        "clear_instance_cache",
+    ]
     assert sleep_calls == [2.0, 4.0]
 
 
-def test_load_block_rows_retries_retryable_read_failures_and_resets_template_cache(monkeypatch) -> None:
+def test_load_block_rows_retries_closed_client_failures_and_resets_hf_state(monkeypatch) -> None:
     import cr_train.data.source as source_mod
 
     class FailingShardDataset:
         def take(self, count: int):
             del count
-            raise ConnectionError("Server Disconnected")
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
 
     class SuccessShardDataset:
         def __init__(self, rows: list[dict[str, object]]) -> None:
@@ -810,6 +838,7 @@ def test_load_block_rows_retries_retryable_read_failures_and_resets_template_cac
 
     startup_events: list[dict[str, object]] = []
     sleep_calls: list[float] = []
+    reset_calls: list[str] = []
     rows = [_make_stream_row(index) for index in range(BLOCK_SIZE)]
     fresh_template = FreshTemplate(rows)
     cache_key = ("unit/retry-block", None, "train")
@@ -828,6 +857,12 @@ def test_load_block_rows_retries_retryable_read_failures_and_resets_template_cac
 
     monkeypatch.setattr(source_mod, "ensure_supported_datasets_version", lambda: None)
     monkeypatch.setattr(source_mod, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(source_mod, "close_session", lambda: reset_calls.append("close_session"))
+    monkeypatch.setattr(
+        source_mod.HfFileSystem,
+        "clear_instance_cache",
+        classmethod(lambda cls: reset_calls.append("clear_instance_cache")),
+    )
     monkeypatch.setattr(source_mod.random, "uniform", lambda _lo, _hi: 0.0)
     monkeypatch.setattr(source_mod.time, "sleep", lambda seconds: sleep_calls.append(seconds))
     monkeypatch.setattr(source_mod, "_prepare_row_group_stream", lambda dataset, retry_policy=None: dataset)
@@ -852,6 +887,8 @@ def test_load_block_rows_retries_retryable_read_failures_and_resets_template_cac
     assert len(retry_events) == 1
     assert retry_events[0]["operation"] == "load block rows"
     assert retry_events[0]["cache_key"] == "retry-block"
+    assert retry_events[0]["recovery"] == "reset_hf_session"
+    assert reset_calls == ["close_session", "clear_instance_cache"]
     assert sleep_calls == [2.0]
     assert source_mod._stream_template_cache[cache_key] is fresh_template
 
@@ -901,13 +938,13 @@ def test_load_block_rows_does_not_retry_non_retryable_empty_shard(monkeypatch) -
     assert startup_events == []
 
 
-def test_load_block_rows_wraps_exhausted_retryable_errors(monkeypatch) -> None:
+def test_load_block_rows_wraps_exhausted_closed_client_errors(monkeypatch) -> None:
     import cr_train.data.source as source_mod
 
     class FailingShardDataset:
         def take(self, count: int):
             del count
-            raise ConnectionError("Server Disconnected")
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
 
     class FakeTemplate:
         num_shards = 1
@@ -920,12 +957,19 @@ def test_load_block_rows_wraps_exhausted_retryable_errors(monkeypatch) -> None:
 
     startup_events: list[dict[str, object]] = []
     sleep_calls: list[float] = []
+    reset_calls: list[str] = []
 
     monkeypatch.setattr(source_mod, "load_row_group_stream", lambda **kwargs: FakeTemplate())
+    monkeypatch.setattr(source_mod, "close_session", lambda: reset_calls.append("close_session"))
+    monkeypatch.setattr(
+        source_mod.HfFileSystem,
+        "clear_instance_cache",
+        classmethod(lambda cls: reset_calls.append("clear_instance_cache")),
+    )
     monkeypatch.setattr(source_mod.random, "uniform", lambda _lo, _hi: 0.0)
     monkeypatch.setattr(source_mod.time, "sleep", lambda seconds: sleep_calls.append(seconds))
 
-    with pytest.raises(RuntimeError, match="failed after 5 attempts"):
+    with pytest.raises(RuntimeError, match="failed after 3 attempts"):
         source_mod.load_block_rows(
             dataset_name="unit/retry-fail",
             revision=None,
@@ -938,12 +982,20 @@ def test_load_block_rows_wraps_exhausted_retryable_errors(monkeypatch) -> None:
                 "row_groups": [0],
             },
             startup_callback=startup_events.append,
+            retry_policy=source_mod.RemoteRetryPolicy(outer_max_attempts=3),
         )
 
     retry_events = [event for event in startup_events if event["stage"] == "remote retry"]
-    assert len(retry_events) == 4
-    assert sleep_calls == [2.0, 4.0, 8.0, 16.0]
-    assert retry_events[-1]["attempt"] == 4
+    assert len(retry_events) == 2
+    assert [event["recovery"] for event in retry_events] == ["reset_hf_session", "reset_hf_session"]
+    assert reset_calls == [
+        "close_session",
+        "clear_instance_cache",
+        "close_session",
+        "clear_instance_cache",
+    ]
+    assert sleep_calls == [2.0, 4.0]
+    assert retry_events[-1]["attempt"] == 2
 
 
 def test_build_catalog_records_shard_index(monkeypatch, parquet_row_group_path: Path) -> None:

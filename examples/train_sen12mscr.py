@@ -143,19 +143,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-train-samples",
         type=parse_max_samples,
-        default=64,
+        default=None,
         help="Requested train rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
     )
     parser.add_argument(
         "--max-val-samples",
         type=parse_max_samples,
-        default=64,
+        default=None,
         help="Requested validation rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
     )
     parser.add_argument(
         "--max-test-samples",
         type=parse_max_samples,
-        default=64,
+        default=None,
         help="Requested test rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
     )
     parser.add_argument(
@@ -175,7 +175,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--output-dir", default="runs/sen12mscr-example")
-    parser.add_argument("--cache-dir", default=None)
+    parser.add_argument("--cache-dir", default="/dhdd/.cache/cr-train")
     parser.add_argument("--device", default=None)
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument(

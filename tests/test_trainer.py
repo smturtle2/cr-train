@@ -489,16 +489,20 @@ def test_format_startup_message_formats_remote_retry_summary() -> None:
             "status": "retry",
             "operation": "load block rows",
             "attempt": 2,
-            "max_attempts": 5,
+            "max_attempts": 10,
             "delay_sec": 4.0,
             "error_type": "ConnectionError",
             "cache_key": "abc123",
+            "recovery": "reset_hf_session",
         }
     )
     plain_summary = re.sub(r"\x1b\[[0-9;]*m", "", summary)
 
     assert should_print_startup({"stage": "remote retry", "status": "retry"}) is True
-    assert plain_summary == "retry train │ load block rows │ attempt 2/5 │ backoff 4.0s │ ConnectionError │ cache_key=abc123"
+    assert plain_summary == (
+        "retry train │ load block rows │ attempt 2/10 │ backoff 4.0s │ ConnectionError"
+        " │ cache_key=abc123 │ recovery=reset_hf_session"
+    )
 
 
 def test_resolve_progress_bar_ncols_leaves_one_column_headroom(monkeypatch) -> None:
@@ -874,11 +878,12 @@ def test_trainer_prints_and_records_remote_retry_startup_events(monkeypatch, tmp
                     "split": str(kwargs["split"]),
                     "operation": "load block rows",
                     "attempt": 1,
-                    "max_attempts": 5,
+                    "max_attempts": 10,
                     "delay_sec": 2.0,
                     "error_type": "ConnectionError",
                     "error": "Server Disconnected",
                     "cache_key": str(kwargs["block"]["cache_key"]),
+                    "recovery": "reset_hf_session",
                 }
             )
             emitted = True
@@ -919,7 +924,9 @@ def test_trainer_prints_and_records_remote_retry_startup_events(monkeypatch, tmp
     assert len(retry_records) == 1
     assert retry_records[0]["operation"] == "load block rows"
     assert retry_records[0]["attempt"] == 1
-    assert any(message.startswith("retry train │ load block rows │ attempt 1/5") for message in plain_writes)
+    assert retry_records[0]["recovery"] == "reset_hf_session"
+    assert any(message.startswith("retry train │ load block rows │ attempt 1/10") for message in plain_writes)
+    assert any("recovery=reset_hf_session" in message for message in plain_writes)
 
 
 def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(

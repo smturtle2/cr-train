@@ -22,7 +22,9 @@ from datasets.utils.file_utils import (
     RATE_LIMIT_CODE,
     xopen,
 )
+from huggingface_hub import HfFileSystem
 from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.utils import close_session
 
 from .constants import (
     BLOCK_SIZE,
@@ -47,6 +49,8 @@ from .store import freeze_row, read_json, write_json_atomic
 
 T = TypeVar("T")
 _REMOTE_RETRY_STAGE = "remote retry"
+_REMOTE_RETRY_RECOVERY = "reset_hf_session"
+_CLOSED_HTTP_CLIENT_ERROR = "Cannot send a request, as the client has been closed."
 
 
 def emit_startup_event(startup_callback: StartupCallback | None, **event: Any) -> None:
@@ -192,10 +196,16 @@ def _retryable_http_status(exc: HfHubHTTPError) -> int | None:
     return None
 
 
+def _is_closed_http_client_error(exc: Exception) -> bool:
+    return isinstance(exc, RuntimeError) and str(exc) == _CLOSED_HTTP_CLIENT_ERROR
+
+
 def _is_retryable_remote_error(exc: Exception) -> bool:
     if isinstance(exc, CONNECTION_ERRORS_TO_RETRY):
         return True
     if isinstance(exc, ConnectionError) and str(exc) == "Server Disconnected":
+        return True
+    if _is_closed_http_client_error(exc):
         return True
     if isinstance(exc, HfHubHTTPError) and _retryable_http_status(exc) is not None:
         return True
@@ -268,6 +278,23 @@ def _format_retry_context(
     return ", ".join(parts)
 
 
+def _reset_hf_remote_state() -> None:
+    # huggingface_hub keeps a shared httpx.Client and HfFileSystem caches instances.
+    # When the client is closed, retries must force both layers to rebuild fresh state.
+    close_session()
+    HfFileSystem.clear_instance_cache()
+
+
+def _reset_source_descriptor_retry_state(cache_key: tuple[str, str | None]) -> None:
+    _source_descriptor_cache.pop(cache_key, None)
+    _reset_hf_remote_state()
+
+
+def _reset_stream_retry_state(dataset_name: str, revision: str | None, split: str) -> None:
+    _clear_stream_template_cache(dataset_name, revision, split)
+    _reset_hf_remote_state()
+
+
 def _emit_remote_retry(
     startup_callback: StartupCallback | None,
     *,
@@ -277,6 +304,7 @@ def _emit_remote_retry(
     delay_sec: float,
     split: str | None,
     error: Exception,
+    recovery: str | None,
     context_fields: dict[str, Any],
 ) -> None:
     event: dict[str, Any] = {
@@ -290,6 +318,8 @@ def _emit_remote_retry(
         "error": str(error),
         **context_fields,
     }
+    if recovery is not None:
+        event["recovery"] = recovery
     if split is not None:
         event["split"] = split
     emit_startup_event(startup_callback, **event)
@@ -303,6 +333,7 @@ def _with_remote_retries(
     startup_callback: StartupCallback | None = None,
     split: str | None = None,
     on_retry_reset: Callable[[], None] | None = None,
+    recovery: str | None = None,
     context_fields: dict[str, Any] | None = None,
 ) -> T:
     resolved_policy = _resolve_retry_policy(retry_policy)
@@ -320,6 +351,8 @@ def _with_remote_retries(
             if attempt >= resolved_policy.outer_max_attempts:
                 break
             delay_sec = _compute_retry_delay_sec(resolved_policy, attempt)
+            if on_retry_reset is not None:
+                on_retry_reset()
             _emit_remote_retry(
                 startup_callback,
                 operation=operation_name,
@@ -328,10 +361,9 @@ def _with_remote_retries(
                 delay_sec=delay_sec,
                 split=split,
                 error=exc,
+                recovery=recovery,
                 context_fields=resolved_context,
             )
-            if on_retry_reset is not None:
-                on_retry_reset()
             time.sleep(delay_sec)
 
     if last_retryable_error is None:
@@ -395,7 +427,8 @@ def load_source_descriptor(
         retry_policy=resolved_policy,
         startup_callback=startup_callback,
         split=None,
-        on_retry_reset=lambda: _source_descriptor_cache.pop(cache_key, None),
+        on_retry_reset=lambda: _reset_source_descriptor_retry_state(cache_key),
+        recovery=_REMOTE_RETRY_RECOVERY,
         context_fields={
             "dataset_name": dataset_name,
             "revision": revision,
@@ -640,7 +673,8 @@ def load_row_group_stream(
         retry_policy=resolved_policy,
         startup_callback=startup_callback,
         split=split,
-        on_retry_reset=lambda: _clear_stream_template_cache(dataset_name, revision, split),
+        on_retry_reset=lambda: _reset_stream_retry_state(dataset_name, revision, split),
+        recovery=_REMOTE_RETRY_RECOVERY,
         context_fields={
             "dataset_name": dataset_name,
             "revision": revision,
@@ -852,7 +886,8 @@ def load_block_rows(
         retry_policy=resolved_policy,
         startup_callback=startup_callback,
         split=split,
-        on_retry_reset=lambda: _clear_stream_template_cache(dataset_name, revision, split),
+        on_retry_reset=lambda: _reset_stream_retry_state(dataset_name, revision, split),
+        recovery=_REMOTE_RETRY_RECOVERY,
         context_fields=context_fields,
     )
 

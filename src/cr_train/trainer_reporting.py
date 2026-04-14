@@ -105,6 +105,8 @@ def format_remote_retry_summary(event: dict[str, Any]) -> str:
     ]
     if "cache_key" in event:
         parts.append(f"cache_key={event['cache_key']}")
+    if "recovery" in event:
+        parts.append(f"recovery={event['recovery']}")
     return _summary_separator().join(parts)
 
 
