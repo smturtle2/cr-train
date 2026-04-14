@@ -24,6 +24,7 @@ from cr_train.trainer_reporting import (
     format_test_summary,
     format_train_epoch_row,
     format_val_epoch_row,
+    should_print_startup,
 )
 
 
@@ -99,9 +100,15 @@ def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list
     }
     load_counts: dict[str, int] = defaultdict(int)
 
-    def fake_ensure_source_root(*, dataset_name: str, revision: str | None, cache_root: Path):
+    def fake_ensure_source_root(
+        *,
+        dataset_name: str,
+        revision: str | None,
+        cache_root: Path,
+        startup_callback=None,
+    ):
         assert dataset_name in {"unit/test", "Hermanni/sen12mscr"}
-        del revision, cache_root
+        del revision, cache_root, startup_callback
         return source_root, descriptor
 
     def fake_ensure_split_catalog(*, source_root: Path, descriptor: dict[str, object], split: str, startup_callback):
@@ -115,8 +122,9 @@ def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list
         split: str,
         block: dict[str, object],
         progress_callback=None,
+        startup_callback=None,
     ):
-        del dataset_name, revision, split
+        del dataset_name, revision, split, startup_callback
         cache_key = str(block["cache_key"])
         load_counts[cache_key] += 1
         rows = [dict(row) for row in rows_by_key[cache_key]]
@@ -473,6 +481,26 @@ def test_format_startup_message_uses_dim_separator() -> None:
     assert plain_summary == "startup │ split=train │ stage=build dataloader │ max_samples=128 │ error=boom"
 
 
+def test_format_startup_message_formats_remote_retry_summary() -> None:
+    summary = format_startup_message(
+        {
+            "split": "train",
+            "stage": "remote retry",
+            "status": "retry",
+            "operation": "load block rows",
+            "attempt": 2,
+            "max_attempts": 5,
+            "delay_sec": 4.0,
+            "error_type": "ConnectionError",
+            "cache_key": "abc123",
+        }
+    )
+    plain_summary = re.sub(r"\x1b\[[0-9;]*m", "", summary)
+
+    assert should_print_startup({"stage": "remote retry", "status": "retry"}) is True
+    assert plain_summary == "retry train │ load block rows │ attempt 2/5 │ backoff 4.0s │ ConnectionError │ cache_key=abc123"
+
+
 def test_resolve_progress_bar_ncols_leaves_one_column_headroom(monkeypatch) -> None:
     import cr_train.progress as progress_mod
 
@@ -809,6 +837,89 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
 
     with pytest.raises(RuntimeError):
         trainer.step()
+
+
+def test_trainer_prints_and_records_remote_retry_startup_events(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.runtime as runtime_mod
+
+    output_dir = tmp_path / "run"
+    metrics_path = output_dir / "metrics.jsonl"
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    _patch_split_cache(
+        monkeypatch,
+        tmp_path,
+        {
+            "train": _make_block_splits(2),
+            "validation": _make_block_splits(1),
+            "test": _make_block_splits(1),
+        },
+    )
+    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    real_load_block_rows = runtime_mod.load_block_rows
+    emitted = False
+
+    def emit_retry_then_load(**kwargs):
+        nonlocal emitted
+        if not emitted:
+            startup_callback = kwargs.get("startup_callback")
+            assert startup_callback is not None
+            startup_callback(
+                {
+                    "stage": "remote retry",
+                    "status": "retry",
+                    "split": str(kwargs["split"]),
+                    "operation": "load block rows",
+                    "attempt": 1,
+                    "max_attempts": 5,
+                    "delay_sec": 2.0,
+                    "error_type": "ConnectionError",
+                    "error": "Server Disconnected",
+                    "cache_key": str(kwargs["block"]["cache_key"]),
+                }
+            )
+            emitted = True
+        return real_load_block_rows(**kwargs)
+
+    monkeypatch.setattr(runtime_mod, "load_block_rows", emit_retry_then_load)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        metrics={"mae": mae_metric},
+        max_train_samples=BLOCK_SIZE,
+        max_val_samples=BLOCK_SIZE,
+        max_test_samples=BLOCK_SIZE,
+        epochs=1,
+        batch_size=8,
+        seed=7,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer.step()
+
+    metrics_records = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    retry_records = [
+        record
+        for record in metrics_records
+        if record.get("kind") == "startup" and record.get("stage") == "remote retry"
+    ]
+    plain_writes = [re.sub(r"\x1b\[[0-9;]*m", "", message) for message in FakeTqdm.writes]
+
+    assert emitted is True
+    assert len(retry_records) == 1
+    assert retry_records[0]["operation"] == "load block rows"
+    assert retry_records[0]["attempt"] == 1
+    assert any(message.startswith("retry train │ load block rows │ attempt 1/5") for message in plain_writes)
 
 
 def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(

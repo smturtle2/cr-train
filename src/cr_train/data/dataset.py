@@ -16,7 +16,7 @@ from .constants import OPTICAL_CHANNELS, SAR_CHANNELS
 from .planning import plan_sample
 from .runtime import get_rank, get_world_size
 from .source import ensure_source_root, ensure_split_catalog, run_startup_stage
-from .store import BlockCachePaths, as_bytes, block_is_cached, load_block, load_block_metadata, resolve_block_cache_paths
+from .store import BlockCachePaths, as_bytes, load_block, load_completed_block_index, resolve_block_cache_paths
 
 
 @dataclass(slots=True)
@@ -240,16 +240,6 @@ def _slice_blocks_for_rank(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]
     return [block for i, block in enumerate(blocks) if i % world_size == rank]
 
 
-def _count_block_rows(cache_paths: BlockCachePaths, blocks: list[dict[str, Any]]) -> int:
-    total = 0
-    for block in blocks:
-        metadata = load_block_metadata(cache_paths, str(block["cache_key"]))
-        if metadata is None:
-            raise FileNotFoundError(f"cached block metadata is missing for {block['cache_key']}")
-        total += int(metadata.get("row_count", 0))
-    return total
-
-
 def _count_rows_from_state(state: PreparedSplitState, blocks: list[dict[str, Any]]) -> int:
     total = 0
     for block in blocks:
@@ -310,17 +300,16 @@ def _resolve_selected_block_row_counts(
     cache_paths: BlockCachePaths,
     selected_blocks: list[dict[str, Any]],
 ) -> dict[str, int]:
+    completed_by_key = load_completed_block_index(cache_paths)
     missing_cache_keys: list[str] = []
     row_counts_by_key: dict[str, int] = {}
     for block in selected_blocks:
         cache_key = str(block["cache_key"])
-        if not block_is_cached(cache_paths, cache_key):
+        row_count = completed_by_key.get(cache_key)
+        if row_count is None:
             missing_cache_keys.append(cache_key)
             continue
-        metadata = load_block_metadata(cache_paths, cache_key)
-        if metadata is None:
-            raise FileNotFoundError(f"cached block metadata is missing for {cache_key}")
-        row_counts_by_key[cache_key] = int(metadata.get("row_count", 0))
+        row_counts_by_key[cache_key] = row_count
     if missing_cache_keys:
         raise FileNotFoundError(f"split cache is missing requested blocks: {', '.join(missing_cache_keys)}")
     return row_counts_by_key
@@ -341,6 +330,7 @@ def resolve_prepared_split_state(
         dataset_name=dataset_name,
         revision=revision,
         cache_root=cache_root,
+        startup_callback=startup_callback,
     )
     catalog = ensure_split_catalog(
         source_root=source_root,

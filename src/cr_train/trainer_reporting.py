@@ -11,6 +11,7 @@ from .data.constants import WARMUP_TIMELINE_WIDTH
 
 PRINTED_STARTUP_STAGES: dict[str, set[str]] = {
     "warm split cache": {"done"},
+    "remote retry": {"retry"},
 }
 
 _DIM = "\033[2m"
@@ -88,11 +89,32 @@ def format_cache_summary(event: dict[str, Any]) -> str:
     return _summary_separator().join(parts)
 
 
+def format_remote_retry_summary(event: dict[str, Any]) -> str:
+    split = event.get("split")
+    operation = str(event.get("operation", "remote"))
+    attempt = int(event.get("attempt", 0))
+    max_attempts = int(event.get("max_attempts", 0))
+    delay_sec = float(event.get("delay_sec", 0.0))
+    error_type = str(event.get("error_type", "error"))
+    parts = [
+        f"retry {split}" if split is not None else "retry",
+        operation,
+        f"attempt {attempt}/{max_attempts}",
+        f"backoff {delay_sec:.1f}s",
+        error_type,
+    ]
+    if "cache_key" in event:
+        parts.append(f"cache_key={event['cache_key']}")
+    return _summary_separator().join(parts)
+
+
 def format_startup_message(event: dict[str, Any]) -> str:
     stage = str(event.get("stage", "startup"))
     split = str(event.get("split", "unknown"))
     if stage == "warm split cache":
         return format_cache_summary(event)
+    if stage == "remote retry":
+        return format_remote_retry_summary(event)
 
     parts = ["startup", f"split={split}", f"stage={stage}"]
     for field in (
@@ -108,6 +130,11 @@ def format_startup_message(event: dict[str, Any]) -> str:
         "run_count",
         "resolved_blocks",
         "epoch",
+        "operation",
+        "attempt",
+        "max_attempts",
+        "delay_sec",
+        "error_type",
     ):
         if field in event and not (field == "max_samples" and event[field] is None):
             parts.append(f"{field}={event[field]}")

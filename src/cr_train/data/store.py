@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from .constants import LOCK_POLL_INTERVAL_SECONDS, LOCK_TIMEOUT_SECONDS
+from .constants import BLOCK_SIZE, LOCK_POLL_INTERVAL_SECONDS, LOCK_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +20,7 @@ class BlockCachePaths:
     block_root: Path
     metadata_root: Path
     lock_root: Path
+    completed_root: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,7 @@ _BLOCK_PAYLOAD_FILENAMES = (
     _CLOUDY_PAYLOAD_FILENAME,
     _TARGET_PAYLOAD_FILENAME,
 )
+_COMPLETED_MARKER_SUFFIX = ".ok"
 
 
 def resolve_cache_root(cache_dir: str | os.PathLike[str] | None) -> Path:
@@ -93,11 +95,14 @@ def resolve_block_cache_paths(source_root: Path, split: str) -> BlockCachePaths:
     metadata_root.mkdir(parents=True, exist_ok=True)
     lock_root = store_root / "locks"
     lock_root.mkdir(parents=True, exist_ok=True)
+    completed_root = store_root / "completed"
+    completed_root.mkdir(parents=True, exist_ok=True)
     return BlockCachePaths(
         store_root=store_root,
         block_root=block_root,
         metadata_root=metadata_root,
         lock_root=lock_root,
+        completed_root=completed_root,
     )
 
 
@@ -176,6 +181,72 @@ def block_metadata_path(paths: BlockCachePaths, cache_key: str) -> Path:
 
 def block_lock_path(paths: BlockCachePaths, cache_key: str) -> Path:
     return paths.lock_root / f"{cache_key}.lock"
+
+
+def _completed_marker_name(cache_key: str, row_count: int) -> str:
+    return f"{cache_key}.{int(row_count)}{_COMPLETED_MARKER_SUFFIX}"
+
+
+def _parse_completed_marker_name(name: str) -> tuple[str, int] | None:
+    if not name.endswith(_COMPLETED_MARKER_SUFFIX):
+        return None
+    stem = name[: -len(_COMPLETED_MARKER_SUFFIX)]
+    parts = stem.rsplit(".", 1)
+    if len(parts) != 2:
+        return None
+    cache_key, row_count_str = parts
+    if not cache_key or not row_count_str.isdigit():
+        return None
+    row_count = int(row_count_str)
+    if row_count <= 0 or row_count > BLOCK_SIZE:
+        return None
+    return cache_key, row_count
+
+
+def _completed_marker_paths(paths: BlockCachePaths, cache_key: str) -> list[Path]:
+    return sorted(
+        path
+        for path in paths.completed_root.glob(f"{cache_key}.*{_COMPLETED_MARKER_SUFFIX}")
+        if path.is_file()
+    )
+
+
+def find_completed_block_row_count(paths: BlockCachePaths, cache_key: str) -> int | None:
+    row_count: int | None = None
+    for path in _completed_marker_paths(paths, cache_key):
+        parsed = _parse_completed_marker_name(path.name)
+        if parsed is None:
+            continue
+        row_count = parsed[1]
+    return row_count
+
+
+def load_completed_block_index(paths: BlockCachePaths) -> dict[str, int]:
+    completed: dict[str, int] = {}
+    for path in sorted(paths.completed_root.glob(f"*{_COMPLETED_MARKER_SUFFIX}")):
+        if not path.is_file():
+            continue
+        parsed = _parse_completed_marker_name(path.name)
+        if parsed is None:
+            continue
+        cache_key, row_count = parsed
+        completed[cache_key] = row_count
+    return completed
+
+
+def write_completed_block_marker(paths: BlockCachePaths, cache_key: str, *, row_count: int) -> Path:
+    if row_count <= 0 or row_count > BLOCK_SIZE:
+        raise ValueError(f"row_count must be between 1 and {BLOCK_SIZE}, got {row_count}")
+
+    marker_path = paths.completed_root / _completed_marker_name(cache_key, row_count)
+    tmp_path = marker_path.with_suffix(marker_path.suffix + ".tmp")
+    tmp_path.write_text("", encoding="utf-8")
+    tmp_path.replace(marker_path)
+
+    for stale_path in _completed_marker_paths(paths, cache_key):
+        if stale_path != marker_path:
+            stale_path.unlink(missing_ok=True)
+    return marker_path
 
 
 def _tmp_path(path: Path) -> Path:
@@ -268,6 +339,9 @@ def clear_block_cache_entry(paths: BlockCachePaths, cache_key: str, *, keep_lock
     remove_tree(_tmp_path(payload_path))
     remove_tree(metadata_path)
     remove_tree(_tmp_path(metadata_path))
+    for marker_path in _completed_marker_paths(paths, cache_key):
+        remove_tree(marker_path)
+        remove_tree(_tmp_path(marker_path))
     if not keep_lock:
         remove_tree(lock_path)
         remove_tree(_tmp_path(lock_path))
@@ -315,6 +389,7 @@ def save_block(
 
     payload_tmp.replace(payload_path)
     metadata_tmp.replace(metadata_path)
+    write_completed_block_marker(paths, cache_key, row_count=len(rows))
     return SaveBlockResult(
         payload_bytes=_path_size(payload_path),
         metadata_bytes=metadata_path.stat().st_size,
@@ -331,10 +406,16 @@ def _load_payload_strings(payload_metadata: dict[str, Any], *, field: str) -> tu
 
 def load_block(paths: BlockCachePaths, cache_key: str) -> MappedBlockPayload:
     path = block_data_path(paths, cache_key)
-    payload_metadata = read_json(_payload_metadata_path(path))
-    sar = np.load(_payload_file_path(path, _SAR_PAYLOAD_FILENAME), mmap_mode="r")
-    cloudy = np.load(_payload_file_path(path, _CLOUDY_PAYLOAD_FILENAME), mmap_mode="r")
-    target = np.load(_payload_file_path(path, _TARGET_PAYLOAD_FILENAME), mmap_mode="r")
+    try:
+        payload_metadata = read_json(_payload_metadata_path(path))
+        sar = np.load(_payload_file_path(path, _SAR_PAYLOAD_FILENAME), mmap_mode="r")
+        cloudy = np.load(_payload_file_path(path, _CLOUDY_PAYLOAD_FILENAME), mmap_mode="r")
+        target = np.load(_payload_file_path(path, _TARGET_PAYLOAD_FILENAME), mmap_mode="r")
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
+        clear_block_cache_entry(paths, cache_key)
+        raise RuntimeError(
+            f"cached block payload is unreadable for {cache_key}; cache entry was cleared"
+        ) from exc
 
     return MappedBlockPayload(
         sar=sar,
@@ -386,8 +467,10 @@ __all__ = [
     "block_lock_path",
     "block_metadata_path",
     "clear_block_cache_entry",
+    "find_completed_block_row_count",
     "file_lock",
     "freeze_row",
+    "load_completed_block_index",
     "load_block",
     "load_block_metadata",
     "read_json",
@@ -395,5 +478,6 @@ __all__ = [
     "resolve_block_cache_paths",
     "resolve_cache_root",
     "save_block",
+    "write_completed_block_marker",
     "write_json_atomic",
 ]

@@ -32,6 +32,7 @@ from cr_train.data.store import (
     block_data_path,
     block_is_cached,
     block_metadata_path,
+    find_completed_block_row_count,
     load_block,
     load_block_metadata,
     resolve_block_cache_paths,
@@ -173,9 +174,15 @@ def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list
     }
     load_counts: dict[str, int] = defaultdict(int)
 
-    def fake_ensure_source_root(*, dataset_name: str, revision: str | None, cache_root: Path):
+    def fake_ensure_source_root(
+        *,
+        dataset_name: str,
+        revision: str | None,
+        cache_root: Path,
+        startup_callback=None,
+    ):
         assert dataset_name == "unit/test" or dataset_name == "Hermanni/sen12mscr"
-        del revision, cache_root
+        del revision, cache_root, startup_callback
         return source_root, descriptor
 
     def fake_ensure_split_catalog(*, source_root: Path, descriptor: dict[str, object], split: str, startup_callback):
@@ -189,8 +196,9 @@ def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list
         split: str,
         block: dict[str, object],
         progress_callback=None,
+        startup_callback=None,
     ):
-        del dataset_name, revision, split
+        del dataset_name, revision, split, startup_callback
         cache_key = str(block["cache_key"])
         load_counts[cache_key] += 1
         rows = [dict(row) for row in rows_by_key[cache_key]]
@@ -366,6 +374,7 @@ def test_block_payload_round_trip_uses_mmap_layout(tmp_path: Path) -> None:
     first_row = payload[0]
 
     assert payload_path.is_dir()
+    assert find_completed_block_row_count(cache_paths, "block-key") == len(rows)
     assert sorted(path.name for path in payload_path.iterdir()) == ["cloudy.npy", "payload.json", "sar.npy", "target.npy"]
     assert save_result.payload_bytes > 0
     assert len(payload) == 2
@@ -512,7 +521,11 @@ def test_prepare_row_group_stream_activates_internal_row_group_reshard(monkeypat
         "_clone_iterable_dataset",
         lambda dataset, kwargs: FakeDataset(num_shards=dataset.num_shards, kwargs=kwargs),
     )
-    monkeypatch.setattr(source_mod, "_patch_parquet_generate_tables_fn", lambda dataset: patch_calls.append(dataset))
+    monkeypatch.setattr(
+        source_mod,
+        "_patch_parquet_generate_tables_fn",
+        lambda dataset, retry_policy=None: patch_calls.append(dataset),
+    )
 
     dataset = FakeDataset(num_shards=1, kwargs={"files": ["file.parquet"], "row_groups_list": [None]})
     resharded = source_mod._prepare_row_group_stream(dataset)
@@ -668,6 +681,271 @@ def test_load_block_rows_rejects_oversized_shard(monkeypatch) -> None:
     assert "row_groups=[2]" in message
 
 
+def test_load_source_descriptor_retries_retryable_builder_failures(monkeypatch) -> None:
+    import cr_train.data.source as source_mod
+
+    class FakeSplitInfo:
+        def __init__(self, num_examples: int) -> None:
+            self.num_examples = num_examples
+
+    class FakeBuilder:
+        info = SimpleNamespace(splits={"train": FakeSplitInfo(128), "validation": FakeSplitInfo(64)})
+
+    startup_events: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
+    call_count = 0
+
+    def fake_load_dataset_builder(dataset_name: str, revision: str | None, download_config=None):
+        nonlocal call_count
+        assert dataset_name == "unit/retry-builder"
+        assert revision is None
+        assert download_config is not None
+        call_count += 1
+        if call_count < 3:
+            raise ConnectionError("Server Disconnected")
+        return FakeBuilder()
+
+    monkeypatch.setattr(source_mod, "load_dataset_builder", fake_load_dataset_builder)
+    monkeypatch.setattr(source_mod.random, "uniform", lambda _lo, _hi: 0.0)
+    monkeypatch.setattr(source_mod.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    descriptor = source_mod.load_source_descriptor(
+        "unit/retry-builder",
+        None,
+        startup_callback=startup_events.append,
+    )
+
+    retry_events = [event for event in startup_events if event["stage"] == "remote retry"]
+    assert descriptor["split_sizes"] == {"train": 128, "validation": 64}
+    assert call_count == 3
+    assert len(retry_events) == 2
+    assert [event["attempt"] for event in retry_events] == [1, 2]
+    assert all(event["operation"] == "load source descriptor" for event in retry_events)
+    assert sleep_calls == [2.0, 4.0]
+
+
+def test_load_row_group_stream_retries_retryable_bootstrap_failures(monkeypatch) -> None:
+    import cr_train.data.source as source_mod
+
+    class FakeStream:
+        num_shards = 2
+
+        def __init__(self) -> None:
+            self._ex_iterable = SimpleNamespace(kwargs={"files": ["a"], "row_groups_list": [(0,)]})
+
+    startup_events: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
+    call_count = 0
+
+    def fake_load_dataset(dataset_name: str, revision: str | None, split: str, streaming: bool, columns, download_config=None):
+        nonlocal call_count
+        assert dataset_name == "unit/retry-stream"
+        assert revision is None
+        assert split == "train"
+        assert streaming is True
+        assert download_config is not None
+        call_count += 1
+        if call_count < 3:
+            raise ConnectionError("Server Disconnected")
+        return FakeStream()
+
+    monkeypatch.setattr(source_mod, "ensure_supported_datasets_version", lambda: None)
+    monkeypatch.setattr(source_mod, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(source_mod.random, "uniform", lambda _lo, _hi: 0.0)
+    monkeypatch.setattr(source_mod.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(source_mod, "_prepare_row_group_stream", lambda dataset, retry_policy=None: dataset)
+
+    stream = source_mod.load_row_group_stream(
+        dataset_name="unit/retry-stream",
+        revision=None,
+        split="train",
+        startup_callback=startup_events.append,
+    )
+
+    retry_events = [event for event in startup_events if event["stage"] == "remote retry"]
+    assert isinstance(stream, FakeStream)
+    assert call_count == 3
+    assert len(retry_events) == 2
+    assert [event["attempt"] for event in retry_events] == [1, 2]
+    assert all(event["operation"] == "load row-group stream" for event in retry_events)
+    assert sleep_calls == [2.0, 4.0]
+
+
+def test_load_block_rows_retries_retryable_read_failures_and_resets_template_cache(monkeypatch) -> None:
+    import cr_train.data.source as source_mod
+
+    class FailingShardDataset:
+        def take(self, count: int):
+            del count
+            raise ConnectionError("Server Disconnected")
+
+    class SuccessShardDataset:
+        def __init__(self, rows: list[dict[str, object]]) -> None:
+            self.rows = rows
+
+        def take(self, count: int):
+            return list(self.rows[:count])
+
+    class StaleTemplate:
+        num_shards = 1
+
+        def shard(self, *, num_shards: int, index: int, contiguous: bool):
+            assert num_shards == 1
+            assert index == 0
+            assert contiguous is True
+            return FailingShardDataset()
+
+    class FreshTemplate:
+        num_shards = 1
+
+        def __init__(self, rows: list[dict[str, object]]) -> None:
+            self.rows = rows
+            self._ex_iterable = SimpleNamespace(kwargs={"files": ["f"], "row_groups_list": [(0,)]})
+
+        def shard(self, *, num_shards: int, index: int, contiguous: bool):
+            assert num_shards == 1
+            assert index == 0
+            assert contiguous is True
+            return SuccessShardDataset(self.rows)
+
+    startup_events: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
+    rows = [_make_stream_row(index) for index in range(BLOCK_SIZE)]
+    fresh_template = FreshTemplate(rows)
+    cache_key = ("unit/retry-block", None, "train")
+    source_mod._stream_template_cache[cache_key] = StaleTemplate()
+    load_dataset_calls = 0
+
+    def fake_load_dataset(dataset_name: str, revision: str | None, split: str, streaming: bool, columns, download_config=None):
+        nonlocal load_dataset_calls
+        assert dataset_name == "unit/retry-block"
+        assert revision is None
+        assert split == "train"
+        assert streaming is True
+        assert download_config is not None
+        load_dataset_calls += 1
+        return fresh_template
+
+    monkeypatch.setattr(source_mod, "ensure_supported_datasets_version", lambda: None)
+    monkeypatch.setattr(source_mod, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(source_mod.random, "uniform", lambda _lo, _hi: 0.0)
+    monkeypatch.setattr(source_mod.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(source_mod, "_prepare_row_group_stream", lambda dataset, retry_policy=None: dataset)
+
+    loaded_rows = source_mod.load_block_rows(
+        dataset_name="unit/retry-block",
+        revision=None,
+        split="train",
+        block={
+            "index": 0,
+            "shard_index": 0,
+            "cache_key": "retry-block",
+            "source_file": "hf://datasets/unit/retry-block/train/0000.parquet",
+            "row_groups": [0],
+        },
+        startup_callback=startup_events.append,
+    )
+
+    retry_events = [event for event in startup_events if event["stage"] == "remote retry"]
+    assert len(loaded_rows) == BLOCK_SIZE
+    assert load_dataset_calls == 1
+    assert len(retry_events) == 1
+    assert retry_events[0]["operation"] == "load block rows"
+    assert retry_events[0]["cache_key"] == "retry-block"
+    assert sleep_calls == [2.0]
+    assert source_mod._stream_template_cache[cache_key] is fresh_template
+
+
+def test_load_block_rows_does_not_retry_non_retryable_empty_shard(monkeypatch) -> None:
+    import cr_train.data.source as source_mod
+
+    class EmptyShardDataset:
+        def take(self, count: int):
+            return []
+
+    class FakeTemplate:
+        num_shards = 1
+
+        def shard(self, *, num_shards: int, index: int, contiguous: bool):
+            assert num_shards == 1
+            assert index == 0
+            assert contiguous is True
+            return EmptyShardDataset()
+
+    startup_events: list[dict[str, object]] = []
+    call_count = 0
+
+    def fake_load_row_group_stream(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        return FakeTemplate()
+
+    monkeypatch.setattr(source_mod, "load_row_group_stream", fake_load_row_group_stream)
+
+    with pytest.raises(RuntimeError, match="empty row-group shard"):
+        source_mod.load_block_rows(
+            dataset_name="unit/nonretry",
+            revision=None,
+            split="train",
+            block={
+                "index": 0,
+                "shard_index": 0,
+                "cache_key": "empty-block",
+                "source_file": "hf://datasets/unit/nonretry/train/0000.parquet",
+                "row_groups": [0],
+            },
+            startup_callback=startup_events.append,
+        )
+
+    assert call_count == 1
+    assert startup_events == []
+
+
+def test_load_block_rows_wraps_exhausted_retryable_errors(monkeypatch) -> None:
+    import cr_train.data.source as source_mod
+
+    class FailingShardDataset:
+        def take(self, count: int):
+            del count
+            raise ConnectionError("Server Disconnected")
+
+    class FakeTemplate:
+        num_shards = 1
+
+        def shard(self, *, num_shards: int, index: int, contiguous: bool):
+            assert num_shards == 1
+            assert index == 0
+            assert contiguous is True
+            return FailingShardDataset()
+
+    startup_events: list[dict[str, object]] = []
+    sleep_calls: list[float] = []
+
+    monkeypatch.setattr(source_mod, "load_row_group_stream", lambda **kwargs: FakeTemplate())
+    monkeypatch.setattr(source_mod.random, "uniform", lambda _lo, _hi: 0.0)
+    monkeypatch.setattr(source_mod.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    with pytest.raises(RuntimeError, match="failed after 5 attempts"):
+        source_mod.load_block_rows(
+            dataset_name="unit/retry-fail",
+            revision=None,
+            split="train",
+            block={
+                "index": 0,
+                "shard_index": 0,
+                "cache_key": "always-fail",
+                "source_file": "hf://datasets/unit/retry-fail/train/0000.parquet",
+                "row_groups": [0],
+            },
+            startup_callback=startup_events.append,
+        )
+
+    retry_events = [event for event in startup_events if event["stage"] == "remote retry"]
+    assert len(retry_events) == 4
+    assert sleep_calls == [2.0, 4.0, 8.0, 16.0]
+    assert retry_events[-1]["attempt"] == 4
+
+
 def test_build_catalog_records_shard_index(monkeypatch, parquet_row_group_path: Path) -> None:
     import cr_train.data.source as source_mod
 
@@ -779,6 +1057,8 @@ def test_ensure_split_cache_refills_stale_block_cache(
 
     assert metadata is not None
     assert patched["load_counts"][cache_key] == 1
+    marker_path = cache_paths.completed_root / f"{cache_key}.{int(metadata['row_count'])}.ok"
+    marker_path.unlink()
 
     stale_metadata = dict(metadata)
     mutate_metadata(stale_metadata)
@@ -803,7 +1083,42 @@ def test_ensure_split_cache_refills_stale_block_cache(
     assert 0 < int(refilled_metadata["row_count"]) <= BLOCK_SIZE
 
 
-def test_ensure_split_cache_refills_missing_payload_file(monkeypatch, tmp_path: Path) -> None:
+def test_ensure_split_cache_backfills_completed_marker_from_legacy_metadata(monkeypatch, tmp_path: Path) -> None:
+    split_blocks = {"train": _make_block_splits(1)}
+    patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
+    block = patched["catalogs"]["train"]["blocks"][0]
+    cache_key = str(block["cache_key"])
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=BLOCK_SIZE,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    cache_paths = resolve_block_cache_paths(patched["source_root"], "train")
+    metadata = load_block_metadata(cache_paths, cache_key)
+    assert metadata is not None
+    marker_path = cache_paths.completed_root / f"{cache_key}.{int(metadata['row_count'])}.ok"
+    marker_path.unlink()
+    patched["load_counts"][cache_key] = 0
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=BLOCK_SIZE,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    assert patched["load_counts"][cache_key] == 0
+    assert find_completed_block_row_count(cache_paths, cache_key) == int(metadata["row_count"])
+
+
+def test_broken_payload_clears_completed_marker_and_next_warmup_refills(monkeypatch, tmp_path: Path) -> None:
     split_blocks = {"train": _make_block_splits(1)}
     patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
     block = patched["catalogs"]["train"]["blocks"][0]
@@ -831,8 +1146,85 @@ def test_ensure_split_cache_refills_missing_payload_file(monkeypatch, tmp_path: 
         cache_root=tmp_path,
     )
 
+    assert patched["load_counts"][cache_key] == 1
+    assert find_completed_block_row_count(cache_paths, cache_key) == BLOCK_SIZE
+
+    with pytest.raises(RuntimeError, match=cache_key):
+        load_block(cache_paths, cache_key)
+
+    assert block_is_cached(cache_paths, cache_key) is False
+    assert find_completed_block_row_count(cache_paths, cache_key) is None
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=BLOCK_SIZE,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
     assert patched["load_counts"][cache_key] == 2
     assert block_is_cached(cache_paths, cache_key) is True
+
+
+def test_marker_backed_cache_hit_skips_metadata_revalidation(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.runtime as runtime_mod
+
+    split_blocks = {"train": _make_block_splits(2)}
+    patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=2 * BLOCK_SIZE,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "load_block_metadata",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("metadata reload should not run")),
+    )
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=2 * BLOCK_SIZE,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+
+def test_resolve_prepared_split_state_uses_completed_markers(monkeypatch, tmp_path: Path) -> None:
+    split_blocks = {"train": _make_block_splits(2)}
+    patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=2 * BLOCK_SIZE,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    state = resolve_prepared_split_state(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=2 * BLOCK_SIZE,
+        seed=7,
+        cache_root=tmp_path,
+    )
+
+    assert state.required_blocks == 2
+    assert len(state.row_counts_by_key) == 2
+    assert sum(state.row_counts_by_key.values()) == 2 * BLOCK_SIZE
+    assert set(state.row_counts_by_key.values()) == {BLOCK_SIZE}
 
 
 def test_prepare_split_reads_cached_blocks_in_selected_order(monkeypatch, tmp_path: Path) -> None:
