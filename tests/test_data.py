@@ -130,6 +130,21 @@ def _make_block_splits(block_count: int) -> list[list[dict[str, object]]]:
     return blocks
 
 
+def _make_scene_block_splits(scene_names: list[str]) -> list[list[dict[str, object]]]:
+    blocks: list[list[dict[str, object]]] = []
+    current_index = 0
+    for scene_name in scene_names:
+        block_rows: list[dict[str, object]] = []
+        for offset in range(BLOCK_SIZE):
+            row = _make_row(current_index + offset)
+            row["scene"] = scene_name
+            row["patch"] = f"{scene_name}-p{offset:03d}"
+            block_rows.append(row)
+        blocks.append(block_rows)
+        current_index += BLOCK_SIZE
+    return blocks
+
+
 def _catalog(split: str, blocks: list[list[dict[str, object]]]) -> tuple[dict[str, object], dict[str, list[dict[str, object]]]]:
     rows_by_key: dict[str, list[dict[str, object]]] = {}
     block_entries = []
@@ -1726,6 +1741,105 @@ def test_prepare_split_training_order_changes_by_epoch(monkeypatch, tmp_path: Pa
 
     assert scenes_epoch0 != scenes_epoch1
     assert set(scenes_epoch0) == set(scenes_epoch1)
+
+
+def test_prepare_split_training_order_is_reproducible_for_same_seed_and_epoch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    split_blocks = {
+        "train": _make_scene_block_splits(["scene-134", "scene-055", "scene-200", "scene-201"]),
+        "validation": _make_block_splits(2),
+        "test": _make_block_splits(2),
+    }
+    _patch_split_cache(monkeypatch, tmp_path, split_blocks)
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=4 * BLOCK_SIZE,
+        seed=9,
+        cache_root=tmp_path,
+    )
+    state = resolve_prepared_split_state(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=4 * BLOCK_SIZE,
+        seed=9,
+        cache_root=tmp_path,
+    )
+
+    prepared_a = prepare_split_from_state(state, epoch=0, training=True)
+    prepared_b = prepare_split_from_state(state, epoch=0, training=True)
+    loader_a = build_dataloader(
+        prepared_a,
+        batch_size=8,
+        num_workers=0,
+        training=True,
+        seed=9,
+        epoch=0,
+    )
+    loader_b = build_dataloader(
+        prepared_b,
+        batch_size=8,
+        num_workers=0,
+        training=True,
+        seed=9,
+        epoch=0,
+    )
+
+    scenes_a = [scene for batch in loader_a for scene in batch["meta"]["scene"]]
+    scenes_b = [scene for batch in loader_b for scene in batch["meta"]["scene"]]
+
+    assert scenes_a == scenes_b
+
+
+def test_prepare_split_training_mixes_samples_across_scene_local_blocks(
+    monkeypatch, tmp_path: Path
+) -> None:
+    split_blocks = {
+        "train": _make_scene_block_splits(["scene-134", "scene-055", "scene-200", "scene-201"]),
+        "validation": _make_block_splits(2),
+        "test": _make_block_splits(2),
+    }
+    _patch_split_cache(monkeypatch, tmp_path, split_blocks)
+
+    ensure_split_cache(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=4 * BLOCK_SIZE,
+        seed=9,
+        cache_root=tmp_path,
+    )
+    prepared = prepare_split(
+        split="train",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=4 * BLOCK_SIZE,
+        seed=9,
+        epoch=0,
+        training=True,
+        cache_root=tmp_path,
+    )
+    loader = build_dataloader(
+        prepared,
+        batch_size=8,
+        num_workers=0,
+        training=True,
+        seed=9,
+        epoch=0,
+    )
+
+    first_scenes: list[str] = []
+    for batch in loader:
+        first_scenes.extend(batch["meta"]["scene"])
+        if len(first_scenes) >= 8:
+            break
+
+    assert len(first_scenes) == 8
+    assert len(set(first_scenes)) == 4
 
 
 def test_build_dataloader_defaults_to_non_persistent_workers(monkeypatch) -> None:

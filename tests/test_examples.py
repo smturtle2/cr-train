@@ -20,6 +20,7 @@ def test_training_example_loads_without_running_main() -> None:
     assert namespace["parse_max_samples"]("128") == 128
     assert namespace["parse_non_negative_int"]("0") == 0
     assert namespace["parse_positive_int"]("4") == 4
+    assert namespace["parse_positive_float"]("0.5") == 0.5
 
 
 def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -> None:
@@ -45,6 +46,8 @@ def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -
             "2",
             "--min-lr-scale",
             "0.2",
+            "--grad-clip-norm",
+            "0.75",
         ],
     )
     args = namespace["parse_args"]()
@@ -57,6 +60,7 @@ def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -
     assert args.scheduler_timing == "before_optimizer_step"
     assert args.warmup_epochs == 2
     assert args.min_lr_scale == 0.2
+    assert args.grad_clip_norm == 0.75
 
 
 def test_training_example_builds_custom_scheduler() -> None:
@@ -122,6 +126,8 @@ def test_training_example_main_forwards_scheduler_timing(monkeypatch, tmp_path: 
             str(tmp_path / "run"),
             "--scheduler-timing",
             "after_optimizer_step",
+            "--grad-clip-norm",
+            "1.25",
         ],
     )
     main = namespace["main"]
@@ -130,6 +136,7 @@ def test_training_example_main_forwards_scheduler_timing(monkeypatch, tmp_path: 
     main()
 
     assert trainer_kwargs["scheduler_timing"] == "after_optimizer_step"
+    assert trainer_kwargs["grad_clip_norm"] == 1.25
 
 
 def test_bitmask_demo_example_loads_without_running_main() -> None:

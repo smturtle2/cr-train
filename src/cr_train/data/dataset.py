@@ -18,6 +18,8 @@ from .runtime import get_rank, get_world_size
 from .source import ensure_source_root, ensure_split_catalog, run_startup_stage
 from .store import BlockCachePaths, as_bytes, load_block, load_completed_block_index, resolve_block_cache_paths
 
+_TRAIN_ACTIVE_BLOCK_COUNT = 8
+
 
 @dataclass(slots=True)
 class PreparedSplit:
@@ -51,6 +53,22 @@ class _SpatialTransformParams:
     flip_vertical: bool = False
     flip_horizontal: bool = False
     rot90_k: int = 0
+
+
+@dataclass(slots=True, eq=False)
+class _ActiveBlockCursor:
+    rows: Any
+    indices: list[int]
+    next_index: int = 0
+
+    def pop(self) -> dict[str, Any]:
+        row = self.rows[self.indices[self.next_index]]
+        self.next_index += 1
+        return row
+
+    @property
+    def exhausted(self) -> bool:
+        return self.next_index >= len(self.indices)
 
 
 @dataclass(slots=True)
@@ -218,6 +236,11 @@ def _derive_block_seed(seed: int, *, split: str, epoch: int, cache_key: str) -> 
     return int(seed) ^ int.from_bytes(digest[:8], "big")
 
 
+def _derive_worker_seed(seed: int, *, split: str, epoch: int, worker_id: int) -> int:
+    digest = hashlib.sha256(f"{split}:{epoch}:worker:{worker_id}".encode("utf-8")).digest()
+    return int(seed) ^ int.from_bytes(digest[:8], "big")
+
+
 def _shuffle_blocks(
     blocks: list[dict[str, Any]],
     *,
@@ -265,22 +288,78 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
         self.split = split
         self.training = training
 
+    def _load_active_block(self, *, block: dict[str, Any]) -> _ActiveBlockCursor:
+        cache_key = str(block["cache_key"])
+        rows = load_block(self.cache_paths, cache_key)
+        indices = list(range(len(rows)))
+        if len(indices) > 1:
+            row_rng = random.Random(
+                _derive_block_seed(
+                    self.seed,
+                    split=self.split,
+                    epoch=self.epoch,
+                    cache_key=cache_key,
+                )
+            )
+            row_rng.shuffle(indices)
+        return _ActiveBlockCursor(rows=rows, indices=indices)
+
+    def _iter_training_rows(self, *, blocks: list[dict[str, Any]], worker_id: int):
+        if not blocks:
+            return
+
+        mix_rng = random.Random(
+            _derive_worker_seed(
+                self.seed,
+                split=self.split,
+                epoch=self.epoch,
+                worker_id=worker_id,
+            )
+        )
+        active_blocks: list[_ActiveBlockCursor] = []
+        round_robin: list[_ActiveBlockCursor] = []
+        next_block_index = 0
+
+        def refill_active_blocks() -> None:
+            nonlocal next_block_index
+            while (
+                len(active_blocks) < _TRAIN_ACTIVE_BLOCK_COUNT
+                and next_block_index < len(blocks)
+            ):
+                active_blocks.append(
+                    self._load_active_block(block=blocks[next_block_index])
+                )
+                next_block_index += 1
+
+        refill_active_blocks()
+        while active_blocks:
+            if not round_robin:
+                round_robin = list(active_blocks)
+                mix_rng.shuffle(round_robin)
+
+            current_block = round_robin.pop()
+            yield current_block.pop()
+
+            if current_block.exhausted:
+                active_blocks.remove(current_block)
+                round_robin = [
+                    candidate for candidate in round_robin if candidate is not current_block
+                ]
+                refill_active_blocks()
+
     def __iter__(self):
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         worker_count = worker_info.num_workers if worker_info is not None else 1
         blocks = [block for index, block in enumerate(self.blocks) if index % worker_count == worker_id]
 
+        if self.training:
+            yield from self._iter_training_rows(blocks=blocks, worker_id=worker_id)
+            return
+
         for block in blocks:
             cache_key = str(block["cache_key"])
             rows = load_block(self.cache_paths, cache_key)
-            if self.training and len(rows) > 1:
-                indices = list(range(len(rows)))
-                rng = random.Random(_derive_block_seed(self.seed, split=self.split, epoch=self.epoch, cache_key=cache_key))
-                rng.shuffle(indices)
-                for index in indices:
-                    yield rows[index]
-                continue
             yield from rows
 
 

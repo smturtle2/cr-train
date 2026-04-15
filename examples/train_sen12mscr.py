@@ -9,6 +9,7 @@ Usage:
       --max-val-samples 256 \\
       --batch-size 4 \\
       --accum-steps 4 \\
+      --grad-clip-norm 1.0 \\
       --epochs 2 \\
       --scheduler warmup-cosine \\
       --scheduler-timing after_validation \\
@@ -135,6 +136,20 @@ def parse_positive_int(value: str) -> int:
     return parsed
 
 
+def parse_positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def parse_optional_positive_float(value: str) -> float | None:
+    lowered = value.strip().lower()
+    if lowered in {"none", "off"}:
+        return None
+    return parse_positive_float(value)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run SEN12MS-CR training with Trainer.",
@@ -174,6 +189,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=parse_optional_positive_float,
+        default=1.0,
+        help="Max grad norm applied before each optimizer update, or 'none'/'off' to disable.",
+    )
     parser.add_argument("--output-dir", default="runs/sen12mscr-example")
     parser.add_argument("--cache-dir", default="/dhdd/.cache/cr-train")
     parser.add_argument("--device", default=None)
@@ -298,6 +319,7 @@ def main() -> None:
         train_crop_size=args.train_crop_size,
         train_random_flip=args.train_random_flip,
         train_random_rot90=args.train_random_rot90,
+        grad_clip_norm=args.grad_clip_norm,
     )
 
     # Training loop — Trainer prints epoch summaries automatically

@@ -134,6 +134,7 @@ uv run python examples/train_sen12mscr.py \
   --max-test-samples 256 \
   --batch-size 4 \
   --accum-steps 4 \
+  --grad-clip-norm 1.0 \
   --epochs 2 \
   --scheduler warmup-cosine \
   --scheduler-timing after_validation \
@@ -147,6 +148,8 @@ uv run python examples/train_sen12mscr.py \
 Pass `--max-train-samples none` (or `full`) to bypass sampling, warm every row-group block, and train on the entire split.
 After a full split is completely warmed once, later runs reuse the cached source metadata and split catalog without contacting HF again unless the local cache becomes incomplete.
 Use `--accum-steps N` to accumulate gradients across `N` micro-batches before each optimizer update; `global_step` in `get_state()` and checkpoints counts optimizer updates, not micro-batches.
+Train batches use a deterministic sample-mixed order across active cached blocks, while validation and test keep the selected block order.
+Pass `--grad-clip-norm VALUE` to clip gradients before each optimizer update. Non-finite train losses and gradients fail fast before `optimizer.step()`.
 The bundled script uses a custom `WarmupCosineScheduler` subclass by default to show the public scheduler API end-to-end; pass `--scheduler none` to disable it.
 Use `--scheduler-timing after_validation|before_optimizer_step|after_optimizer_step` to control when `Trainer` calls `scheduler.step()`. The bundled warmup-cosine example stays on the default epoch-based `after_validation` timing.
 The training augmentations apply only to the train split; validation and test stay at the original `256x256`.
@@ -172,7 +175,7 @@ Most users only need `from cr_train import Trainer`. Once you construct it, `Tra
 
 - resolves dataset metadata and local cache state
 - warms only the splits needed for the current call
-- builds iterable dataloaders and rank-aware block partitioning
+- builds iterable dataloaders, rank-aware block partitioning, and sample-mixed train order
 - writes `metrics.jsonl`
 - shows running-average loss and metrics with batch-level tqdm during training, then prints aligned train/validation summary lines with per-split elapsed time
 - appends metrics to `metrics.jsonl` in the output directory (one JSON object per line)
@@ -201,7 +204,7 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `batch_size` | `int` | `4` | Batch size for all DataLoaders. |
 | `accum_steps` | `int` | `1` | Number of micro-batches to accumulate before each optimizer update. `global_step` counts these optimizer updates, not individual micro-batches. |
 | `epochs` | `int` | `1` | Total training epochs. Call `step()` once per epoch. |
-| `seed` | `int` | `42` | Seed controlling deterministic block selection and epoch-wise block/row shuffle order. |
+| `seed` | `int` | `42` | Seed controlling deterministic block selection and epoch-wise train sample order. |
 | `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and the default `save_checkpoint()` / `save_weights()` output files. |
 | `cache_dir` | `str \| Path \| None` | `None` | Block cache root. `None` = `~/.cache/cr-train`. |
 | `num_workers` | `int \| "auto"` | `"auto"` | DataLoader worker count. `"auto"` resolves to `min(4, max(1, os.cpu_count() // 4))`. |
@@ -209,6 +212,7 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `train_crop_size` | `int \| None` | `128` | Apply random square crops of this size to train batches before they leave the collate step. |
 | `train_random_flip` | `bool` | `True` | Apply independent random vertical/horizontal flips to train batches. |
 | `train_random_rot90` | `bool` | `True` | Apply random `0/90/180/270` degree rotations to train batches. |
+| `grad_clip_norm` | `float \| None` | `None` | Optional max grad norm applied before each optimizer update. Non-finite train losses and gradients always fail fast before stepping. |
 
 ### `Trainer.step() -> dict`
 
@@ -317,7 +321,7 @@ See [`examples/bitmask_sampling_demo.py`](examples/bitmask_sampling_demo.py) for
 
 ## Architecture
 
-`Trainer` reads the dataset through HuggingFace streaming, keeps a reusable local block cache keyed by row group, and records startup events in `metrics.jsonl`. Partial requests use deterministic uniform exact-k logical block selection keyed by `seed`, while full-split requests bypass sampling and select every row-group block in order. Training block and row order still change by epoch through `seed + epoch_index`.
+`Trainer` reads the dataset through HuggingFace streaming, keeps a reusable local block cache keyed by row group, and records startup events in `metrics.jsonl`. Partial requests use deterministic uniform exact-k logical block selection keyed by `seed`, while full-split requests bypass sampling and select every row-group block in order. Training sample order still changes by epoch through `seed + epoch_index`, but samples are mixed across active cached blocks instead of draining one block at a time.
 
 During warmup, `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing blocks are fetched from HuggingFace only when the selected row-group blocks are not already cached locally.
 

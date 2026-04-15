@@ -87,7 +87,7 @@ class _ResolvedSchedulerConfig:
 class Trainer:
     """SEN12MS-CR trainer.
 
-    `seed` fixes the deterministic logical row order and drives logical block selection.
+    `seed` fixes deterministic logical block selection and epoch-wise train sample order.
     """
 
     def __init__(
@@ -114,6 +114,7 @@ class Trainer:
         train_crop_size: int | None = 128,
         train_random_flip: bool = True,
         train_random_rot90: bool = True,
+        grad_clip_norm: float | None = 1.0,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
@@ -131,6 +132,8 @@ class Trainer:
             raise ValueError("epochs must be greater than zero")
         if train_crop_size is not None and train_crop_size <= 0:
             raise ValueError("train_crop_size must be greater than zero when provided")
+        if grad_clip_norm is not None and grad_clip_norm <= 0:
+            raise ValueError("grad_clip_norm must be greater than zero when provided")
 
         self._validate_max_samples("max_train_samples", max_train_samples)
         self._validate_max_samples("max_val_samples", max_val_samples)
@@ -167,6 +170,7 @@ class Trainer:
         self.train_crop_size = train_crop_size
         self.train_random_flip = bool(train_random_flip)
         self.train_random_rot90 = bool(train_random_rot90)
+        self.grad_clip_norm = grad_clip_norm
 
         self.num_workers = resolve_num_workers(num_workers)
         self.output_dir = Path(output_dir)
@@ -620,6 +624,7 @@ class Trainer:
                 "train_crop_size": self.train_crop_size,
                 "train_random_flip": self.train_random_flip,
                 "train_random_rot90": self.train_random_rot90,
+                "grad_clip_norm": self.grad_clip_norm,
             }
         )
         tqdm.write(
@@ -638,6 +643,7 @@ class Trainer:
                 scheduler_name=self._scheduler_name(),
                 scheduler_timing=self.scheduler_timing,
                 scheduler_monitor=self.scheduler_monitor,
+                grad_clip_norm=self.grad_clip_norm,
             )
         )
 
@@ -777,6 +783,103 @@ class Trainer:
             return nullcontext()
         return self.model.no_sync()
 
+    @staticmethod
+    def _format_batch_meta_preview(batch: Mapping[str, Any]) -> str | None:
+        meta = batch.get("meta")
+        if not isinstance(meta, Mapping):
+            return None
+
+        preview_parts: list[str] = []
+        for field in ("scene", "patch"):
+            values = meta.get(field)
+            if isinstance(values, (list, tuple)):
+                rendered = [str(value) for value in values[:3]]
+                if len(values) > 3:
+                    rendered.append("...")
+                preview_parts.append(f"{field}=[{', '.join(rendered)}]")
+                continue
+            if values is not None:
+                preview_parts.append(f"{field}={values}")
+
+        if not preview_parts:
+            return None
+        return " ".join(preview_parts)
+
+    def _training_failure_context(
+        self,
+        *,
+        epoch_index: int,
+        batch_index: int,
+        batch: Mapping[str, Any],
+    ) -> str:
+        parts = [
+            f"epoch={epoch_index + 1}",
+            f"batch_index={batch_index}",
+            f"global_step={self.global_step}",
+        ]
+        meta_preview = self._format_batch_meta_preview(batch)
+        if meta_preview is not None:
+            parts.append(meta_preview)
+        return ", ".join(parts)
+
+    def _assert_finite_loss(
+        self,
+        *,
+        loss: torch.Tensor,
+        epoch_index: int,
+        batch_index: int,
+        batch: Mapping[str, Any],
+    ) -> None:
+        if bool(torch.isfinite(loss.detach()).all()):
+            return
+
+        context = self._training_failure_context(
+            epoch_index=epoch_index,
+            batch_index=batch_index,
+            batch=batch,
+        )
+        raise FloatingPointError(
+            f"non-finite training loss before backward: loss={float(loss.detach().cpu().item())}, {context}"
+        )
+
+    def _assert_finite_gradients(
+        self,
+        *,
+        epoch_index: int,
+        batch_index: int,
+        batch: Mapping[str, Any],
+    ) -> None:
+        bad_parameters: list[str] = []
+        for name, parameter in self._model_state_owner().named_parameters():
+            grad = parameter.grad
+            if grad is None or bool(torch.isfinite(grad).all()):
+                continue
+            bad_parameters.append(name)
+            if len(bad_parameters) >= 3:
+                break
+
+        if not bad_parameters:
+            return
+
+        context = self._training_failure_context(
+            epoch_index=epoch_index,
+            batch_index=batch_index,
+            batch=batch,
+        )
+        raise FloatingPointError(
+            "non-finite gradients before optimizer.step: "
+            f"parameters={', '.join(bad_parameters)}, {context}"
+        )
+
+    def _apply_gradient_clipping(self) -> None:
+        if self.grad_clip_norm is None:
+            return
+        torch.nn.utils.clip_grad_norm_(
+            self._model_state_owner().parameters(),
+            max_norm=self.grad_clip_norm,
+            error_if_nonfinite=True,
+        )
+
     def _run_optimizer_update(
         self,
         *,
@@ -835,9 +938,21 @@ class Trainer:
                 with self._gradient_sync_context(sync_gradients=sync_gradients):
                     model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
                     loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
+                    self._assert_finite_loss(
+                        loss=loss,
+                        epoch_index=epoch_index,
+                        batch_index=batch_index,
+                        batch=moved_batch,
+                    )
                     (loss / accum_window_size).backward()
 
                 if sync_gradients:
+                    self._assert_finite_gradients(
+                        epoch_index=epoch_index,
+                        batch_index=batch_index,
+                        batch=moved_batch,
+                    )
+                    self._apply_gradient_clipping()
                     first_update_lrs = self._run_optimizer_update(
                         first_update_lrs=first_update_lrs
                     )

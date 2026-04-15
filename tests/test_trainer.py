@@ -345,7 +345,10 @@ def _make_training_batch(indices: list[int]) -> dict[str, torch.Tensor]:
         "sar": sar,
         "cloudy": cloudy,
         "target": target,
-        "meta": {"scene": [f"scene-{index}" for index in indices]},
+        "meta": {
+            "scene": [f"scene-{index}" for index in indices],
+            "patch": [f"patch-{index:03d}" for index in indices],
+        },
     }
 
 
@@ -744,6 +747,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert config_record["train_crop_size"] == 128
     assert config_record["train_random_flip"] is True
     assert config_record["train_random_rot90"] is True
+    assert config_record["grad_clip_norm"] is None
     assert warmup_splits_after_step == {"train", "validation", "test"}
     assert "warm split cache" in startup_stages
     assert "load local cache" in startup_stages
@@ -980,8 +984,46 @@ def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(
     assert config_record["scheduler"] == "CountingStepLR"
     assert config_record["scheduler_timing"] == "after_validation"
     assert config_record["scheduler_monitor"] is None
+    assert config_record["grad_clip_norm"] is None
     assert any("scheduler CountingStepLR" in message for message in FakeTqdm.writes)
     assert any("timing after_validation" in message for message in FakeTqdm.writes)
+
+
+def test_trainer_records_grad_clip_norm_in_config_and_banner(
+    monkeypatch, tmp_path: Path
+) -> None:
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+    _patch_epoch_execution(
+        monkeypatch,
+        train_summaries=[_make_train_summary()],
+        validation_summaries=[_make_eval_summary(loss=0.1)],
+    )
+
+    output_dir = tmp_path / "run"
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        epochs=1,
+        grad_clip_norm=0.75,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer.step()
+
+    metrics_records = [
+        json.loads(line)
+        for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    config_record = next(record for record in metrics_records if record["kind"] == "config")
+
+    assert config_record["grad_clip_norm"] == 0.75
+    assert any("clip 0.7500" in message for message in FakeTqdm.writes)
 
 
 def test_trainer_steps_scheduler_before_optimizer_step_once_per_update(
@@ -1294,6 +1336,137 @@ def test_trainer_accumulated_updates_match_equivalent_larger_batches(
     assert accumulated_summary["num_batches"] == 4
     assert baseline_trainer.global_step == 2
     assert accumulated_trainer.global_step == 2
+
+
+def test_trainer_raises_on_non_finite_loss_before_optimizer_step(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+        ],
+    )
+
+    def nan_loss(prediction: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        del batch
+        return prediction.new_tensor(float("nan"))
+
+    model = TinyModel()
+    optimizer = CountingSGD(model.parameters(), lr=1e-3)
+    trainer = Trainer(
+        model,
+        optimizer,
+        nan_loss,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    with pytest.raises(FloatingPointError, match="non-finite training loss before backward") as exc_info:
+        trainer._run_training_epoch(0)
+
+    message = str(exc_info.value)
+    assert "scene=[scene-0, scene-1]" in message
+    assert "patch=[patch-000, patch-001]" in message
+    assert optimizer.step_calls == 0
+    assert trainer.global_step == 0
+
+
+def test_trainer_raises_on_non_finite_gradients_before_optimizer_step(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+        ],
+    )
+
+    model = TinyModel()
+    hook = model.body.weight.register_hook(lambda grad: torch.full_like(grad, float("nan")))
+    optimizer = CountingSGD(model.parameters(), lr=1e-3)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    with pytest.raises(FloatingPointError, match="non-finite gradients before optimizer.step") as exc_info:
+        trainer._run_training_epoch(0)
+
+    hook.remove()
+    message = str(exc_info.value)
+    assert "parameters=body.weight" in message
+    assert optimizer.step_calls == 0
+    assert trainer.global_step == 0
+
+
+def test_trainer_clips_gradients_once_per_optimizer_update(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+            _make_training_batch([6, 7]),
+        ],
+    )
+
+    clip_calls: list[dict[str, object]] = []
+
+    def fake_clip_grad_norm_(parameters, max_norm, error_if_nonfinite):
+        clip_calls.append(
+            {
+                "parameter_count": len(list(parameters)),
+                "max_norm": max_norm,
+                "error_if_nonfinite": error_if_nonfinite,
+            }
+        )
+        return torch.tensor(0.5)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", fake_clip_grad_norm_)
+
+    model = TinyModel()
+    optimizer = CountingSGD(model.parameters(), lr=1e-3)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        accum_steps=2,
+        grad_clip_norm=0.75,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    summary = trainer._run_training_epoch(0)
+
+    assert summary["num_batches"] == 4
+    assert optimizer.step_calls == 2
+    assert len(clip_calls) == 2
+    assert all(call["parameter_count"] > 0 for call in clip_calls)
+    assert all(call["max_norm"] == 0.75 for call in clip_calls)
+    assert all(call["error_if_nonfinite"] is True for call in clip_calls)
 
 
 def test_trainer_uses_no_sync_on_non_update_micro_batches(monkeypatch, tmp_path: Path) -> None:
@@ -1950,6 +2123,18 @@ def test_trainer_rejects_non_positive_accum_steps() -> None:
             torch.optim.AdamW(model.parameters(), lr=1e-3),
             loss_fn,
             accum_steps=0,
+        )
+
+
+def test_trainer_rejects_non_positive_grad_clip_norm() -> None:
+    model = TinyModel()
+
+    with pytest.raises(ValueError):
+        Trainer(
+            model,
+            torch.optim.AdamW(model.parameters(), lr=1e-3),
+            loss_fn,
+            grad_clip_norm=0,
         )
 
 
