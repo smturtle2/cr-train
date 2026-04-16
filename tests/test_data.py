@@ -56,6 +56,39 @@ def _make_row(index: int) -> dict[str, object]:
     }
 
 
+def _make_non_finite_sar_row(index: int) -> dict[str, object]:
+    row = _make_row(index)
+    sar = np.empty((256, 256, 2), dtype=np.float32)
+    sar[..., 0] = -10.0
+    sar[..., 1] = -20.0
+    sar[0, 0, 0] = np.nan
+    sar[100, 100, 1] = np.nan
+    row["sar"] = sar.tobytes()
+    return row
+
+
+def _make_crop_sensitive_sar_row(index: int) -> dict[str, object]:
+    row = _make_row(index)
+    sar = np.zeros((256, 256, 2), dtype=np.float32)
+    sar[64:192, 64:192, 0] = -10.0
+    sar[64:192, 64:192, 1] = -20.0
+    sar[64, 64, 0] = np.nan
+    sar[64, 65, 1] = np.nan
+    row["sar"] = sar.tobytes()
+    return row
+
+
+def _make_non_finite_optical_row(index: int) -> dict[str, object]:
+    row = _make_row(index)
+    cloudy = np.full((256, 256, 13), 1000.0, dtype=np.float32)
+    target = np.full((256, 256, 13), 4000.0, dtype=np.float32)
+    cloudy[0, 0, 0] = np.nan
+    target[10, 11, 3] = np.nan
+    row["cloudy"] = cloudy
+    row["target"] = target
+    return row
+
+
 def _make_stream_row(index: int) -> dict[str, object]:
     sar = bytes(((index + offset) % 251 for offset in range(2)))
     cloudy = bytes(((index + offset) % 251 for offset in range(13)))
@@ -386,6 +419,27 @@ def test_decode_row_converts_to_chw_and_normalizes() -> None:
     assert decoded["meta"]["scene"] == "3"
 
 
+def test_decode_row_fills_sar_nan_with_image_mean_before_normalization() -> None:
+    row = _make_non_finite_sar_row(5)
+    decoded = decode_row(row)
+
+    assert bool(np.isfinite(decoded["sar"]).all())
+    assert decoded["sar"][0, 0, 0] == pytest.approx(0.8)
+    assert decoded["sar"][1, 100, 100] == pytest.approx(17.5 * 2.0 / 32.5)
+    assert decoded["sar"][0, 0, 1] == pytest.approx(1.2)
+    assert decoded["sar"][1, 100, 101] == pytest.approx(12.5 * 2.0 / 32.5)
+
+
+def test_decode_row_fills_optical_nan_with_image_mean_before_normalization() -> None:
+    row = _make_non_finite_optical_row(6)
+    decoded = decode_row(row)
+
+    assert bool(np.isfinite(decoded["cloudy"]).all())
+    assert bool(np.isfinite(decoded["target"]).all())
+    assert decoded["cloudy"][0, 0, 0] == pytest.approx(0.5)
+    assert decoded["target"][3, 10, 11] == pytest.approx(2.0)
+
+
 def test_build_collate_fn_batches_rows() -> None:
     collate = build_collate_fn()
     batch = collate([_make_row(0), _make_row(1)])
@@ -394,6 +448,48 @@ def test_build_collate_fn_batches_rows() -> None:
     assert batch["cloudy"].shape == (2, 13, 256, 256)
     assert batch["target"].shape == (2, 13, 256, 256)
     assert batch["meta"]["patch"] == ["p000", "p001"]
+
+
+def test_build_collate_fn_fills_sar_nan_with_image_mean_without_spatial_transform() -> None:
+    collate = build_collate_fn()
+    row = _make_non_finite_sar_row(7)
+    batch = collate([row])
+
+    assert bool(torch.isfinite(batch["sar"]).all())
+    assert batch["sar"][0, 0, 0, 0].item() == pytest.approx(0.8)
+    assert batch["sar"][0, 1, 100, 100].item() == pytest.approx(17.5 * 2.0 / 32.5)
+    assert batch["sar"][0, 0, 0, 1].item() == pytest.approx(1.2)
+    assert batch["sar"][0, 1, 100, 101].item() == pytest.approx(12.5 * 2.0 / 32.5)
+
+
+def test_build_collate_fn_uses_full_image_mean_for_nan_fill_before_crop() -> None:
+    row = _make_crop_sensitive_sar_row(8)
+    collate = build_collate_fn(crop_size=128, crop_mode="center")
+
+    batch = collate([row])
+    decoded = decode_row(row)
+
+    assert bool(torch.isfinite(batch["sar"]).all())
+    expected = torch.from_numpy(decoded["sar"][:, 64:192, 64:192].copy())
+    torch.testing.assert_close(batch["sar"][0], expected)
+
+
+def test_build_collate_fn_raises_if_tensor_remains_non_finite_after_normalization(
+    monkeypatch,
+) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    original_normalize = dataset_mod._normalize_sar_tensor
+
+    def inject_nan(sar: torch.Tensor) -> None:
+        original_normalize(sar)
+        sar[0, 0, 0] = float("nan")
+
+    monkeypatch.setattr(dataset_mod, "_normalize_sar_tensor", inject_nan)
+    collate = build_collate_fn()
+
+    with pytest.raises(FloatingPointError, match="non-finite sar after normalization"):
+        collate([_make_row(0)])
 
 
 def test_build_collate_fn_is_picklable() -> None:

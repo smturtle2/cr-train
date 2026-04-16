@@ -141,8 +141,11 @@ class _BatchCollateFn:
                     src_dtype=torch.float32,
                     expected_channels=SAR_CHANNELS,
                 )
+                _fill_nan_tensor(sar_image)
                 _normalize_sar_tensor(sar_image)
-                sar_batch[i].copy_(_apply_spatial_transform(sar_image, params))
+                _assert_finite_tensor(sar_image, field="sar", row=row)
+                sar_transformed = _apply_spatial_transform(sar_image, params)
+                sar_batch[i].copy_(sar_transformed)
 
                 cloudy_image = torch.empty(opt_chw, dtype=torch.float32)
                 _decode_image_into(
@@ -152,8 +155,11 @@ class _BatchCollateFn:
                     src_dtype=torch.int16,
                     expected_channels=OPTICAL_CHANNELS,
                 )
+                _fill_nan_tensor(cloudy_image)
                 _normalize_optical_tensor(cloudy_image)
-                cloudy_batch[i].copy_(_apply_spatial_transform(cloudy_image, params))
+                _assert_finite_tensor(cloudy_image, field="cloudy", row=row)
+                cloudy_transformed = _apply_spatial_transform(cloudy_image, params)
+                cloudy_batch[i].copy_(cloudy_transformed)
 
                 target_image = torch.empty(opt_chw, dtype=torch.float32)
                 _decode_image_into(
@@ -163,8 +169,11 @@ class _BatchCollateFn:
                     src_dtype=torch.int16,
                     expected_channels=OPTICAL_CHANNELS,
                 )
+                _fill_nan_tensor(target_image)
                 _normalize_optical_tensor(target_image)
-                target_batch[i].copy_(_apply_spatial_transform(target_image, params))
+                _assert_finite_tensor(target_image, field="target", row=row)
+                target_transformed = _apply_spatial_transform(target_image, params)
+                target_batch[i].copy_(target_transformed)
             else:
                 _decode_image_into(
                     sar_batch[i],
@@ -173,7 +182,9 @@ class _BatchCollateFn:
                     src_dtype=torch.float32,
                     expected_channels=SAR_CHANNELS,
                 )
+                _fill_nan_tensor(sar_batch[i])
                 _normalize_sar_tensor(sar_batch[i])
+                _assert_finite_tensor(sar_batch[i], field="sar", row=row)
                 _decode_image_into(
                     cloudy_batch[i],
                     row["cloudy"],
@@ -181,7 +192,9 @@ class _BatchCollateFn:
                     src_dtype=torch.int16,
                     expected_channels=OPTICAL_CHANNELS,
                 )
+                _fill_nan_tensor(cloudy_batch[i])
                 _normalize_optical_tensor(cloudy_batch[i])
+                _assert_finite_tensor(cloudy_batch[i], field="cloudy", row=row)
                 _decode_image_into(
                     target_batch[i],
                     row["target"],
@@ -189,7 +202,9 @@ class _BatchCollateFn:
                     src_dtype=torch.int16,
                     expected_channels=OPTICAL_CHANNELS,
                 )
+                _fill_nan_tensor(target_batch[i])
                 _normalize_optical_tensor(target_batch[i])
+                _assert_finite_tensor(target_batch[i], field="target", row=row)
             if metadata is not None:
                 metadata["season"].append(str(row.get("season", "")))
                 metadata["scene"].append(str(row.get("scene", "")))
@@ -541,6 +556,66 @@ _OPTICAL_CLAMP_RANGE = (0.0, 10000.0)
 _OPTICAL_SCALE = 1.0 / 2000.0
 
 
+def _row_metadata_key(row: dict[str, Any] | None) -> tuple[str, str, str]:
+    if row is None:
+        return ("", "", "")
+    return (
+        str(row.get("season", "")),
+        str(row.get("scene", "")),
+        str(row.get("patch", "")),
+    )
+
+
+def _format_row_context(row: dict[str, Any] | None) -> str:
+    season, scene, patch = _row_metadata_key(row)
+    parts = []
+    if season:
+        parts.append(f"season={season}")
+    if scene:
+        parts.append(f"scene={scene}")
+    if patch:
+        parts.append(f"patch={patch}")
+    if parts:
+        return ", ".join(parts)
+    return "metadata unavailable"
+
+
+def _fill_nan_numpy(image: np.ndarray) -> None:
+    nan_mask = np.isnan(image)
+    if not bool(nan_mask.any()):
+        return
+    valid = image[~nan_mask]
+    if valid.size == 0:
+        return
+    image[nan_mask] = valid.mean(dtype=np.float64)
+
+
+def _fill_nan_tensor(image: torch.Tensor) -> None:
+    nan_mask = torch.isnan(image)
+    if not bool(nan_mask.any()):
+        return
+    valid = image[~nan_mask]
+    if valid.numel() == 0:
+        return
+    image[nan_mask] = valid.mean()
+
+
+def _assert_finite_numpy(image: np.ndarray, *, field: str, row: dict[str, Any] | None) -> None:
+    if bool(np.isfinite(image).all()):
+        return
+    raise FloatingPointError(
+        f"non-finite {field} after normalization: {_format_row_context(row)}"
+    )
+
+
+def _assert_finite_tensor(image: torch.Tensor, *, field: str, row: dict[str, Any] | None) -> None:
+    if bool(torch.isfinite(image).all()):
+        return
+    raise FloatingPointError(
+        f"non-finite {field} after normalization: {_format_row_context(row)}"
+    )
+
+
 def _normalize_sar_numpy(sar: np.ndarray) -> None:
     for channel, clamp_min, clamp_max, offset, scale in _SAR_NORMALIZATION:
         np.clip(sar[channel], clamp_min, clamp_max, out=sar[channel])
@@ -656,11 +731,17 @@ def _apply_spatial_transform(image: torch.Tensor, params: _SpatialTransformParam
 def decode_row(row: dict[str, Any], *, include_metadata: bool = True) -> dict[str, Any]:
     """Decode one cached row into CHW float32 arrays."""
     sar = _decode_image(row["sar"], row["sar_shape"], dtype=np.float32, expected_channels=SAR_CHANNELS)
+    _fill_nan_numpy(sar)
     _normalize_sar_numpy(sar)
+    _assert_finite_numpy(sar, field="sar", row=row)
     cloudy = _decode_image(row["cloudy"], row["opt_shape"], dtype=np.int16, expected_channels=OPTICAL_CHANNELS)
+    _fill_nan_numpy(cloudy)
     _normalize_optical_numpy(cloudy)
+    _assert_finite_numpy(cloudy, field="cloudy", row=row)
     target = _decode_image(row["target"], row["opt_shape"], dtype=np.int16, expected_channels=OPTICAL_CHANNELS)
+    _fill_nan_numpy(target)
     _normalize_optical_numpy(target)
+    _assert_finite_numpy(target, field="target", row=row)
     decoded = {"sar": sar, "cloudy": cloudy, "target": target}
     if include_metadata:
         decoded["meta"] = {

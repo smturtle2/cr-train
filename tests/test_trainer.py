@@ -10,11 +10,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from cr_train import Trainer
-from cr_train.data import BLOCK_SIZE
+from cr_train.data import BLOCK_SIZE, build_collate_fn
 from cr_train.progress import resolve_progress_bar_ncols
 from cr_train.data.store import resolve_block_cache_paths
 from cr_train.trainer_reporting import (
@@ -42,6 +43,17 @@ def _make_row(index: int) -> dict[str, object]:
         "scene": str(index),
         "patch": f"p{index:03d}",
     }
+
+
+def _make_non_finite_sar_row(index: int) -> dict[str, object]:
+    row = _make_row(index)
+    sar = np.empty((256, 256, 2), dtype=np.float32)
+    sar[..., 0] = -10.0
+    sar[..., 1] = -20.0
+    sar[0, 0, 0] = np.nan
+    sar[0, 1, 1] = np.nan
+    row["sar"] = sar.tobytes()
+    return row
 
 
 def _make_block_splits(block_count: int) -> list[list[dict[str, object]]]:
@@ -747,7 +759,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert config_record["train_crop_size"] == 128
     assert config_record["train_random_flip"] is True
     assert config_record["train_random_rot90"] is True
-    assert config_record["grad_clip_norm"] is None
+    assert config_record["grad_clip_norm"] == 1.0
     assert warmup_splits_after_step == {"train", "validation", "test"}
     assert "warm split cache" in startup_stages
     assert "load local cache" in startup_stages
@@ -984,7 +996,7 @@ def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(
     assert config_record["scheduler"] == "CountingStepLR"
     assert config_record["scheduler_timing"] == "after_validation"
     assert config_record["scheduler_monitor"] is None
-    assert config_record["grad_clip_norm"] is None
+    assert config_record["grad_clip_norm"] == 1.0
     assert any("scheduler CountingStepLR" in message for message in FakeTqdm.writes)
     assert any("timing after_validation" in message for message in FakeTqdm.writes)
 
@@ -1467,6 +1479,35 @@ def test_trainer_clips_gradients_once_per_optimizer_update(
     assert all(call["parameter_count"] > 0 for call in clip_calls)
     assert all(call["max_norm"] == 0.75 for call in clip_calls)
     assert all(call["error_if_nonfinite"] is True for call in clip_calls)
+
+
+def test_trainer_runs_with_dsen2cr_nan_filled_sar_batch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    batch = build_collate_fn()([_make_non_finite_sar_row(0)])
+    _patch_training_batches(monkeypatch, batches=[batch])
+
+    model = TinyModel()
+    optimizer = CountingSGD(model.parameters(), lr=1e-3)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    summary = trainer._run_training_epoch(0)
+
+    assert summary["num_batches"] == 1
+    assert summary["loss"] >= 0.0
+    assert optimizer.step_calls == 1
+    assert trainer.global_step == 1
 
 
 def test_trainer_uses_no_sync_on_non_update_micro_batches(monkeypatch, tmp_path: Path) -> None:
