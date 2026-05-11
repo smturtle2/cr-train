@@ -389,13 +389,14 @@ class Trainer:
     def predict(self, batch: Mapping[str, Any]) -> Any:
         """Run inference for a single batch without mutating training mode."""
         moved_batch = move_batch_to_device(dict(batch), self.device)
-        was_training = self.model.training
-        self.model.eval()
+        model = self._model_state_owner()
+        was_training = model.training
+        model.eval()
         try:
             with torch.no_grad():
-                return self.model(moved_batch["sar"], moved_batch["cloudy"])
+                return model(moved_batch["sar"], moved_batch["cloudy"])
         finally:
-            self.model.train(was_training)
+            model.train(was_training)
 
     def get_state(self) -> dict[str, Any]:
         """Return the trainer runtime counters and execution context."""
@@ -651,7 +652,13 @@ class Trainer:
         if not is_distributed() or isinstance(self.model, DDP):
             return
         if self.device.type == "cuda":
-            device_index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+            current_device = torch.cuda.current_device()
+            device_index = self.device.index if self.device.index is not None else current_device
+            if device_index != current_device:
+                raise RuntimeError(
+                    "model must be placed on the current CUDA device before DDP wrapping: "
+                    f"model_device={self.device}, current_device=cuda:{current_device}"
+                )
             self.model = DDP(self.model, device_ids=[device_index])
             return
         self.model = DDP(self.model)

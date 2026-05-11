@@ -453,11 +453,19 @@ def _elapsed_column_start(text: str) -> int:
 def test_top_level_package_exports_trainer_as_primary_entry_point() -> None:
     package = importlib.import_module("cr_train")
     namespace: dict[str, object] = {}
-    exec("from cr_train import Trainer\n", namespace)
+    exec("from cr_train import Trainer, cleanup_distributed, is_primary, setup_distributed_from_env\n", namespace)
 
-    assert package.__all__ == ["Trainer"]
+    assert package.__all__ == [
+        "Trainer",
+        "cleanup_distributed",
+        "is_primary",
+        "setup_distributed_from_env",
+    ]
     assert package.Trainer is Trainer
     assert namespace["Trainer"] is Trainer
+    assert callable(namespace["cleanup_distributed"])
+    assert callable(namespace["is_primary"])
+    assert callable(namespace["setup_distributed_from_env"])
 
 
 def test_format_cache_summary_compacts_square_timeline_on_one_line() -> None:
@@ -1984,6 +1992,40 @@ def test_trainer_predict_preserves_training_mode(monkeypatch, tmp_path: Path) ->
     assert trainer.model.training is True
 
 
+def test_trainer_predict_uses_unwrapped_model_in_distributed_mode(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.trainer as trainer_mod
+
+    class ForwardFailDDP(FakeDDP):
+        def forward(self, *args, **kwargs):
+            raise AssertionError("predict should call the wrapped module directly")
+
+    monkeypatch.setattr(trainer_mod, "is_distributed", lambda: True)
+    monkeypatch.setattr(trainer_mod, "DDP", ForwardFailDDP)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+    trainer.model.train(True)
+
+    batch = {
+        "sar": torch.randn(2, 2, 8, 8),
+        "cloudy": torch.randn(2, 13, 8, 8),
+        "target": torch.randn(2, 13, 8, 8),
+    }
+
+    prediction = trainer.predict(batch)
+
+    assert prediction.shape == (2, 13, 8, 8)
+    assert prediction.requires_grad is False
+    assert trainer.model.module.training is True
+
+
 def test_trainer_get_state_reports_runtime_values(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
@@ -2214,6 +2256,30 @@ def test_trainer_wraps_model_for_distributed_without_device_bootstrap_bug(monkey
     assert isinstance(trainer.model, FakeDDP)
     assert trainer.model.module is model
     assert trainer.device.type == "cpu"
+
+
+def test_trainer_rejects_cuda_model_on_wrong_local_rank(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.trainer as trainer_mod
+
+    monkeypatch.setattr(trainer_mod, "is_distributed", lambda: True)
+    monkeypatch.setattr(trainer_mod, "DDP", FakeDDP)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    monkeypatch.setattr(
+        trainer_mod.Trainer,
+        "_infer_module_device",
+        lambda self, module: torch.device("cuda", 1),
+    )
+    monkeypatch.setattr(trainer_mod.torch.cuda, "current_device", lambda: 0)
+
+    model = TinyModel()
+    with pytest.raises(RuntimeError, match="current CUDA device"):
+        Trainer(
+            model,
+            torch.optim.AdamW(model.parameters(), lr=1e-3),
+            loss_fn,
+            output_dir=tmp_path / "run",
+            cache_dir=tmp_path / "cache",
+        )
 
 
 def test_trainer_checkpoint_apis_use_unwrapped_model_state_in_distributed_mode(monkeypatch, tmp_path: Path) -> None:

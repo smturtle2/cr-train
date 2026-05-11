@@ -335,14 +335,17 @@ from cr_train.data import BLOCK_SIZE, trace_plan_sample
 
 ## 분산 학습
 
-`torch.distributed`가 초기화되면 Trainer가 자동으로 모델을 `DistributedDataParallel`로 래핑합니다. 코드 변경이 필요 없습니다:
+모델을 device로 옮기기 전에 `setup_distributed_from_env()`를 호출하면,
+Trainer가 자동으로 모델을 `DistributedDataParallel`로 래핑합니다:
 
 ```bash
-torchrun --nproc_per_node=2 examples/train_sen12mscr.py \
+uv run torchrun --standalone --nproc-per-node=2 examples/train_sen12mscr.py \
   --max-train-samples 4096 \
   --epochs 5
 ```
 
+- `setup_distributed_from_env()`는 `torchrun` 환경 변수로 process group을
+  초기화하고 local CUDA device를 선택합니다
 - 결정적 block 분할로 rank별 데이터 분할
 - 모든 프로세스에 걸쳐 메트릭 all-reduce
 - rank 0만 `metrics.jsonl`과 명시적으로 호출한 `save_*()` 출력 파일 기록

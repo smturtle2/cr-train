@@ -34,7 +34,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from cr_train import Trainer
+from cr_train import Trainer, cleanup_distributed, setup_distributed_from_env
 
 
 # --- Model ---
@@ -252,9 +252,7 @@ def parse_args() -> argparse.Namespace:
 def resolve_device(device_name: str | None) -> torch.device:
     if device_name is not None:
         return torch.device(device_name)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    return setup_distributed_from_env()
 
 
 def reconstruction_loss(prediction: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -288,46 +286,49 @@ def build_scheduler(
 # --- Main ---
 
 def main() -> None:
-    args = parse_args()
-    device = resolve_device(args.device)
-    model = FusionBaseline(hidden_channels=args.hidden_channels).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = build_scheduler(
-        optimizer,
-        scheduler_name=args.scheduler,
-        epochs=args.epochs,
-        warmup_epochs=args.warmup_epochs,
-        min_lr_scale=args.min_lr_scale,
-    )
+    try:
+        args = parse_args()
+        device = resolve_device(args.device)
+        model = FusionBaseline(hidden_channels=args.hidden_channels).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = build_scheduler(
+            optimizer,
+            scheduler_name=args.scheduler,
+            epochs=args.epochs,
+            warmup_epochs=args.warmup_epochs,
+            min_lr_scale=args.min_lr_scale,
+        )
 
-    trainer = Trainer(
-        model,
-        optimizer,
-        reconstruction_loss,
-        metrics={"mae": mean_absolute_error},
-        scheduler=scheduler,
-        scheduler_timing=args.scheduler_timing,
-        max_train_samples=args.max_train_samples,
-        max_val_samples=args.max_val_samples,
-        max_test_samples=args.max_test_samples,
-        batch_size=args.batch_size,
-        accum_steps=args.accum_steps,
-        epochs=args.epochs,
-        seed=args.seed,
-        output_dir=args.output_dir,
-        cache_dir=args.cache_dir,
-        train_crop_size=args.train_crop_size,
-        train_random_flip=args.train_random_flip,
-        train_random_rot90=args.train_random_rot90,
-        grad_clip_norm=args.grad_clip_norm,
-    )
+        trainer = Trainer(
+            model,
+            optimizer,
+            reconstruction_loss,
+            metrics={"mae": mean_absolute_error},
+            scheduler=scheduler,
+            scheduler_timing=args.scheduler_timing,
+            max_train_samples=args.max_train_samples,
+            max_val_samples=args.max_val_samples,
+            max_test_samples=args.max_test_samples,
+            batch_size=args.batch_size,
+            accum_steps=args.accum_steps,
+            epochs=args.epochs,
+            seed=args.seed,
+            output_dir=args.output_dir,
+            cache_dir=args.cache_dir,
+            train_crop_size=args.train_crop_size,
+            train_random_flip=args.train_random_flip,
+            train_random_rot90=args.train_random_rot90,
+            grad_clip_norm=args.grad_clip_norm,
+        )
 
-    # Training loop — Trainer prints epoch summaries automatically
-    for _ in range(args.epochs):
-        trainer.step()
+        # Training loop — Trainer prints epoch summaries automatically
+        for _ in range(args.epochs):
+            trainer.step()
 
-    # Test evaluation — Trainer prints test summary automatically
-    trainer.test()
+        # Test evaluation — Trainer prints test summary automatically
+        trainer.test()
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

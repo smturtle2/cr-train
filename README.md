@@ -335,14 +335,17 @@ During warmup, `step()` prepares `train` and `validation`, while `test()` prepar
 
 ## Distributed Training
 
-Trainer auto-wraps the model in `DistributedDataParallel` when `torch.distributed` is initialized. No code changes needed:
+Use `setup_distributed_from_env()` before moving the model to a device, then
+Trainer auto-wraps the model in `DistributedDataParallel`:
 
 ```bash
-torchrun --nproc_per_node=2 examples/train_sen12mscr.py \
+uv run torchrun --standalone --nproc-per-node=2 examples/train_sen12mscr.py \
   --max-train-samples 4096 \
   --epochs 5
 ```
 
+- `setup_distributed_from_env()` initializes the process group from `torchrun`
+  environment variables and selects the local CUDA device
 - Data is sharded across ranks via deterministic block partitioning
 - Metrics are all-reduced across all processes
 - Only rank 0 writes `metrics.jsonl` and explicit `save_*()` output files

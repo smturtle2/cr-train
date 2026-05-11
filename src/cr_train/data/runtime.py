@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -608,7 +609,64 @@ def ensure_split_cache(
     return resolve_catalog_path(source_root, split)
 
 
+import torch
 import torch.distributed as dist
+
+
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
+
+def _has_distributed_env() -> bool:
+    return _env_int("RANK") is not None and _env_int("WORLD_SIZE") is not None
+
+
+def _resolve_local_cuda_device() -> torch.device:
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+
+    local_rank = _env_int("LOCAL_RANK")
+    if local_rank is None:
+        local_rank = 0
+
+    device_count = torch.cuda.device_count()
+    if local_rank < 0 or local_rank >= device_count:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is outside the visible CUDA device range "
+            f"0..{device_count - 1}"
+        )
+
+    torch.cuda.set_device(local_rank)
+    return torch.device("cuda", local_rank)
+
+
+def setup_distributed_from_env() -> torch.device:
+    """Initialize torch.distributed from torchrun env vars and return the local device."""
+    device = _resolve_local_cuda_device()
+    if not _has_distributed_env():
+        return device
+
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available")
+
+    if not dist.is_initialized():
+        backend = os.environ.get("CR_TRAIN_DIST_BACKEND")
+        if backend is None:
+            backend = "nccl" if device.type == "cuda" else "gloo"
+        dist.init_process_group(backend=backend)
+
+    return device
+
+
+def cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def is_distributed() -> bool:
@@ -632,9 +690,11 @@ __all__ = [
     "WarmupSummary",
     "_compact_warmup_timeline",
     "ensure_split_cache",
+    "cleanup_distributed",
     "get_rank",
     "get_world_size",
     "is_distributed",
     "is_primary",
+    "setup_distributed_from_env",
     "tqdm",
 ]
