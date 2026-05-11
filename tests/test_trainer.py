@@ -364,12 +364,17 @@ def _make_training_batch(indices: list[int]) -> dict[str, torch.Tensor]:
     }
 
 
-def _patch_training_batches(monkeypatch, *, batches: list[dict[str, torch.Tensor]]) -> None:
+def _patch_training_batches(
+    monkeypatch,
+    *,
+    batches: list[dict[str, torch.Tensor]],
+    total_batches: int | None = None,
+) -> None:
     def fake_build_loader(self, *, split: str, max_samples: int | None, training: bool, epoch_index: int):
         del self, max_samples, epoch_index
         assert split == "train"
         assert training is True
-        return copy.deepcopy(batches), len(batches)
+        return copy.deepcopy(batches), len(batches) if total_batches is None else total_batches
 
     monkeypatch.setattr(Trainer, "_build_loader", fake_build_loader)
     monkeypatch.setattr(Trainer, "_set_sampler_epoch", lambda self, loader, epoch_index: None)
@@ -1346,6 +1351,45 @@ def test_trainer_flushes_last_partial_accumulation_window(monkeypatch, tmp_path:
     assert optimizer.step_calls == 3
 
 
+def test_trainer_uses_actual_batch_stream_for_optimizer_steps(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 4)
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+            _make_training_batch([6]),
+        ],
+        total_batches=3,
+    )
+
+    model = TinyModel()
+    optimizer = CountingSGD(model.parameters(), lr=1e-3)
+    trainer = Trainer(
+        model,
+        optimizer,
+        loss_fn,
+        batch_size=2,
+        accum_steps=1,
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    summary = trainer._run_training_epoch(0)
+
+    assert summary["num_samples"] == 7
+    assert summary["num_batches"] == 4
+    assert trainer.global_step == 4
+    assert optimizer.step_calls == 4
+
+
 def test_trainer_accumulated_updates_match_equivalent_larger_batches(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -1403,6 +1447,61 @@ def test_trainer_accumulated_updates_match_equivalent_larger_batches(
     assert accumulated_summary["num_batches"] == 4
     assert baseline_trainer.global_step == 2
     assert accumulated_trainer.global_step == 2
+
+
+def test_trainer_scales_final_partial_accumulation_window_like_full_batch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+
+    baseline_model = TinyModel()
+    accumulated_model = TinyModel()
+    accumulated_model.load_state_dict(copy.deepcopy(baseline_model.state_dict()))
+    baseline_trainer = Trainer(
+        baseline_model,
+        torch.optim.SGD(baseline_model.parameters(), lr=1e-3),
+        loss_fn,
+        accum_steps=1,
+        output_dir=tmp_path / "baseline-run",
+        cache_dir=tmp_path / "baseline-cache",
+    )
+    accumulated_trainer = Trainer(
+        accumulated_model,
+        torch.optim.SGD(accumulated_model.parameters(), lr=1e-3),
+        loss_fn,
+        accum_steps=4,
+        output_dir=tmp_path / "accum-run",
+        cache_dir=tmp_path / "accum-cache",
+    )
+
+    _patch_training_batches(
+        monkeypatch,
+        batches=[
+            _make_training_batch([0, 1]),
+            _make_training_batch([2, 3]),
+            _make_training_batch([4, 5]),
+        ],
+    )
+    accumulated_summary = accumulated_trainer._run_training_epoch(0)
+
+    _patch_training_batches(
+        monkeypatch,
+        batches=[_make_training_batch([0, 1, 2, 3, 4, 5])],
+    )
+    baseline_summary = baseline_trainer._run_training_epoch(0)
+
+    _assert_nested_equal(
+        _clone_model_state_dict(baseline_model),
+        _clone_model_state_dict(accumulated_model),
+    )
+    assert baseline_summary["num_batches"] == 1
+    assert accumulated_summary["num_batches"] == 3
+    assert baseline_trainer.global_step == 1
+    assert accumulated_trainer.global_step == 1
 
 
 def test_trainer_raises_on_non_finite_loss_before_optimizer_step(

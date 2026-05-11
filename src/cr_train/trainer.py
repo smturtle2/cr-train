@@ -819,14 +819,26 @@ class Trainer:
             return num_examples // batch_size
         return (num_examples + batch_size - 1) // batch_size
 
-    def _should_step_optimizer(self, *, batch_index: int, total_batches: int) -> bool:
-        is_accum_boundary = (batch_index + 1) % self.accum_steps == 0
-        is_last_batch = batch_index + 1 == total_batches
-        return is_accum_boundary or is_last_batch
+    @staticmethod
+    def _iter_batches_with_last_flag(batch_iterator):
+        iterator = iter(batch_iterator)
+        try:
+            current = next(iterator)
+        except StopIteration:
+            return
 
-    def _accum_window_size(self, *, batch_index: int, total_batches: int) -> int:
-        window_start = batch_index - (batch_index % self.accum_steps)
-        return min(self.accum_steps, total_batches - window_start)
+        for next_batch in iterator:
+            yield current, False
+            current = next_batch
+        yield current, True
+
+    def _scale_gradients(self, factor: float) -> None:
+        if factor == 1.0:
+            return
+        for parameter in self._model_state_owner().parameters():
+            grad = parameter.grad
+            if grad is not None:
+                grad.mul_(factor)
 
     def _gradient_sync_context(self, *, sync_gradients: bool):
         if sync_gradients or not isinstance(self.model, DDP):
@@ -979,15 +991,14 @@ class Trainer:
         )
         try:
             self.optimizer.zero_grad(set_to_none=True)
-            for batch_index, batch in enumerate(batch_iterator):
+            pending_accum_batches = 0
+            for batch_index, (batch, is_last_batch) in enumerate(
+                self._iter_batches_with_last_flag(batch_iterator)
+            ):
                 moved_batch = move_batch_to_device(batch, self.device)
-                sync_gradients = self._should_step_optimizer(
-                    batch_index=batch_index,
-                    total_batches=total_batches,
-                )
-                accum_window_size = self._accum_window_size(
-                    batch_index=batch_index,
-                    total_batches=total_batches,
+                pending_accum_batches += 1
+                sync_gradients = (
+                    pending_accum_batches == self.accum_steps or is_last_batch
                 )
                 with self._gradient_sync_context(sync_gradients=sync_gradients):
                     with self._autocast_context():
@@ -999,7 +1010,7 @@ class Trainer:
                         batch_index=batch_index,
                         batch=moved_batch,
                     )
-                    scaled_loss = loss / accum_window_size
+                    scaled_loss = loss / self.accum_steps
                     if self._uses_grad_scaler():
                         self._grad_scaler.scale(scaled_loss).backward()
                     else:
@@ -1008,6 +1019,7 @@ class Trainer:
                 if sync_gradients:
                     if self._uses_grad_scaler():
                         self._grad_scaler.unscale_(self.optimizer)
+                    self._scale_gradients(self.accum_steps / pending_accum_batches)
                     self._assert_finite_gradients(
                         epoch_index=epoch_index,
                         batch_index=batch_index,
@@ -1018,6 +1030,7 @@ class Trainer:
                         first_update_lrs=first_update_lrs
                     )
                     self.optimizer.zero_grad(set_to_none=True)
+                    pending_accum_batches = 0
 
                 batch_size = int(moved_batch["sar"].shape[0])
 
