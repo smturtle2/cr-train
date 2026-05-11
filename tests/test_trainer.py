@@ -768,6 +768,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert config_record["train_random_flip"] is True
     assert config_record["train_random_rot90"] is True
     assert config_record["grad_clip_norm"] == 1.0
+    assert config_record["mixed_precision"] == "off"
     assert warmup_splits_after_step == {"train", "validation", "test"}
     assert "warm split cache" in startup_stages
     assert "load local cache" in startup_stages
@@ -1005,6 +1006,7 @@ def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(
     assert config_record["scheduler_timing"] == "after_validation"
     assert config_record["scheduler_monitor"] is None
     assert config_record["grad_clip_norm"] == 1.0
+    assert config_record["mixed_precision"] == "off"
     assert any("scheduler CountingStepLR" in message for message in FakeTqdm.writes)
     assert any("timing after_validation" in message for message in FakeTqdm.writes)
 
@@ -1044,6 +1046,51 @@ def test_trainer_records_grad_clip_norm_in_config_and_banner(
 
     assert config_record["grad_clip_norm"] == 0.75
     assert any("clip 0.7500" in message for message in FakeTqdm.writes)
+
+
+def test_trainer_bf16_mixed_precision_autocasts_forward_and_records_config(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
+    monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
+    _patch_training_batches(monkeypatch, batches=[_make_training_batch([0, 1])])
+
+    class DtypeRecordingModel(TinyModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.output_dtypes: list[torch.dtype] = []
+
+        def forward(self, sar, cloudy):
+            output = super().forward(sar, cloudy)
+            self.output_dtypes.append(output.dtype)
+            return output
+
+    model = DtypeRecordingModel()
+    trainer = Trainer(
+        model,
+        torch.optim.SGD(model.parameters(), lr=1e-3),
+        loss_fn,
+        mixed_precision="bf16",
+        output_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+    )
+
+    trainer._run_training_epoch(0)
+    trainer._write_config_once()
+
+    metrics_records = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    config_record = next(record for record in metrics_records if record["kind"] == "config")
+
+    assert model.output_dtypes == [torch.bfloat16]
+    assert config_record["mixed_precision"] == "bf16"
+    assert any("amp bf16" in message for message in FakeTqdm.writes)
 
 
 def test_trainer_steps_scheduler_before_optimizer_step_once_per_update(
@@ -2048,6 +2095,7 @@ def test_trainer_get_state_reports_runtime_values(monkeypatch, tmp_path: Path) -
         "lr": [1e-3],
         "device": torch.device("cpu"),
         "distributed": False,
+        "mixed_precision": "off",
     }
 
 
@@ -2218,6 +2266,30 @@ def test_trainer_rejects_non_positive_grad_clip_norm() -> None:
             torch.optim.AdamW(model.parameters(), lr=1e-3),
             loss_fn,
             grad_clip_norm=0,
+        )
+
+
+def test_trainer_rejects_invalid_mixed_precision() -> None:
+    model = TinyModel()
+
+    with pytest.raises(ValueError, match="mixed_precision"):
+        Trainer(
+            model,
+            torch.optim.AdamW(model.parameters(), lr=1e-3),
+            loss_fn,
+            mixed_precision="bf32",  # type: ignore[arg-type]
+        )
+
+
+def test_trainer_rejects_fp16_mixed_precision_without_cuda() -> None:
+    model = TinyModel()
+
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        Trainer(
+            model,
+            torch.optim.AdamW(model.parameters(), lr=1e-3),
+            loss_fn,
+            mixed_precision="fp16",
         )
 
 

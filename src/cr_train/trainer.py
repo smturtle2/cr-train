@@ -58,11 +58,13 @@ _SCHEDULER_TIMING_CHOICES = {
     "before_optimizer_step",
     "after_optimizer_step",
 }
+_MIXED_PRECISION_CHOICES = {"off", "fp16", "bf16"}
 SchedulerTiming = Literal[
     "after_validation",
     "before_optimizer_step",
     "after_optimizer_step",
 ]
+MixedPrecision = Literal["off", "fp16", "bf16"]
 
 
 @dataclass(slots=True)
@@ -115,6 +117,7 @@ class Trainer:
         train_random_flip: bool = True,
         train_random_rot90: bool = True,
         grad_clip_norm: float | None = 1.0,
+        mixed_precision: MixedPrecision = "off",
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
@@ -160,6 +163,7 @@ class Trainer:
             else None
         )
 
+        self.mixed_precision = self._resolve_mixed_precision(mixed_precision)
         self.max_train_samples = max_train_samples
         self.max_val_samples = max_val_samples
         self.max_test_samples = max_test_samples
@@ -192,6 +196,11 @@ class Trainer:
         self.device = self._infer_module_device(self.model)
         self._wrap_model_for_ddp_if_needed()
         self.device = self._infer_module_device(self._model_state_owner())
+        self._validate_mixed_precision_for_device()
+        self._grad_scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=self._uses_grad_scaler(),
+        )
         self.multiprocessing_context = self._resolve_multiprocessing_context(
             multiprocessing_context
         )
@@ -319,6 +328,8 @@ class Trainer:
         }
         if self.scheduler is not None:
             checkpoint["scheduler"] = self.scheduler.state_dict()
+        if self._uses_grad_scaler():
+            checkpoint["grad_scaler"] = self._grad_scaler.state_dict()
         torch.save(checkpoint, checkpoint_path)
         self._write_record(
             {
@@ -347,6 +358,8 @@ class Trainer:
         # scheduler state unchanged when no scheduler payload is available.
         if self.scheduler is not None and "scheduler" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler"])
+        if self._uses_grad_scaler() and "grad_scaler" in checkpoint:
+            self._grad_scaler.load_state_dict(checkpoint["grad_scaler"])
         self.current_epoch = int(checkpoint.get("epoch", 0))
         self.global_step = int(checkpoint.get("global_step", 0))
 
@@ -393,7 +406,7 @@ class Trainer:
         was_training = model.training
         model.eval()
         try:
-            with torch.no_grad():
+            with torch.no_grad(), self._autocast_context():
                 return model(moved_batch["sar"], moved_batch["cloudy"])
         finally:
             model.train(was_training)
@@ -407,6 +420,7 @@ class Trainer:
             "lr": self._get_learning_rates(),
             "device": self.device,
             "distributed": is_distributed(),
+            "mixed_precision": self.mixed_precision,
         }
 
     @staticmethod
@@ -438,6 +452,33 @@ class Trainer:
             supported = ", ".join(sorted(_SCHEDULER_TIMING_CHOICES))
             raise ValueError(f"scheduler_timing must be one of {supported}")
         return cast(SchedulerTiming, normalized)
+
+    def _resolve_mixed_precision(self, value: MixedPrecision) -> MixedPrecision:
+        normalized = value.strip().lower()
+        if normalized not in _MIXED_PRECISION_CHOICES:
+            supported = ", ".join(sorted(_MIXED_PRECISION_CHOICES))
+            raise ValueError(f"mixed_precision must be one of {supported}")
+        return cast(MixedPrecision, normalized)
+
+    def _validate_mixed_precision_for_device(self) -> None:
+        if self.mixed_precision == "fp16" and self.device.type != "cuda":
+            raise ValueError("mixed_precision='fp16' requires a CUDA device")
+
+    def _autocast_dtype(self) -> torch.dtype | None:
+        if self.mixed_precision == "bf16":
+            return torch.bfloat16
+        if self.mixed_precision == "fp16":
+            return torch.float16
+        return None
+
+    def _autocast_context(self):
+        dtype = self._autocast_dtype()
+        if dtype is None:
+            return nullcontext()
+        return torch.amp.autocast(device_type=self.device.type, dtype=dtype)
+
+    def _uses_grad_scaler(self) -> bool:
+        return self.mixed_precision == "fp16" and self.device.type == "cuda"
 
     def _resolve_scheduler_config(
         self,
@@ -626,6 +667,7 @@ class Trainer:
                 "train_random_flip": self.train_random_flip,
                 "train_random_rot90": self.train_random_rot90,
                 "grad_clip_norm": self.grad_clip_norm,
+                "mixed_precision": self.mixed_precision,
             }
         )
         tqdm.write(
@@ -645,6 +687,7 @@ class Trainer:
                 scheduler_timing=self.scheduler_timing,
                 scheduler_monitor=self.scheduler_monitor,
                 grad_clip_norm=self.grad_clip_norm,
+                mixed_precision=self.mixed_precision,
             )
         )
 
@@ -896,7 +939,11 @@ class Trainer:
             self._step_scheduler_before_optimizer()
 
         applied_lrs = self._get_learning_rates() if first_update_lrs is None else first_update_lrs
-        self.optimizer.step()
+        if self._uses_grad_scaler():
+            self._grad_scaler.step(self.optimizer)
+            self._grad_scaler.update()
+        else:
+            self.optimizer.step()
 
         if self.scheduler_timing == "after_optimizer_step":
             self._step_scheduler_after_optimizer()
@@ -943,17 +990,24 @@ class Trainer:
                     total_batches=total_batches,
                 )
                 with self._gradient_sync_context(sync_gradients=sync_gradients):
-                    model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
-                    loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
+                    with self._autocast_context():
+                        model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
+                        loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
                     self._assert_finite_loss(
                         loss=loss,
                         epoch_index=epoch_index,
                         batch_index=batch_index,
                         batch=moved_batch,
                     )
-                    (loss / accum_window_size).backward()
+                    scaled_loss = loss / accum_window_size
+                    if self._uses_grad_scaler():
+                        self._grad_scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
 
                 if sync_gradients:
+                    if self._uses_grad_scaler():
+                        self._grad_scaler.unscale_(self.optimizer)
                     self._assert_finite_gradients(
                         epoch_index=epoch_index,
                         batch_index=batch_index,
@@ -1020,8 +1074,9 @@ class Trainer:
             with torch.no_grad():
                 for batch in batch_iterator:
                     moved_batch = move_batch_to_device(batch, self.device)
-                    model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
-                    loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
+                    with self._autocast_context():
+                        model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
+                        loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
                     batch_size = int(moved_batch["sar"].shape[0])
 
                     metric_values = compute_metric_values(self.metric_fns, model_output, moved_batch)

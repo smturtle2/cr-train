@@ -195,6 +195,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Max grad norm applied before each optimizer update, or 'none'/'off' to disable.",
     )
+    parser.add_argument(
+        "--mixed-precision",
+        choices=("off", "fp16", "bf16"),
+        default="off",
+        help="Autocast precision for model forward/loss. fp16 uses GradScaler on CUDA.",
+    )
     parser.add_argument("--output-dir", default="runs/sen12mscr-example")
     parser.add_argument("--cache-dir", default="/dhdd/.cache/cr-train")
     parser.add_argument("--device", default=None)
@@ -319,6 +325,7 @@ def main() -> None:
             train_random_flip=args.train_random_flip,
             train_random_rot90=args.train_random_rot90,
             grad_clip_norm=args.grad_clip_norm,
+            mixed_precision=args.mixed_precision,
         )
 
         # Training loop — Trainer prints epoch summaries automatically

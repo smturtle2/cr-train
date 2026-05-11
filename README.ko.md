@@ -213,6 +213,7 @@ raw draw order, 최종 선택 블록 인덱스, 그리고 선택(`■`) vs. 건�
 | `train_random_flip` | `bool` | `True` | train batch에 vertical/horizontal flip을 독립적으로 무작위 적용. |
 | `train_random_rot90` | `bool` | `True` | train batch에 `0/90/180/270`도 회전을 무작위 적용. |
 | `grad_clip_norm` | `float \| None` | `None` | optimizer update 전에 적용할 optional max grad norm. train loss/gradient non-finite는 step 전에 즉시 실패합니다. |
+| `mixed_precision` | `str` | `"off"` | Autocast 모드입니다: `off`, `bf16`, `fp16`. `fp16`은 CUDA에서 `GradScaler`를 사용하고, `bf16`은 scaling 없이 autocast만 사용합니다. |
 
 ### `Trainer.step() -> dict`
 

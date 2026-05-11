@@ -268,6 +268,7 @@ def format_config_banner(
     scheduler_timing: str,
     scheduler_monitor: str | None,
     grad_clip_norm: float | None,
+    mixed_precision: str,
 ) -> str:
     header = f"{_BOLD}cr-train{_RESET} {_DIM}── {dataset_name} ── {device}{_RESET}"
     splits = (
@@ -292,6 +293,8 @@ def format_config_banner(
         config_parts.append(f"monitor {scheduler_monitor}")
     if grad_clip_norm is not None:
         config_parts.append(f"clip {format_metric_value(grad_clip_norm)}")
+    if mixed_precision != "off":
+        config_parts.append(f"amp {mixed_precision}")
     config = f"  {_DIM}config{_RESET}  " + _summary_separator().join(config_parts)
     return f"{header}\n{splits}\n{config}"
 

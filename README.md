@@ -213,6 +213,7 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `train_random_flip` | `bool` | `True` | Apply independent random vertical/horizontal flips to train batches. |
 | `train_random_rot90` | `bool` | `True` | Apply random `0/90/180/270` degree rotations to train batches. |
 | `grad_clip_norm` | `float \| None` | `None` | Optional max grad norm applied before each optimizer update. Non-finite train losses and gradients always fail fast before stepping. |
+| `mixed_precision` | `str` | `"off"` | Autocast mode: `off`, `bf16`, or `fp16`. `fp16` uses `GradScaler` on CUDA; `bf16` uses autocast without scaling. |
 
 ### `Trainer.step() -> dict`
 
