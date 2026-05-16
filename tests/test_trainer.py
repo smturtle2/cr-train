@@ -873,6 +873,45 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
         trainer.step()
 
 
+def test_trainer_b2_cache_src_skips_local_warmup_and_records_config(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.trainer as trainer_mod
+
+    warmup_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        trainer_mod,
+        "ensure_split_cache",
+        lambda **kwargs: warmup_calls.append(dict(kwargs)),
+    )
+    cache_dir = Path("cache")
+    output_dir = tmp_path / "run"
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.SGD(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=output_dir,
+        cache_dir=cache_dir,
+        cache_src="B2",
+        num_workers=0,
+    )
+
+    trainer._ensure_training_startup_caches()
+    trainer._write_config_once()
+    records = [
+        json.loads(line)
+        for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    config_record = next(record for record in records if record["kind"] == "config")
+
+    assert warmup_calls == []
+    assert trainer.cache_root == Path("cache")
+    assert config_record["cache_src"] == "B2"
+    assert config_record["dataloader_workers"] == 0
+    assert config_record["b2_download_workers"] == 16
+
+
 def test_trainer_prints_and_records_remote_retry_startup_events(monkeypatch, tmp_path: Path) -> None:
     import cr_train.data.runtime as runtime_mod
 

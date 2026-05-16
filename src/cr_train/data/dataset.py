@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import random
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,17 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset as TorchIterableDataset, get_worker_info
 
+from .cache_backend import (
+    BlockReader,
+    CacheSource,
+    LocalBlockReader,
+    resolve_b2_cache_repository,
+)
 from .constants import OPTICAL_CHANNELS, SAR_CHANNELS
 from .planning import plan_sample
 from .runtime import get_rank, get_world_size
 from .source import ensure_source_root, ensure_split_catalog, run_startup_stage
-from .store import BlockCachePaths, as_bytes, load_block, load_completed_block_index, resolve_block_cache_paths
+from .store import BlockCachePaths, as_bytes, load_completed_block_index, resolve_block_cache_paths
 
 _TRAIN_ACTIVE_BLOCK_COUNT = 8
 
@@ -31,10 +38,13 @@ class PreparedSplit:
 
 @dataclass(slots=True)
 class PreparedSplitState:
-    """Static split selection resolved against the local block cache."""
+    """Static split selection resolved against a block cache source."""
 
     split: str
-    cache_paths: BlockCachePaths
+    cache_paths: BlockCachePaths | None
+    block_reader: BlockReader
+    cache_src: CacheSource
+    cache_stage: str
     seed: int
     requested_rows: int
     effective_rows: int
@@ -57,6 +67,7 @@ class _SpatialTransformParams:
 
 @dataclass(slots=True, eq=False)
 class _ActiveBlockCursor:
+    cache_key: str
     rows: Any
     indices: list[int]
     next_index: int = 0
@@ -289,25 +300,30 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
     def __init__(
         self,
         *,
-        cache_paths,
+        block_reader: BlockReader,
         blocks: tuple[dict[str, Any], ...],
         seed: int,
         epoch: int,
         split: str,
         training: bool,
     ) -> None:
-        self.cache_paths = cache_paths
+        self.block_reader = block_reader
         self.blocks = blocks
         self.seed = seed
         self.epoch = epoch
         self.split = split
         self.training = training
 
-    def _load_active_block(self, *, block: dict[str, Any]) -> _ActiveBlockCursor:
+    def _load_block_cursor(
+        self,
+        *,
+        block: dict[str, Any],
+        shuffle_rows: bool,
+    ) -> _ActiveBlockCursor:
         cache_key = str(block["cache_key"])
-        rows = load_block(self.cache_paths, cache_key)
+        rows = self.block_reader.load_block(cache_key)
         indices = list(range(len(rows)))
-        if len(indices) > 1:
+        if shuffle_rows and len(indices) > 1:
             row_rng = random.Random(
                 _derive_block_seed(
                     self.seed,
@@ -317,7 +333,22 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                 )
             )
             row_rng.shuffle(indices)
-        return _ActiveBlockCursor(rows=rows, indices=indices)
+        return _ActiveBlockCursor(cache_key=cache_key, rows=rows, indices=indices)
+
+    def _load_active_block(self, *, block: dict[str, Any]) -> _ActiveBlockCursor:
+        return self._load_block_cursor(block=block, shuffle_rows=True)
+
+    def _load_block_rows(self, *, block: dict[str, Any]):
+        cache_key = str(block["cache_key"])
+        return self.block_reader.load_block(cache_key)
+
+    def _prefetch_blocks(self) -> bool:
+        return bool(getattr(self.block_reader, "prefetch_blocks", False))
+
+    def _release_block(self, cache_key: str) -> None:
+        release_block = getattr(self.block_reader, "release_block", None)
+        if release_block is not None:
+            release_block(cache_key)
 
     def _iter_training_rows(self, *, blocks: list[dict[str, Any]], worker_id: int):
         if not blocks:
@@ -334,33 +365,126 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
         active_blocks: list[_ActiveBlockCursor] = []
         round_robin: list[_ActiveBlockCursor] = []
         next_block_index = 0
+        prefetch_pool: ThreadPoolExecutor | None = None
+        prefetch_future: Future[_ActiveBlockCursor] | None = None
+
+        def start_prefetch() -> None:
+            nonlocal next_block_index, prefetch_pool, prefetch_future
+            if not self._prefetch_blocks() or prefetch_future is not None:
+                return
+            if next_block_index >= len(blocks):
+                return
+            if prefetch_pool is None:
+                prefetch_pool = ThreadPoolExecutor(max_workers=1)
+            block = blocks[next_block_index]
+            next_block_index += 1
+            prefetch_future = prefetch_pool.submit(
+                self._load_block_cursor,
+                block=block,
+                shuffle_rows=True,
+            )
+
+        def load_next_block() -> _ActiveBlockCursor | None:
+            nonlocal next_block_index, prefetch_future
+            if prefetch_future is not None:
+                cursor = prefetch_future.result()
+                prefetch_future = None
+                return cursor
+            if next_block_index >= len(blocks):
+                return None
+            block = blocks[next_block_index]
+            next_block_index += 1
+            return self._load_active_block(block=block)
 
         def refill_active_blocks() -> None:
-            nonlocal next_block_index
-            while (
-                len(active_blocks) < _TRAIN_ACTIVE_BLOCK_COUNT
-                and next_block_index < len(blocks)
-            ):
-                active_blocks.append(
-                    self._load_active_block(block=blocks[next_block_index])
-                )
-                next_block_index += 1
+            while len(active_blocks) < _TRAIN_ACTIVE_BLOCK_COUNT:
+                cursor = load_next_block()
+                if cursor is None:
+                    break
+                active_blocks.append(cursor)
+            start_prefetch()
 
-        refill_active_blocks()
-        while active_blocks:
-            if not round_robin:
-                round_robin = list(active_blocks)
-                mix_rng.shuffle(round_robin)
+        try:
+            refill_active_blocks()
+            while active_blocks:
+                if not round_robin:
+                    round_robin = list(active_blocks)
+                    mix_rng.shuffle(round_robin)
 
-            current_block = round_robin.pop()
-            yield current_block.pop()
+                current_block = round_robin.pop()
+                yield current_block.pop()
 
-            if current_block.exhausted:
-                active_blocks.remove(current_block)
-                round_robin = [
-                    candidate for candidate in round_robin if candidate is not current_block
-                ]
-                refill_active_blocks()
+                if current_block.exhausted:
+                    cache_key = current_block.cache_key
+                    active_blocks.remove(current_block)
+                    round_robin = [
+                        candidate for candidate in round_robin if candidate is not current_block
+                    ]
+                    del current_block
+                    self._release_block(cache_key)
+                    refill_active_blocks()
+        finally:
+            if prefetch_future is not None and prefetch_future.done():
+                try:
+                    prefetched_cursor = prefetch_future.result()
+                except Exception:
+                    pass
+                else:
+                    self._release_block(prefetched_cursor.cache_key)
+            if prefetch_future is not None:
+                prefetch_future.cancel()
+            if prefetch_pool is not None:
+                prefetch_pool.shutdown(wait=False, cancel_futures=True)
+            for cursor in active_blocks:
+                self._release_block(cursor.cache_key)
+
+    def _iter_evaluation_rows(self, *, blocks: list[dict[str, Any]]):
+        if not self._prefetch_blocks() or len(blocks) <= 1:
+            for block in blocks:
+                cache_key = str(block["cache_key"])
+                rows = self._load_block_rows(block=block)
+                try:
+                    yield from rows
+                finally:
+                    del rows
+                    self._release_block(cache_key)
+            return
+
+        prefetch_pool = ThreadPoolExecutor(max_workers=1)
+        prefetch_future: Future[Any] | None = None
+        try:
+            for index, block in enumerate(blocks):
+                if prefetch_future is None:
+                    rows = self._load_block_rows(block=block)
+                else:
+                    rows = prefetch_future.result()
+                    prefetch_future = None
+                next_index = index + 1
+                if next_index < len(blocks):
+                    prefetch_future = prefetch_pool.submit(
+                        self._load_block_rows,
+                        block=blocks[next_index],
+                    )
+                cache_key = str(block["cache_key"])
+                try:
+                    yield from rows
+                finally:
+                    del rows
+                    self._release_block(cache_key)
+        finally:
+            if prefetch_future is not None and prefetch_future.done():
+                try:
+                    prefetched_rows = prefetch_future.result()
+                except Exception:
+                    pass
+                else:
+                    del prefetched_rows
+                    next_index = index + 1
+                    if next_index < len(blocks):
+                        self._release_block(str(blocks[next_index]["cache_key"]))
+            if prefetch_future is not None:
+                prefetch_future.cancel()
+            prefetch_pool.shutdown(wait=False, cancel_futures=True)
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -372,10 +496,7 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
             yield from self._iter_training_rows(blocks=blocks, worker_id=worker_id)
             return
 
-        for block in blocks:
-            cache_key = str(block["cache_key"])
-            rows = load_block(self.cache_paths, cache_key)
-            yield from rows
+        yield from self._iter_evaluation_rows(blocks=blocks)
 
 
 CachedRowDataset = CachedBlockIterableDataset
@@ -409,6 +530,33 @@ def _resolve_selected_block_row_counts(
     return row_counts_by_key
 
 
+def _resolve_b2_selected_block_row_counts(
+    block_reader: Any,
+    selected_blocks: list[dict[str, Any]],
+) -> dict[str, int]:
+    cache_keys = tuple(str(block["cache_key"]) for block in selected_blocks)
+    load_many = getattr(block_reader, "load_block_metadata_many", None)
+    metadata_by_key = (
+        load_many(cache_keys)
+        if load_many is not None
+        else {
+            cache_key: block_reader.load_block_metadata(cache_key)
+            for cache_key in cache_keys
+        }
+    )
+    missing_cache_keys: list[str] = []
+    row_counts_by_key: dict[str, int] = {}
+    for cache_key in cache_keys:
+        metadata = metadata_by_key.get(cache_key)
+        if metadata is None:
+            missing_cache_keys.append(cache_key)
+            continue
+        row_counts_by_key[cache_key] = int(metadata["row_count"])
+    if missing_cache_keys:
+        raise FileNotFoundError(f"B2 split cache is missing requested blocks: {', '.join(missing_cache_keys)}")
+    return row_counts_by_key
+
+
 def resolve_prepared_split_state(
     *,
     split: str,
@@ -417,36 +565,68 @@ def resolve_prepared_split_state(
     max_samples: int | None,
     seed: int,
     cache_root: Path,
+    cache_src: CacheSource = "local",
+    b2_staging_dir: Path | None = None,
+    b2_staging_max_blocks: int = 20,
     startup_callback=None,
 ) -> PreparedSplitState:
-    """Resolve the static block selection for a split from the local cache."""
-    source_root, descriptor = ensure_source_root(
-        dataset_name=dataset_name,
-        revision=revision,
-        cache_root=cache_root,
-        startup_callback=startup_callback,
-    )
-    catalog = ensure_split_catalog(
-        source_root=source_root,
-        descriptor=descriptor,
-        split=split,
-        startup_callback=startup_callback,
-    )
+    """Resolve the static block selection for a split from the configured cache."""
+    cache_paths: BlockCachePaths | None = None
+    if cache_src == "local":
+        source_root, descriptor = ensure_source_root(
+            dataset_name=dataset_name,
+            revision=revision,
+            cache_root=cache_root,
+            startup_callback=startup_callback,
+        )
+        catalog = ensure_split_catalog(
+            source_root=source_root,
+            descriptor=descriptor,
+            split=split,
+            startup_callback=startup_callback,
+        )
+        cache_paths = resolve_block_cache_paths(source_root, split)
+        block_reader: BlockReader = LocalBlockReader(cache_paths)
+        cache_stage = "load local cache"
+    else:
+        b2_repository = resolve_b2_cache_repository(prefix=os.fspath(cache_root))
+        b2_source = b2_repository.find_source(dataset_name=dataset_name, revision=revision)
+        catalog = b2_repository.load_split_catalog(source=b2_source, split=split)
+        staging_root = (
+            Path.home() / ".cache" / "cr-train" / "b2-staging"
+            if b2_staging_dir is None
+            else b2_staging_dir
+        )
+        block_reader = b2_repository.staged_block_reader(
+            source=b2_source,
+            split=split,
+            staging_root=staging_root,
+            max_staged_blocks=b2_staging_max_blocks,
+        )
+        cache_stage = "load B2 cache"
+
     sample_plan = plan_sample(
         catalog,
         seed,
         max_samples,
         split=split,
     )
-    cache_paths = resolve_block_cache_paths(source_root, split)
     selected_blocks = _resolve_selected_blocks(
         catalog,
         selected_indices=[int(index) for index in sample_plan.selected_blocks.tolist()],
     )
-    row_counts_by_key = _resolve_selected_block_row_counts(cache_paths, selected_blocks)
+    if cache_src == "local":
+        if cache_paths is None:
+            raise RuntimeError("local cache paths were not resolved")
+        row_counts_by_key = _resolve_selected_block_row_counts(cache_paths, selected_blocks)
+    else:
+        row_counts_by_key = _resolve_b2_selected_block_row_counts(block_reader, selected_blocks)
     return PreparedSplitState(
         split=split,
         cache_paths=cache_paths,
+        block_reader=block_reader,
+        cache_src=cache_src,
+        cache_stage=cache_stage,
         seed=seed,
         requested_rows=sample_plan.requested_rows,
         effective_rows=int(sum(row_counts_by_key[str(block["cache_key"])] for block in selected_blocks)),
@@ -468,13 +648,16 @@ def prepare_split_from_state(
     selected_blocks = list(state.selected_blocks)
     ordered_blocks = _shuffle_blocks(selected_blocks, seed=state.seed, split=state.split, epoch=epoch) if training else selected_blocks
     rank_blocks = _slice_blocks_for_rank(ordered_blocks)
+    prepare_blocks = getattr(state.block_reader, "prepare_blocks", None)
+    if prepare_blocks is not None:
+        prepare_blocks(tuple(rank_blocks))
     num_examples = _count_rows_from_state(state, rank_blocks)
     dataset = run_startup_stage(
         startup_callback,
-        stage="load local cache",
+        stage=state.cache_stage,
         split=state.split,
         operation=lambda: CachedBlockIterableDataset(
-            cache_paths=state.cache_paths,
+            block_reader=state.block_reader,
             blocks=tuple(rank_blocks),
             seed=state.seed,
             epoch=epoch,
@@ -499,9 +682,12 @@ def prepare_split(
     epoch: int,
     training: bool,
     cache_root: Path,
+    cache_src: CacheSource = "local",
+    b2_staging_dir: Path | None = None,
+    b2_staging_max_blocks: int = 20,
     startup_callback=None,
 ) -> PreparedSplit:
-    """Build a PreparedSplit from the block cache. Missing blocks are fatal."""
+    """Build a PreparedSplit from the configured block cache. Missing blocks are fatal."""
     state = resolve_prepared_split_state(
         split=split,
         dataset_name=dataset_name,
@@ -509,6 +695,9 @@ def prepare_split(
         max_samples=max_samples,
         seed=seed,
         cache_root=cache_root,
+        cache_src=cache_src,
+        b2_staging_dir=b2_staging_dir,
+        b2_staging_max_blocks=b2_staging_max_blocks,
         startup_callback=startup_callback,
     )
     return prepare_split_from_state(

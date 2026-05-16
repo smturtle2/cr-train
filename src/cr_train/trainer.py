@@ -17,6 +17,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 
+from .data.cache_backend import CacheSource, b2_download_worker_count, normalize_cache_src
 from .data.constants import DATASET_ID
 from .data.dataset import (
     PreparedSplitState,
@@ -111,6 +112,9 @@ class Trainer:
         seed: int = 42,
         output_dir: str | Path = "runs/default",
         cache_dir: str | Path | None = None,
+        cache_src: CacheSource = "local",
+        b2_staging_dir: str | Path | None = None,
+        b2_staging_max_blocks: int = 20,
         num_workers: int | str = "auto",
         multiprocessing_context: str | None = None,
         train_crop_size: int | None = 128,
@@ -137,6 +141,8 @@ class Trainer:
             raise ValueError("train_crop_size must be greater than zero when provided")
         if grad_clip_norm is not None and grad_clip_norm <= 0:
             raise ValueError("grad_clip_norm must be greater than zero when provided")
+        if b2_staging_max_blocks <= 0:
+            raise ValueError("b2_staging_max_blocks must be greater than zero")
 
         self._validate_max_samples("max_train_samples", max_train_samples)
         self._validate_max_samples("max_val_samples", max_val_samples)
@@ -175,11 +181,21 @@ class Trainer:
         self.train_random_flip = bool(train_random_flip)
         self.train_random_rot90 = bool(train_random_rot90)
         self.grad_clip_norm = grad_clip_norm
+        self.cache_src = normalize_cache_src(cache_src)
 
         self.num_workers = resolve_num_workers(num_workers)
         self.output_dir = Path(output_dir)
         self.metrics_path = self.output_dir / "metrics.jsonl"
-        self.cache_root = resolve_cache_root(cache_dir)
+        if self.cache_src == "B2":
+            self.cache_root = Path(cache_dir) if cache_dir is not None else Path("cache")
+        else:
+            self.cache_root = resolve_cache_root(cache_dir)
+        self.b2_staging_dir = (
+            Path(b2_staging_dir)
+            if b2_staging_dir is not None
+            else Path.home() / ".cache" / "cr-train" / "b2-staging"
+        )
+        self.b2_staging_max_blocks = max(int(b2_staging_max_blocks), self.num_workers + 1)
 
         self.include_metadata = True
         self.pin_memory = True
@@ -659,6 +675,7 @@ class Trainer:
                 "accum_steps": self.accum_steps,
                 "epochs": self.epochs,
                 "num_workers": self.num_workers,
+                "dataloader_workers": self.num_workers,
                 "multiprocessing_context": self.multiprocessing_context,
                 "scheduler": self._scheduler_name(),
                 "scheduler_timing": self.scheduler_timing,
@@ -668,6 +685,10 @@ class Trainer:
                 "train_random_rot90": self.train_random_rot90,
                 "grad_clip_norm": self.grad_clip_norm,
                 "mixed_precision": self.mixed_precision,
+                "cache_src": self.cache_src,
+                "b2_download_workers": b2_download_worker_count() if self.cache_src == "B2" else None,
+                "b2_staging_dir": str(self.b2_staging_dir) if self.cache_src == "B2" else None,
+                "b2_staging_max_blocks": self.b2_staging_max_blocks if self.cache_src == "B2" else None,
             }
         )
         tqdm.write(
@@ -688,6 +709,7 @@ class Trainer:
                 scheduler_monitor=self.scheduler_monitor,
                 grad_clip_norm=self.grad_clip_norm,
                 mixed_precision=self.mixed_precision,
+                cache_src=self.cache_src,
             )
         )
 
@@ -713,6 +735,9 @@ class Trainer:
 
     def _ensure_split_cache(self, *, split: str, max_samples: int | None) -> None:
         if split in self._cache_ready:
+            return
+        if self.cache_src == "B2":
+            self._cache_ready.add(split)
             return
 
         ensure_split_cache(
@@ -753,6 +778,9 @@ class Trainer:
             max_samples=max_samples,
             seed=self.seed,
             cache_root=self.cache_root,
+            cache_src=self.cache_src,
+            b2_staging_dir=self.b2_staging_dir if self.cache_src == "B2" else None,
+            b2_staging_max_blocks=self.b2_staging_max_blocks,
         )
         self._prepared_split_states[key] = _PreparedSplitCacheEntry(
             split=split,

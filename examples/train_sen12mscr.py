@@ -202,7 +202,28 @@ def parse_args() -> argparse.Namespace:
         help="Autocast precision for model forward/loss. fp16 uses GradScaler on CUDA.",
     )
     parser.add_argument("--output-dir", default="runs/sen12mscr-example")
-    parser.add_argument("--cache-dir", default="/dhdd/.cache/cr-train")
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Local cache root for local mode, or B2 bucket prefix for B2 mode.",
+    )
+    parser.add_argument(
+        "--cache-src",
+        choices=("local", "B2"),
+        default="local",
+        help="Cache source. local uses cache_dir; B2 reads existing B2 cache objects on demand.",
+    )
+    parser.add_argument(
+        "--b2-staging-dir",
+        default=None,
+        help="Local staging directory for B2 blocks. B2 mode only.",
+    )
+    parser.add_argument(
+        "--b2-staging-max-blocks",
+        type=parse_positive_int,
+        default=20,
+        help="Maximum number of B2 blocks staged locally ahead of consumption. This is not a worker count.",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument(
@@ -321,6 +342,9 @@ def main() -> None:
             seed=args.seed,
             output_dir=args.output_dir,
             cache_dir=args.cache_dir,
+            cache_src=args.cache_src,
+            b2_staging_dir=args.b2_staging_dir,
+            b2_staging_max_blocks=args.b2_staging_max_blocks,
             train_crop_size=args.train_crop_size,
             train_random_flip=args.train_random_flip,
             train_random_rot90=args.train_random_rot90,

@@ -269,6 +269,7 @@ def format_config_banner(
     scheduler_monitor: str | None,
     grad_clip_norm: float | None,
     mixed_precision: str,
+    cache_src: str,
 ) -> str:
     header = f"{_BOLD}cr-train{_RESET} {_DIM}── {dataset_name} ── {device}{_RESET}"
     splits = (
@@ -282,7 +283,7 @@ def format_config_banner(
         f"accum {accum_steps}",
         f"epochs {epochs}",
         f"seed {seed}",
-        f"workers {num_workers}",
+        f"dataloader workers {num_workers}",
     ]
     if multiprocessing_context is not None:
         config_parts.append(f"mp {multiprocessing_context}")
@@ -295,6 +296,8 @@ def format_config_banner(
         config_parts.append(f"clip {format_metric_value(grad_clip_norm)}")
     if mixed_precision != "off":
         config_parts.append(f"amp {mixed_precision}")
+    if cache_src != "local":
+        config_parts.append(f"cache {cache_src}")
     config = f"  {_DIM}config{_RESET}  " + _summary_separator().join(config_parts)
     return f"{header}\n{splits}\n{config}"
 

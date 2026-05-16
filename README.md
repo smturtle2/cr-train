@@ -206,8 +206,11 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `epochs` | `int` | `1` | Total training epochs. Call `step()` once per epoch. |
 | `seed` | `int` | `42` | Seed controlling deterministic block selection and epoch-wise train sample order. |
 | `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and the default `save_checkpoint()` / `save_weights()` output files. |
-| `cache_dir` | `str \| Path \| None` | `None` | Block cache root. `None` = `~/.cache/cr-train`. |
-| `num_workers` | `int \| "auto"` | `"auto"` | DataLoader worker count. `"auto"` resolves to `min(4, max(1, os.cpu_count() // 4))`. |
+| `cache_dir` | `str \| Path \| None` | `None` | Cache location. In local mode this is the local block cache root (`None` = `~/.cache/cr-train`). In B2 mode this is the B2 bucket prefix (`None` = `cache`). |
+| `cache_src` | `"local" \| "B2"` | `"local"` | Cache source. `"local"` uses a local cache; `"B2"` reads existing B2 cache objects on demand from the configured B2 prefix. |
+| `b2_staging_dir` | `str \| Path \| None` | `None` | Local directory used only in B2 mode to stage blocks before DataLoader workers read them (`None` = `~/.cache/cr-train/b2-staging`). |
+| `b2_staging_max_blocks` | `int` | `20` | B2 staging buffer size in blocks. This is not a worker count; `Trainer` raises it to at least `num_workers + 1` to avoid blocking DataLoader workers. |
+| `num_workers` | `int \| "auto"` | `"auto"` | PyTorch DataLoader worker process count. `"auto"` resolves to `min(4, max(1, os.cpu_count() // 4))`; this is separate from the fixed 16 B2 download workers. |
 | `multiprocessing_context` | `str \| None` | `None` | Explicit worker start method. When `num_workers > 0` on CUDA, `Trainer` defaults this to `"spawn"` for safer worker startup. |
 | `train_crop_size` | `int \| None` | `128` | Apply random square crops of this size to train batches before they leave the collate step. |
 | `train_random_flip` | `bool` | `True` | Apply independent random vertical/horizontal flips to train batches. |
@@ -322,9 +325,11 @@ See [`examples/bitmask_sampling_demo.py`](examples/bitmask_sampling_demo.py) for
 
 ## Architecture
 
-`Trainer` reads the dataset through HuggingFace streaming, keeps a reusable local block cache keyed by row group, and records startup events in `metrics.jsonl`. Partial requests use deterministic uniform exact-k logical block selection keyed by `seed`, while full-split requests bypass sampling and select every row-group block in order. Training sample order still changes by epoch through `seed + epoch_index`, but samples are mixed across active cached blocks instead of draining one block at a time.
+`Trainer` defaults to HuggingFace streaming plus a reusable local block cache keyed by row group, and records startup events in `metrics.jsonl`. Partial requests use deterministic uniform exact-k logical block selection keyed by `seed`, while full-split requests bypass sampling and select every row-group block in order. Training sample order still changes by epoch through `seed + epoch_index`, but samples are mixed across active cached blocks instead of draining one block at a time.
 
-During warmup, `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing blocks are fetched from HuggingFace only when the selected row-group blocks are not already cached locally.
+Set `cache_src="B2"` to read an already-materialized B2 cache directly from object storage. B2 mode requires `B2_BUCKET`, `B2_ENDPOINT`, `B2_KEY_ID`, and `B2_APP_KEY`; interprets `cache_dir` as the B2 bucket prefix; and reads under `<cache_dir>/layout-v14/` (`cache/layout-v14/` by default). B2 downloads use 16 internal range download workers with 16 MiB ranges, while `num_workers` still controls PyTorch DataLoader processes. The staging downloader keeps a shared range queue across multiple blocks, targeting 2 GiB of queued/in-flight ranges to keep bandwidth steadier. Blocks are staged under `b2_staging_dir`, shared by DataLoader workers, and deleted after consumption. If that configured B2 prefix has no matching cache, or a selected cached object is missing or unreadable, it fails fast.
+
+In local mode, warmup prepares the selected splits from the local cache: `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing blocks are fetched from HuggingFace only when the selected row-group blocks are not already cached locally.
 
 - Cache warmup shows a tqdm progress bar during block download and prints a one-line `■/□` block timeline on completion.
 - Equal `seed` values keep the same uniform exact-k block-selection membership for partial requests; full-split requests always include every block.

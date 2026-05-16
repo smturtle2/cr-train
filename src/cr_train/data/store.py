@@ -203,6 +203,10 @@ def _parse_completed_marker_name(name: str) -> tuple[str, int] | None:
     return cache_key, row_count
 
 
+def parse_completed_marker_name(name: str) -> tuple[str, int] | None:
+    return _parse_completed_marker_name(name)
+
+
 def _completed_marker_paths(paths: BlockCachePaths, cache_key: str) -> list[Path]:
     return sorted(
         path
@@ -404,6 +408,25 @@ def _load_payload_strings(payload_metadata: dict[str, Any], *, field: str) -> tu
     return tuple(str(item) for item in payload_metadata[field])
 
 
+def build_mapped_block_payload(
+    *,
+    payload_metadata: dict[str, Any],
+    sar: np.ndarray,
+    cloudy: np.ndarray,
+    target: np.ndarray,
+) -> MappedBlockPayload:
+    return MappedBlockPayload(
+        sar=sar,
+        cloudy=cloudy,
+        target=target,
+        season=_load_payload_strings(payload_metadata, field="season"),
+        scene=_load_payload_strings(payload_metadata, field="scene"),
+        patch=_load_payload_strings(payload_metadata, field="patch"),
+        sar_shape=_load_payload_shapes(payload_metadata, field="sar_shape"),
+        opt_shape=_load_payload_shapes(payload_metadata, field="opt_shape"),
+    )
+
+
 def load_block(paths: BlockCachePaths, cache_key: str) -> MappedBlockPayload:
     path = block_data_path(paths, cache_key)
     try:
@@ -417,15 +440,11 @@ def load_block(paths: BlockCachePaths, cache_key: str) -> MappedBlockPayload:
             f"cached block payload is unreadable for {cache_key}; cache entry was cleared"
         ) from exc
 
-    return MappedBlockPayload(
+    return build_mapped_block_payload(
+        payload_metadata=payload_metadata,
         sar=sar,
         cloudy=cloudy,
         target=target,
-        season=_load_payload_strings(payload_metadata, field="season"),
-        scene=_load_payload_strings(payload_metadata, field="scene"),
-        patch=_load_payload_strings(payload_metadata, field="patch"),
-        sar_shape=_load_payload_shapes(payload_metadata, field="sar_shape"),
-        opt_shape=_load_payload_shapes(payload_metadata, field="opt_shape"),
     )
 
 
@@ -466,6 +485,7 @@ __all__ = [
     "block_is_cached",
     "block_lock_path",
     "block_metadata_path",
+    "build_mapped_block_payload",
     "clear_block_cache_entry",
     "find_completed_block_row_count",
     "file_lock",
@@ -473,6 +493,7 @@ __all__ = [
     "load_completed_block_index",
     "load_block",
     "load_block_metadata",
+    "parse_completed_marker_name",
     "read_json",
     "remove_tree",
     "resolve_block_cache_paths",

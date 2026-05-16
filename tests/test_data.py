@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib
 import json
 import pickle
@@ -28,6 +29,7 @@ from cr_train.data import (
 )
 from cr_train.data.dataset import prepare_split, prepare_split_from_state, resolve_prepared_split_state
 from cr_train.data.runtime import ensure_split_cache
+from cr_train.data.cache_backend import B2CacheRepository
 from cr_train.data.store import (
     block_data_path,
     block_is_cached,
@@ -38,6 +40,72 @@ from cr_train.data.store import (
     resolve_block_cache_paths,
     save_block,
 )
+
+
+class _FakeB2Body:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def read(self) -> bytes:
+        return self.payload
+
+
+class _FakeB2Client:
+    def __init__(self, objects: dict[str, bytes]) -> None:
+        self.objects = objects
+        self.requests: list[dict[str, object]] = []
+
+    def get_object(self, *, Bucket: str, Key: str, Range: str | None = None) -> dict[str, object]:
+        del Bucket
+        if Key not in self.objects:
+            from botocore.exceptions import ClientError
+
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "not found"}},
+                "GetObject",
+            )
+        self.requests.append({"operation": "get_object", "key": Key, "range": Range})
+        payload = self.objects[Key]
+        if Range is not None:
+            start_str, end_str = Range.removeprefix("bytes=").split("-", 1)
+            payload = payload[int(start_str): int(end_str) + 1]
+        return {"Body": _FakeB2Body(payload)}
+
+    def head_object(self, *, Bucket: str, Key: str) -> dict[str, object]:
+        del Bucket
+        if Key not in self.objects:
+            from botocore.exceptions import ClientError
+
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "not found"}},
+                "HeadObject",
+            )
+        self.requests.append({"operation": "head_object", "key": Key})
+        return {"ContentLength": len(self.objects[Key])}
+
+    def list_objects_v2(self, *, Bucket: str, Prefix: str, Delimiter: str | None = None, **kwargs) -> dict[str, object]:
+        del Bucket, kwargs
+        keys = sorted(key for key in self.objects if key.startswith(Prefix))
+        contents: list[dict[str, object]] = []
+        common_prefixes: set[str] = set()
+        for key in keys:
+            suffix = key[len(Prefix):]
+            if Delimiter is not None and Delimiter in suffix:
+                common_prefixes.add(Prefix + suffix.split(Delimiter, 1)[0] + Delimiter)
+                continue
+            contents.append({"Key": key, "Size": len(self.objects[key])})
+        return {
+            "IsTruncated": False,
+            "KeyCount": len(contents) + len(common_prefixes),
+            "Contents": contents,
+            "CommonPrefixes": [{"Prefix": prefix} for prefix in sorted(common_prefixes)],
+        }
+
+
+def _npy_bytes(array: np.ndarray) -> bytes:
+    buffer = io.BytesIO()
+    np.save(buffer, array, allow_pickle=False)
+    return buffer.getvalue()
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -201,6 +269,108 @@ def _catalog(split: str, blocks: list[list[dict[str, object]]]) -> tuple[dict[st
         "total_blocks": len(block_entries),
         "blocks": block_entries,
     }, rows_by_key
+
+
+def _small_b2_row(index: int) -> dict[str, object]:
+    sar = (np.arange(4 * 4 * 2, dtype=np.float32) + index).reshape(4, 4, 2)
+    cloudy = (np.arange(4 * 4 * 13, dtype=np.int16) + index).reshape(4, 4, 13)
+    target = (np.arange(4 * 4 * 13, dtype=np.int16) + index + 10).reshape(4, 4, 13)
+    return {
+        "sar": sar.tobytes(),
+        "cloudy": cloudy.tobytes(),
+        "target": target.tobytes(),
+        "sar_shape": [4, 4, 2],
+        "opt_shape": [4, 4, 13],
+        "season": "winter",
+        "scene": f"b2-scene-{index}",
+        "patch": f"b2-p{index:03d}",
+    }
+
+
+def _b2_cache_objects(
+    *,
+    split: str,
+    rows: list[dict[str, object]],
+    cache_prefix: str = "cache",
+) -> tuple[dict[str, bytes], dict[str, object]]:
+    return _b2_cache_objects_for_blocks(
+        split=split,
+        blocks=[rows],
+        cache_prefix=cache_prefix,
+    )
+
+
+def _b2_cache_objects_for_blocks(
+    *,
+    split: str,
+    blocks: list[list[dict[str, object]]],
+    cache_prefix: str = "cache",
+) -> tuple[dict[str, bytes], dict[str, list[dict[str, object]]]]:
+    catalog, rows_by_key = _catalog(split, blocks)
+    source_signature = "unit-source"
+    source_prefix = f"{cache_prefix.strip('/')}/layout-v14/{source_signature}"
+    descriptor = {
+        "cache_layout_version": 14,
+        "dataset_name": "unit/test",
+        "revision": None,
+        "source_signature": source_signature,
+        "split_sizes": {split: sum(len(rows) for rows in blocks)},
+    }
+    block_prefix = f"{source_prefix}/block_store/{split}"
+    objects = {
+        f"{source_prefix}/source.json": json.dumps(descriptor).encode("utf-8"),
+        f"{source_prefix}/catalogs/{split}.json": json.dumps(catalog).encode("utf-8"),
+    }
+    for block in catalog["blocks"]:
+        cache_key = str(block["cache_key"])
+        rows = rows_by_key[cache_key]
+        payload_metadata = {
+            "row_count": len(rows),
+            "season": [str(row["season"]) for row in rows],
+            "scene": [str(row["scene"]) for row in rows],
+            "patch": [str(row["patch"]) for row in rows],
+            "sar_shape": [list(row["sar_shape"]) for row in rows],
+            "opt_shape": [list(row["opt_shape"]) for row in rows],
+        }
+        sar = np.stack(
+            [
+                np.frombuffer(row["sar"], dtype=np.float32).reshape(row["sar_shape"])
+                for row in rows
+            ]
+        )
+        cloudy = np.stack(
+            [
+                np.frombuffer(row["cloudy"], dtype=np.int16).reshape(row["opt_shape"])
+                for row in rows
+            ]
+        )
+        target = np.stack(
+            [
+                np.frombuffer(row["target"], dtype=np.int16).reshape(row["opt_shape"])
+                for row in rows
+            ]
+        )
+        objects.update(
+            {
+                f"{block_prefix}/completed/{cache_key}.{len(rows)}.ok": b"",
+                f"{block_prefix}/metadata/{cache_key}.json": json.dumps(
+                    {
+                        "cache_key": cache_key,
+                        "split": split,
+                        "block_index": int(block["index"]),
+                        "shard_index": int(block["shard_index"]),
+                        "source_file": str(block["source_file"]),
+                        "row_groups": list(block["row_groups"]),
+                        "row_count": len(rows),
+                    }
+                ).encode("utf-8"),
+                f"{block_prefix}/blocks/{cache_key}/payload.json": json.dumps(payload_metadata).encode("utf-8"),
+                f"{block_prefix}/blocks/{cache_key}/sar.npy": _npy_bytes(sar),
+                f"{block_prefix}/blocks/{cache_key}/cloudy.npy": _npy_bytes(cloudy),
+                f"{block_prefix}/blocks/{cache_key}/target.npy": _npy_bytes(target),
+            }
+        )
+    return objects, rows_by_key
 
 
 def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list[list[dict[str, object]]]]) -> dict[str, object]:
@@ -1779,6 +1949,254 @@ def test_prepare_split_reads_cached_blocks_in_selected_order(monkeypatch, tmp_pa
         expected_scenes.extend(row["scene"] for row in patched["rows_by_key"][str(block["cache_key"])])
 
     assert batch_scenes == expected_scenes
+
+
+def test_prepare_split_reads_b2_cache_without_local_cache(monkeypatch, tmp_path: Path) -> None:
+    cache_prefix = "cache"
+    objects, _rows_by_key = _b2_cache_objects(
+        split="validation",
+        rows=[_small_b2_row(0), _small_b2_row(1)],
+        cache_prefix=cache_prefix,
+    )
+    fake_client = _FakeB2Client(objects)
+    resolved_prefixes: list[str] = []
+
+    def fake_resolve_b2_cache_repository(*, prefix=None):
+        resolved_prefixes.append(str(prefix))
+        return B2CacheRepository(
+            bucket="unit-bucket",
+            endpoint_url="https://example.invalid",
+            key_id="key-id",
+            app_key="app-key",
+            prefix=prefix,
+            client=fake_client,
+        )
+
+    monkeypatch.setattr(
+        "cr_train.data.dataset.resolve_b2_cache_repository",
+        fake_resolve_b2_cache_repository,
+    )
+    local_cache = tmp_path / "local-cache-must-not-exist"
+
+    prepared = prepare_split(
+        split="validation",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=1,
+        seed=13,
+        epoch=0,
+        training=False,
+        cache_root=Path(cache_prefix),
+        cache_src="B2",
+        b2_staging_dir=tmp_path / "b2-staging",
+    )
+    loader = build_dataloader(
+        prepared,
+        batch_size=2,
+        num_workers=0,
+        training=False,
+        seed=13,
+        epoch=0,
+    )
+    batches = list(loader)
+    batch = batches[0]
+
+    assert not local_cache.exists()
+    assert resolved_prefixes == [cache_prefix]
+    assert not list((tmp_path / "b2-staging").rglob("*.npy"))
+    assert prepared.num_examples == 2
+    assert tuple(batch["sar"].shape) == (2, 2, 4, 4)
+    assert tuple(batch["cloudy"].shape) == (2, 13, 4, 4)
+    assert tuple(batch["target"].shape) == (2, 13, 4, 4)
+    assert batch["meta"]["scene"] == ["b2-scene-0", "b2-scene-1"]
+
+
+def test_b2_cache_missing_payload_fails_without_local_fallback(monkeypatch, tmp_path: Path) -> None:
+    cache_prefix = "cache"
+    objects, _rows_by_key = _b2_cache_objects(
+        split="validation",
+        rows=[_small_b2_row(0)],
+        cache_prefix=cache_prefix,
+    )
+    missing_key = next(key for key in objects if key.endswith("/target.npy"))
+    del objects[missing_key]
+
+    def fake_resolve_b2_cache_repository(*, prefix=None):
+        return B2CacheRepository(
+            bucket="unit-bucket",
+            endpoint_url="https://example.invalid",
+            key_id="key-id",
+            app_key="app-key",
+            prefix=prefix,
+            client=_FakeB2Client(objects),
+        )
+
+    monkeypatch.setattr(
+        "cr_train.data.dataset.resolve_b2_cache_repository",
+        fake_resolve_b2_cache_repository,
+    )
+    local_cache = tmp_path / "local-cache-must-not-exist"
+    with pytest.raises(FileNotFoundError, match="B2 cache object is missing"):
+        prepare_split(
+            split="validation",
+            dataset_name="unit/test",
+            revision=None,
+            max_samples=1,
+            seed=13,
+            epoch=0,
+            training=False,
+            cache_root=Path(cache_prefix),
+            cache_src="B2",
+            b2_staging_dir=tmp_path / "b2-staging",
+        )
+    assert not local_cache.exists()
+
+
+def test_b2_cache_reads_large_payloads_with_range_requests(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.data.cache_backend as cache_backend
+
+    cache_prefix = "cache"
+    objects, _rows_by_key = _b2_cache_objects(
+        split="validation",
+        rows=[_small_b2_row(0), _small_b2_row(1)],
+        cache_prefix=cache_prefix,
+    )
+    monkeypatch.setattr(cache_backend, "_B2_DOWNLOAD_CHUNK_SIZE", 128)
+    monkeypatch.setattr(cache_backend, "_B2_DOWNLOAD_WORKERS", 16)
+    fake_client = _FakeB2Client(objects)
+    def fake_resolve_b2_cache_repository(*, prefix=None):
+        return B2CacheRepository(
+            bucket="unit-bucket",
+            endpoint_url="https://example.invalid",
+            key_id="key-id",
+            app_key="app-key",
+            prefix=prefix,
+            client=fake_client,
+        )
+
+    monkeypatch.setattr(
+        "cr_train.data.dataset.resolve_b2_cache_repository",
+        fake_resolve_b2_cache_repository,
+    )
+
+    prepared = prepare_split(
+        split="validation",
+        dataset_name="unit/test",
+        revision=None,
+        max_samples=1,
+        seed=13,
+        epoch=0,
+        training=False,
+        cache_root=Path(cache_prefix),
+        cache_src="B2",
+        b2_staging_dir=tmp_path / "b2-staging",
+    )
+    loader = build_dataloader(
+        prepared,
+        batch_size=2,
+        num_workers=0,
+        training=False,
+        seed=13,
+        epoch=0,
+    )
+    batch = next(iter(loader))
+
+    range_requests = [
+        request
+        for request in fake_client.requests
+        if request["operation"] == "get_object" and request.get("range") is not None
+    ]
+    head_requests = [
+        request
+        for request in fake_client.requests
+        if request["operation"] == "head_object"
+    ]
+    assert tuple(batch["sar"].shape) == (2, 2, 4, 4)
+    assert len(head_requests) == 3
+    assert range_requests
+    assert all("bytes=" in str(request["range"]) for request in range_requests)
+
+
+def test_b2_staging_downloader_uses_shared_range_scheduler(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import cr_train.data.cache_backend as cache_backend
+
+    objects, rows_by_key = _b2_cache_objects_for_blocks(
+        split="validation",
+        blocks=[
+            [_small_b2_row(0)],
+            [_small_b2_row(1)],
+        ],
+    )
+    fake_client = _FakeB2Client(objects)
+    monkeypatch.setattr(cache_backend, "_new_s3_client", lambda **kwargs: fake_client)
+    monkeypatch.setattr(cache_backend, "_B2_DOWNLOAD_CHUNK_SIZE", 128)
+    monkeypatch.setattr(cache_backend, "_B2_STAGING_TARGET_INFLIGHT_BYTES", 512)
+
+    staging_root = tmp_path / "stage"
+    cache_keys = tuple(rows_by_key)
+    cache_backend._run_b2_staging_downloader(
+        bucket="unit-bucket",
+        endpoint_url="https://example.invalid",
+        key_id="key-id",
+        app_key="app-key",
+        source_prefix="cache/layout-v14/unit-source",
+        split="validation",
+        staging_source_root=str(staging_root),
+        cache_keys=cache_keys,
+        max_staged_blocks=2,
+    )
+
+    cache_paths = resolve_block_cache_paths(staging_root, "validation")
+    range_requests = [
+        request
+        for request in fake_client.requests
+        if request["operation"] == "get_object" and request.get("range") is not None
+    ]
+
+    assert all(block_is_cached(cache_paths, cache_key) for cache_key in cache_keys)
+    assert range_requests
+    assert {request["key"].split("/blocks/", 1)[1].split("/", 1)[0] for request in range_requests} == set(cache_keys)
+
+
+def test_b2_cache_missing_configured_cache_prefix_fails(monkeypatch) -> None:
+    objects, _rows_by_key = _b2_cache_objects(
+        split="validation",
+        rows=[_small_b2_row(0)],
+        cache_prefix="cache",
+    )
+
+    def fake_resolve_b2_cache_repository(*, prefix=None):
+        return B2CacheRepository(
+            bucket="unit-bucket",
+            endpoint_url="https://example.invalid",
+            key_id="key-id",
+            app_key="app-key",
+            prefix=prefix,
+            client=_FakeB2Client(objects),
+        )
+
+    monkeypatch.setattr(
+        "cr_train.data.dataset.resolve_b2_cache_repository",
+        fake_resolve_b2_cache_repository,
+    )
+
+    with pytest.raises(FileNotFoundError, match="B2 cache source metadata was not found"):
+        prepare_split(
+            split="validation",
+            dataset_name="unit/test",
+            revision=None,
+            max_samples=1,
+            seed=13,
+            epoch=0,
+            training=False,
+            cache_root=Path("missing-cache"),
+            cache_src="B2",
+            b2_staging_dir=Path("unused-staging"),
+        )
 
 
 def test_prepare_split_training_order_changes_by_epoch(monkeypatch, tmp_path: Path) -> None:

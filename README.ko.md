@@ -206,8 +206,11 @@ raw draw order, 최종 선택 블록 인덱스, 그리고 선택(`■`) vs. 건�
 | `epochs` | `int` | `1` | 총 학습 epoch 수. epoch당 `step()` 한 번 호출. |
 | `seed` | `int` | `42` | 결정적 블록 선택과 epoch별 train sample 순서를 제어하는 시드. |
 | `output_dir` | `str \| Path` | `"runs/default"` | `metrics.jsonl`과 기본 `save_checkpoint()` / `save_weights()` 출력 파일 디렉토리. |
-| `cache_dir` | `str \| Path \| None` | `None` | block 캐시 루트. `None` = `~/.cache/cr-train`. |
-| `num_workers` | `int \| "auto"` | `"auto"` | DataLoader worker 수. `"auto"`는 `min(4, max(1, os.cpu_count() // 4))`로 해석됩니다. |
+| `cache_dir` | `str \| Path \| None` | `None` | 캐시 위치. local 모드에서는 로컬 block cache 루트(`None` = `~/.cache/cr-train`)이고, B2 모드에서는 B2 버킷 내부 prefix(`None` = `cache`)입니다. |
+| `cache_src` | `"local" \| "B2"` | `"local"` | 캐시 소스. `"local"`은 로컬 캐시를 사용하고, `"B2"`는 설정된 B2 prefix에서 기존 B2 캐시 객체를 on-demand로 읽습니다. |
+| `b2_staging_dir` | `str \| Path \| None` | `None` | B2 모드에서 DataLoader worker가 읽기 전에 block을 받아둘 로컬 staging 디렉토리(`None` = `~/.cache/cr-train/b2-staging`). |
+| `b2_staging_max_blocks` | `int` | `20` | B2 staging buffer 크기(block 수). worker 수가 아니며, `Trainer`는 DataLoader worker가 막히지 않도록 최소 `num_workers + 1`까지 올립니다. |
+| `num_workers` | `int \| "auto"` | `"auto"` | PyTorch DataLoader worker process 수. `"auto"`는 `min(4, max(1, os.cpu_count() // 4))`로 해석되며, 고정 16개인 B2 download worker와 별개입니다. |
 | `multiprocessing_context` | `str \| None` | `None` | worker 시작 방식을 명시합니다. CUDA에서 `num_workers > 0`이면 `Trainer`가 더 안전한 `"spawn"`을 기본값으로 사용합니다. |
 | `train_crop_size` | `int \| None` | `128` | collate 직전 train batch에 이 크기의 random square crop을 적용. |
 | `train_random_flip` | `bool` | `True` | train batch에 vertical/horizontal flip을 독립적으로 무작위 적용. |
@@ -322,9 +325,11 @@ from cr_train.data import BLOCK_SIZE, trace_plan_sample
 
 ## 내부 구조
 
-`Trainer`는 HuggingFace streaming으로 데이터를 읽고, row group 기준의 재사용 가능한 로컬 block cache를 유지하며, 시작 이벤트를 `metrics.jsonl`에 기록합니다. 부분 요청은 `seed` 기반의 결정적 uniform exact-k 논리 블록 선택을 사용하고, 전체 split 요청은 샘플링을 우회해 모든 row-group block을 순서대로 선택합니다. 학습 sample 순서는 `seed + epoch_index`에 따라 epoch마다 바뀌며, 한 block을 끝까지 비우지 않고 active cached block들 사이에서 섞어서 내보냅니다.
+`Trainer`는 기본적으로 HuggingFace streaming으로 데이터를 읽고, row group 기준의 재사용 가능한 로컬 block cache를 유지하며, 시작 이벤트를 `metrics.jsonl`에 기록합니다. 부분 요청은 `seed` 기반의 결정적 uniform exact-k 논리 블록 선택을 사용하고, 전체 split 요청은 샘플링을 우회해 모든 row-group block을 순서대로 선택합니다. 학습 sample 순서는 `seed + epoch_index`에 따라 epoch마다 바뀌며, 한 block을 끝까지 비우지 않고 active cached block들 사이에서 섞어서 내보냅니다.
 
-워밍업은 호출에 필요한 split만 수행합니다. `step()`은 `train`과 `validation`, `test()`는 `test`를 준비하며, 선택된 row-group block이 이미 로컬에 있지 않을 때만 HuggingFace에서 누락된 블록을 가져옵니다.
+`cache_src="B2"`를 설정하면 이미 materialized된 B2 캐시를 object storage에서 직접 읽습니다. B2 모드는 `B2_BUCKET`, `B2_ENDPOINT`, `B2_KEY_ID`, `B2_APP_KEY`가 필요하고, `cache_dir`를 B2 버킷 내부 prefix로 해석하며, `<cache_dir>/layout-v14/` 아래를 읽습니다(기본값은 `cache/layout-v14/`). B2 다운로드는 16 MiB range와 내부 range download worker 16개를 사용하고, `num_workers`는 여전히 PyTorch DataLoader process 수만 의미합니다. staging downloader는 여러 block의 range를 공유 queue에 넣고 queued/in-flight range를 2 GiB 수준으로 유지해 bandwidth가 덜 끊기게 합니다. block은 `b2_staging_dir` 아래에 받아 DataLoader worker들이 공유해서 읽고, 소비 후 삭제됩니다. 설정한 B2 prefix에 캐시가 없거나 선택된 캐시 객체가 없거나 읽을 수 없으면 즉시 실패합니다.
+
+local 모드에서 워밍업은 호출에 필요한 split만 로컬 캐시 기준으로 수행합니다. `step()`은 `train`과 `validation`, `test()`는 `test`를 준비하며, 선택된 row-group block이 이미 로컬에 있지 않을 때만 HuggingFace에서 누락된 블록을 가져옵니다.
 
 - 캐시 워밍업 시 tqdm 프로그레스 바로 블록 다운로드를 표시하고, 완료 시 한 줄 `■/□` 블록 타임라인을 출력합니다.
 - 부분 요청에서는 동일한 `seed`가 같은 uniform exact-k 블록 선택을 유지하고, 전체 split 요청은 항상 모든 block을 포함합니다.
