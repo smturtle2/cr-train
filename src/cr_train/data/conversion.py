@@ -11,7 +11,12 @@ from typing import Any
 import numpy as np
 
 from .constants import CACHE_BLOCK_SIZE, CACHE_LAYOUT_VERSION, LEGACY_CACHE_LAYOUT_VERSION
-from .source import _build_block_descriptor, resolve_catalog_path, resolve_source_metadata_path
+from .source import (
+    _build_block_descriptor,
+    mark_verified_full_split,
+    resolve_catalog_path,
+    resolve_source_metadata_path,
+)
 from .store import (
     BlockCachePaths,
     MappedBlockPayload,
@@ -251,6 +256,7 @@ def convert_v14_cache_to_v15(
                 "blocks": v15_blocks,
             },
         )
+        mark_verified_full_split(v15_source_root, split)
         total_samples += split_samples
 
     return V14ToV15ConversionResult(

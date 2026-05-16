@@ -962,6 +962,7 @@ def test_convert_v14_cache_to_v15_splits_and_packs_blocks(tmp_path: Path) -> Non
     assert catalog["block_row_counts"] == [CACHE_BLOCK_SIZE, 1]
     assert catalog["blocks"][0]["row_start"] == 0
     assert catalog["blocks"][1]["row_start"] == CACHE_BLOCK_SIZE
+    assert source_mod.is_full_split_verified(result.destination_root, "train")
     assert len(first_payload) == CACHE_BLOCK_SIZE
     assert len(second_payload) == 1
     assert first_payload[0]["scene"] == "b2-scene-0"
