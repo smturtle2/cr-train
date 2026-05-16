@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
         "--max-samples",
         type=parse_max_samples,
         default=64,
-        help="Requested rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
+        help="Requested rows; converted to cache-block count, or 'none'/'full'.",
     )
     parser.add_argument("--batch-size", type=parse_positive_int, default=8)
     parser.add_argument(

@@ -38,7 +38,7 @@
 
 - **Single-class API** -- `Trainer` with `step()` + `test()`, nothing else to learn
 - **Deterministic block sampling** -- one-seed system (`seed`) for exact reproducibility
-- **Smart cache warmup** -- fills only missing HF streaming row-group blocks and reuses them across plans
+- **Smart cache warmup** -- fills only missing cache blocks and reuses them across plans
 - **Distributed training** -- automatic DDP wrapping, rank-aware block partitioning, all-reduce metrics
 - **JSONL experiment tracking** -- every train/validation epoch and startup event recorded to `metrics.jsonl`
 - **Zero config data** -- ingests directly from [`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr) via `load_dataset(..., streaming=True)`; no manual download needed
@@ -145,7 +145,7 @@ uv run python examples/train_sen12mscr.py \
   --output-dir runs/sen12mscr-example
 ```
 
-Pass `--max-train-samples none` (or `full`) to bypass sampling, warm every row-group block, and train on the entire split.
+Pass `--max-train-samples none` (or `full`) to bypass sampling, warm every cache block, and train on the entire split.
 After a full split is completely warmed once, later runs reuse the cached source metadata and split catalog without contacting HF again unless the local cache becomes incomplete.
 Use `--accum-steps N` to accumulate gradients across `N` micro-batches before each optimizer update; `global_step` in `get_state()` and checkpoints counts optimizer updates, not micro-batches.
 Train batches use a deterministic sample-mixed order across active cached blocks, while validation and test keep the selected block order.
@@ -198,7 +198,7 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `scheduler` | `LRScheduler \| None` | `None` | Optional scheduler built from the same optimizer. Standard schedulers step once after validation. `ReduceLROnPlateau` is also supported. |
 | `scheduler_timing` | `str` | `"after_validation"` | When `Trainer` calls `scheduler.step()`. Supported values: `after_validation`, `before_optimizer_step`, `after_optimizer_step`. Keep epoch-based schedulers such as the bundled warmup-cosine example on the default `after_validation` timing. |
 | `scheduler_monitor` | `str \| None` | `None` | Monitor path for `ReduceLROnPlateau`. Default is `val.loss`. Supported values are `val.loss` and `val.metrics.<name>`. |
-| `max_train_samples` | `int \| None` | `None` | Requested train rows. Converted to block count using the fixed `BLOCK_SIZE=64` accounting unit. `None` = full split. |
+| `max_train_samples` | `int \| None` | `None` | Requested train rows. Converted to cache-block count using the active cache layout (`CACHE_BLOCK_SIZE=32` for layout-v15). `None` = full split. |
 | `max_val_samples` | `int \| None` | `None` | Same for validation. |
 | `max_test_samples` | `int \| None` | `None` | Same for test. |
 | `batch_size` | `int` | `4` | Batch size for all DataLoaders. |
@@ -325,11 +325,13 @@ See [`examples/bitmask_sampling_demo.py`](examples/bitmask_sampling_demo.py) for
 
 ## Architecture
 
-`Trainer` defaults to HuggingFace streaming plus a reusable local block cache keyed by row group, and records startup events in `metrics.jsonl`. Partial requests use deterministic uniform exact-k logical block selection keyed by `seed`, while full-split requests bypass sampling and select every row-group block in order. Training sample order still changes by epoch through `seed + epoch_index`, but samples are mixed across active cached blocks instead of draining one block at a time.
+`Trainer` defaults to HuggingFace streaming plus a reusable local block cache. Layout-v15 splits each 64-row source row group into 32-row compressed `.crpack` cache blocks and records startup events in `metrics.jsonl`. Partial requests use deterministic uniform exact-k logical block selection keyed by `seed`, while full-split requests bypass sampling and select every cache block in order. Training sample order still changes by epoch through `seed + epoch_index`, but samples are mixed across active cached blocks instead of draining one block at a time.
 
-Set `cache_src="B2"` to read an already-materialized B2 cache directly from object storage. B2 mode requires `B2_BUCKET`, `B2_ENDPOINT`, `B2_KEY_ID`, and `B2_APP_KEY`; interprets `cache_dir` as the B2 bucket prefix; and reads under `<cache_dir>/layout-v14/` (`cache/layout-v14/` by default). B2 downloads use 16 internal range download workers with 16 MiB ranges, while `num_workers` still controls PyTorch DataLoader processes. The staging downloader keeps a shared range queue across multiple blocks, targeting 2 GiB of queued/in-flight ranges to keep bandwidth steadier. Blocks are staged under `b2_staging_dir`, shared by DataLoader workers, and deleted after consumption. If that configured B2 prefix has no matching cache, or a selected cached object is missing or unreadable, it fails fast.
+Set `cache_src="B2"` to read an already-materialized B2 cache directly from object storage. B2 mode requires `B2_BUCKET`, `B2_ENDPOINT`, `B2_KEY_ID`, and `B2_APP_KEY`; interprets `cache_dir` as the B2 bucket prefix; and reads under `<cache_dir>/layout-v15/` (`cache/layout-v15/` by default). B2 downloads use 16 internal object download workers, while `num_workers` still controls PyTorch DataLoader processes. The staging downloader downloads compressed `.crpack` block objects into `b2_staging_dir`, shares them across DataLoader workers, and deletes each staged block after consumption. If that configured B2 prefix has no matching cache, or a selected cached object is missing or unreadable, it fails fast.
 
-In local mode, warmup prepares the selected splits from the local cache: `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing blocks are fetched from HuggingFace only when the selected row-group blocks are not already cached locally.
+Use `cr_train.data.convert_v14_cache_to_v15(...)` to convert an existing local layout-v14 cache into layout-v15 without downloading the dataset again.
+
+In local mode, warmup prepares the selected splits from the local cache: `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing blocks are fetched from HuggingFace only when the selected cache blocks are not already cached locally.
 
 - Cache warmup shows a tqdm progress bar during block download and prints a one-line `■/□` block timeline on completion.
 - Equal `seed` values keep the same uniform exact-k block-selection membership for partial requests; full-split requests always include every block.

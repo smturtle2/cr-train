@@ -16,14 +16,14 @@ from torch.utils.data import DataLoader, IterableDataset as TorchIterableDataset
 from .cache_backend import (
     BlockReader,
     CacheSource,
-    LocalBlockReader,
     resolve_b2_cache_repository,
 )
 from .constants import OPTICAL_CHANNELS, SAR_CHANNELS
 from .planning import plan_sample
 from .runtime import get_rank, get_world_size
 from .source import ensure_source_root, ensure_split_catalog, run_startup_stage
-from .store import BlockCachePaths, as_bytes, load_completed_block_index, resolve_block_cache_paths
+from .store import BlockCachePaths, as_bytes
+from .v15 import V15LocalBlockReader
 
 _TRAIN_ACTIVE_BLOCK_COUNT = 8
 
@@ -511,28 +511,11 @@ def _resolve_selected_blocks(
     return [catalog_blocks[index] for index in selected_indices]
 
 
-def _resolve_selected_block_row_counts(
-    cache_paths: BlockCachePaths,
-    selected_blocks: list[dict[str, Any]],
-) -> dict[str, int]:
-    completed_by_key = load_completed_block_index(cache_paths)
-    missing_cache_keys: list[str] = []
-    row_counts_by_key: dict[str, int] = {}
-    for block in selected_blocks:
-        cache_key = str(block["cache_key"])
-        row_count = completed_by_key.get(cache_key)
-        if row_count is None:
-            missing_cache_keys.append(cache_key)
-            continue
-        row_counts_by_key[cache_key] = row_count
-    if missing_cache_keys:
-        raise FileNotFoundError(f"split cache is missing requested blocks: {', '.join(missing_cache_keys)}")
-    return row_counts_by_key
-
-
-def _resolve_b2_selected_block_row_counts(
+def _resolve_reader_selected_block_row_counts(
     block_reader: Any,
     selected_blocks: list[dict[str, Any]],
+    *,
+    source_name: str,
 ) -> dict[str, int]:
     cache_keys = tuple(str(block["cache_key"]) for block in selected_blocks)
     load_many = getattr(block_reader, "load_block_metadata_many", None)
@@ -546,14 +529,20 @@ def _resolve_b2_selected_block_row_counts(
     )
     missing_cache_keys: list[str] = []
     row_counts_by_key: dict[str, int] = {}
-    for cache_key in cache_keys:
+    for block in selected_blocks:
+        cache_key = str(block["cache_key"])
         metadata = metadata_by_key.get(cache_key)
         if metadata is None:
             missing_cache_keys.append(cache_key)
             continue
-        row_counts_by_key[cache_key] = int(metadata["row_count"])
+        row_count = int(metadata["row_count"])
+        expected_row_count = int(block.get("row_count", row_count))
+        if row_count != expected_row_count:
+            missing_cache_keys.append(cache_key)
+            continue
+        row_counts_by_key[cache_key] = row_count
     if missing_cache_keys:
-        raise FileNotFoundError(f"B2 split cache is missing requested blocks: {', '.join(missing_cache_keys)}")
+        raise FileNotFoundError(f"{source_name} split cache is missing requested blocks: {', '.join(missing_cache_keys)}")
     return row_counts_by_key
 
 
@@ -585,8 +574,7 @@ def resolve_prepared_split_state(
             split=split,
             startup_callback=startup_callback,
         )
-        cache_paths = resolve_block_cache_paths(source_root, split)
-        block_reader: BlockReader = LocalBlockReader(cache_paths)
+        block_reader: BlockReader = V15LocalBlockReader(source_root=source_root, split=split)
         cache_stage = "load local cache"
     else:
         b2_repository = resolve_b2_cache_repository(prefix=os.fspath(cache_root))
@@ -615,12 +603,11 @@ def resolve_prepared_split_state(
         catalog,
         selected_indices=[int(index) for index in sample_plan.selected_blocks.tolist()],
     )
-    if cache_src == "local":
-        if cache_paths is None:
-            raise RuntimeError("local cache paths were not resolved")
-        row_counts_by_key = _resolve_selected_block_row_counts(cache_paths, selected_blocks)
-    else:
-        row_counts_by_key = _resolve_b2_selected_block_row_counts(block_reader, selected_blocks)
+    row_counts_by_key = _resolve_reader_selected_block_row_counts(
+        block_reader,
+        selected_blocks,
+        source_name="local" if cache_src == "local" else "B2",
+    )
     return PreparedSplitState(
         split=split,
         cache_paths=cache_paths,

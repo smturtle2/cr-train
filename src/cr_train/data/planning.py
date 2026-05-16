@@ -82,6 +82,13 @@ def _resolve_total_blocks(catalog: dict[str, object]) -> int:
     return int(math.ceil(total_rows / BLOCK_SIZE))
 
 
+def _resolve_cache_block_size(catalog: dict[str, object]) -> int:
+    block_size = int(catalog.get("cache_block_size", BLOCK_SIZE))
+    if block_size <= 0:
+        raise ValueError(f"cache_block_size must be greater than zero, got {block_size}")
+    return block_size
+
+
 def _estimate_effective_rows(
     catalog: dict[str, object],
     *,
@@ -101,7 +108,7 @@ def _estimate_effective_rows(
         return int(selected_blocks.size) * BLOCK_SIZE
     if selected_blocks.size >= total_blocks:
         return total_rows
-    return min(total_rows, int(selected_blocks.size) * BLOCK_SIZE)
+    return min(total_rows, int(selected_blocks.size) * _resolve_cache_block_size(catalog))
 
 
 def _resolve_requested_rows(total_rows: int, max_samples: int | None) -> int:
@@ -149,7 +156,8 @@ def trace_plan_sample(
             execution_block_count=total_blocks,
         )
 
-    required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE)))
+    cache_block_size = _resolve_cache_block_size(catalog)
+    required_blocks = min(total_blocks, int(math.ceil(requested_rows / cache_block_size)))
     selected_blocks, draw_order = _select_blocks_uniform_exact_k(
         required_blocks=required_blocks,
         total_blocks=total_blocks,
@@ -212,7 +220,8 @@ def plan_sample(
             execution_block_count=total_blocks,
         )
 
-    required_blocks = min(total_blocks, int(math.ceil(requested_rows / BLOCK_SIZE)))
+    cache_block_size = _resolve_cache_block_size(catalog)
+    required_blocks = min(total_blocks, int(math.ceil(requested_rows / cache_block_size)))
     selected_blocks, _draw_order = _select_blocks_uniform_exact_k(
         required_blocks=required_blocks,
         total_blocks=total_blocks,

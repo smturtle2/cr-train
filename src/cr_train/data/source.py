@@ -27,7 +27,7 @@ from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import close_session
 
 from .constants import (
-    BLOCK_SIZE,
+    CACHE_BLOCK_SIZE,
     CACHE_LAYOUT_VERSION,
     DATA_COLUMNS,
     HF_DATASETS_VERSION,
@@ -42,6 +42,7 @@ from .constants import (
     REMOTE_STREAMING_READ_RATE_LIMIT_RETRY_INTERVAL_SEC,
     REMOTE_STREAMING_READ_RETRY_INTERVAL_SEC,
     REMOTE_STREAMING_READ_SERVER_UNAVAILABLE_RETRY_INTERVAL_SEC,
+    SOURCE_BLOCK_SIZE,
     StartupCallback,
 )
 from .store import file_lock, freeze_row, read_json, write_json_atomic
@@ -135,6 +136,8 @@ class BlockDescriptor:
     cache_key: str
     source_file: str
     row_groups: tuple[int, ...]
+    row_start: int
+    row_count: int
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -143,6 +146,8 @@ class BlockDescriptor:
             "cache_key": self.cache_key,
             "source_file": self.source_file,
             "row_groups": list(self.row_groups),
+            "row_start": self.row_start,
+            "row_count": self.row_count,
         }
 
 
@@ -502,6 +507,7 @@ def load_source_descriptor(
         }
         source_signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
         return {
+            "cache_layout_version": CACHE_LAYOUT_VERSION,
             "dataset_name": dataset_name,
             "revision": revision,
             "source_signature": source_signature,
@@ -783,6 +789,8 @@ def _build_block_descriptor(
     shard_index: int,
     source_file: str,
     row_groups: tuple[int, ...],
+    row_start: int,
+    row_count: int,
 ) -> BlockDescriptor:
     payload = {
         "dataset_name": dataset_name,
@@ -790,6 +798,8 @@ def _build_block_descriptor(
         "split": split,
         "source_file": source_file,
         "row_groups": list(row_groups),
+        "row_start": int(row_start),
+        "row_count": int(row_count),
     }
     cache_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:32]
     return BlockDescriptor(
@@ -798,7 +808,16 @@ def _build_block_descriptor(
         cache_key=cache_key,
         source_file=source_file,
         row_groups=row_groups,
+        row_start=int(row_start),
+        row_count=int(row_count),
     )
+
+
+def _source_row_count_for_shard(*, shard_index: int, total_rows: int) -> int:
+    remaining = int(total_rows) - (int(shard_index) * SOURCE_BLOCK_SIZE)
+    if remaining <= 0:
+        return 0
+    return min(SOURCE_BLOCK_SIZE, remaining)
 
 
 def build_catalog(
@@ -825,25 +844,39 @@ def build_catalog(
         raise RuntimeError("unexpected row-group iterable layout after reshard")
 
     blocks = []
-    for index, (source_file, row_groups) in enumerate(zip(files, row_groups_list, strict=True)):
+    block_row_counts: list[int] = []
+    block_index = 0
+    for shard_index, (source_file, row_groups) in enumerate(zip(files, row_groups_list, strict=True)):
         if row_groups is None:
             raise RuntimeError("unexpected unsplit parquet shard after row-group reshard")
-        block = _build_block_descriptor(
-            dataset_name=dataset_name,
-            revision=revision,
-            split=split,
-            index=index,
-            shard_index=index,
-            source_file=str(source_file),
-            row_groups=tuple(int(value) for value in row_groups),
+        source_row_count = _source_row_count_for_shard(
+            shard_index=shard_index,
+            total_rows=total_rows,
         )
-        blocks.append(block.to_payload())
+        for row_start in range(0, source_row_count, CACHE_BLOCK_SIZE):
+            row_count = min(CACHE_BLOCK_SIZE, source_row_count - row_start)
+            block = _build_block_descriptor(
+                dataset_name=dataset_name,
+                revision=revision,
+                split=split,
+                index=block_index,
+                shard_index=shard_index,
+                source_file=str(source_file),
+                row_groups=tuple(int(value) for value in row_groups),
+                row_start=row_start,
+                row_count=row_count,
+            )
+            blocks.append(block.to_payload())
+            block_row_counts.append(row_count)
+            block_index += 1
 
     return {
         "cache_layout_version": CACHE_LAYOUT_VERSION,
+        "cache_block_size": CACHE_BLOCK_SIZE,
         "split": split,
         "total_rows": total_rows,
         "total_blocks": len(blocks),
+        "block_row_counts": block_row_counts,
         "blocks": blocks,
     }
 
@@ -934,14 +967,23 @@ def _load_block_rows_once(
         index=shard_index,
         contiguous=True,
     )
-    raw_rows = list(block_dataset.take(BLOCK_SIZE + 1))
+    raw_rows = list(block_dataset.take(SOURCE_BLOCK_SIZE + 1))
     row_count = len(raw_rows)
     block_context = _block_error_context(block, shard_index=shard_index)
     if row_count <= 0:
         raise RuntimeError(f"empty row-group shard: {block_context}")
-    if row_count > BLOCK_SIZE:
+    if row_count > SOURCE_BLOCK_SIZE:
         raise RuntimeError(
-            f"row-group shard exceeded BLOCK_SIZE={BLOCK_SIZE}: got {row_count}; {block_context}"
+            f"row-group shard exceeded SOURCE_BLOCK_SIZE={SOURCE_BLOCK_SIZE}: got {row_count}; {block_context}"
+        )
+
+    row_start = int(block.get("row_start", 0))
+    expected_row_count = int(block.get("row_count", row_count))
+    raw_rows = raw_rows[row_start : row_start + expected_row_count]
+    if len(raw_rows) != expected_row_count:
+        raise RuntimeError(
+            f"row-group shard did not contain requested cache slice: got {len(raw_rows)}, "
+            f"expected {expected_row_count}; {block_context}"
         )
 
     rows: list[dict[str, Any]] = []

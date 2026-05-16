@@ -19,10 +19,13 @@ from datasets import load_dataset
 
 from cr_train.data import (
     BLOCK_SIZE,
+    CACHE_BLOCK_SIZE,
     DATA_COLUMNS,
     PreparedSplit,
+    V14ToV15ConversionResult,
     build_collate_fn,
     build_dataloader,
+    convert_v14_cache_to_v15,
     decode_row,
     plan_sample,
     trace_plan_sample,
@@ -39,6 +42,16 @@ from cr_train.data.store import (
     load_block_metadata,
     resolve_block_cache_paths,
     save_block,
+)
+from cr_train.data.v15 import (
+    load_v15_block,
+    load_v15_block_metadata,
+    pack_v15_block,
+    read_v15_header_from_file,
+    unpack_v15_block_bytes,
+    v15_block_is_cached,
+    v15_block_path,
+    write_v15_block_arrays,
 )
 
 
@@ -249,24 +262,35 @@ def _make_scene_block_splits(scene_names: list[str]) -> list[list[dict[str, obje
 def _catalog(split: str, blocks: list[list[dict[str, object]]]) -> tuple[dict[str, object], dict[str, list[dict[str, object]]]]:
     rows_by_key: dict[str, list[dict[str, object]]] = {}
     block_entries = []
+    block_row_counts = []
     total_rows = 0
-    for index, rows in enumerate(blocks):
-        cache_key = hashlib.sha256(f"{split}:{index}".encode("utf-8")).hexdigest()[:16]
-        rows_by_key[cache_key] = [dict(row) for row in rows]
-        block_entries.append(
-            {
-                "index": index,
-                "shard_index": index,
-                "cache_key": cache_key,
-                "source_file": f"hf://datasets/unit/test/{split}/{index:04d}.parquet",
-                "row_groups": [index],
-            }
-        )
+    for source_index, rows in enumerate(blocks):
+        for row_start in range(0, len(rows), CACHE_BLOCK_SIZE):
+            row_count = min(CACHE_BLOCK_SIZE, len(rows) - row_start)
+            cache_key = hashlib.sha256(
+                f"{split}:{source_index}:{row_start}:{row_count}".encode("utf-8")
+            ).hexdigest()[:16]
+            rows_by_key[cache_key] = [dict(row) for row in rows[row_start : row_start + row_count]]
+            block_entries.append(
+                {
+                    "index": len(block_entries),
+                    "shard_index": source_index,
+                    "cache_key": cache_key,
+                    "source_file": f"hf://datasets/unit/test/{split}/{source_index:04d}.parquet",
+                    "row_groups": [source_index],
+                    "row_start": row_start,
+                    "row_count": row_count,
+                }
+            )
+            block_row_counts.append(row_count)
         total_rows += len(rows)
     return {
+        "cache_layout_version": 15,
+        "cache_block_size": CACHE_BLOCK_SIZE,
         "split": split,
         "total_rows": total_rows,
         "total_blocks": len(block_entries),
+        "block_row_counts": block_row_counts,
         "blocks": block_entries,
     }, rows_by_key
 
@@ -308,9 +332,9 @@ def _b2_cache_objects_for_blocks(
 ) -> tuple[dict[str, bytes], dict[str, list[dict[str, object]]]]:
     catalog, rows_by_key = _catalog(split, blocks)
     source_signature = "unit-source"
-    source_prefix = f"{cache_prefix.strip('/')}/layout-v14/{source_signature}"
+    source_prefix = f"{cache_prefix.strip('/')}/layout-v15/{source_signature}"
     descriptor = {
-        "cache_layout_version": 14,
+        "cache_layout_version": 15,
         "dataset_name": "unit/test",
         "revision": None,
         "source_signature": source_signature,
@@ -350,27 +374,52 @@ def _b2_cache_objects_for_blocks(
                 for row in rows
             ]
         )
+        metadata = {
+            "cache_key": cache_key,
+            "split": split,
+            "block_index": int(block["index"]),
+            "shard_index": int(block["shard_index"]),
+            "source_file": str(block["source_file"]),
+            "row_groups": list(block["row_groups"]),
+            "row_start": int(block["row_start"]),
+            "row_count": len(rows),
+        }
         objects.update(
             {
-                f"{block_prefix}/completed/{cache_key}.{len(rows)}.ok": b"",
-                f"{block_prefix}/metadata/{cache_key}.json": json.dumps(
-                    {
-                        "cache_key": cache_key,
-                        "split": split,
-                        "block_index": int(block["index"]),
-                        "shard_index": int(block["shard_index"]),
-                        "source_file": str(block["source_file"]),
-                        "row_groups": list(block["row_groups"]),
-                        "row_count": len(rows),
-                    }
-                ).encode("utf-8"),
-                f"{block_prefix}/blocks/{cache_key}/payload.json": json.dumps(payload_metadata).encode("utf-8"),
-                f"{block_prefix}/blocks/{cache_key}/sar.npy": _npy_bytes(sar),
-                f"{block_prefix}/blocks/{cache_key}/cloudy.npy": _npy_bytes(cloudy),
-                f"{block_prefix}/blocks/{cache_key}/target.npy": _npy_bytes(target),
+                f"{block_prefix}/blocks/{cache_key}.crpack": pack_v15_block(
+                    payload_metadata=payload_metadata,
+                    metadata=metadata,
+                    sar=sar,
+                    cloudy=cloudy,
+                    target=target,
+                ),
             }
         )
     return objects, rows_by_key
+
+
+def _rewrite_v15_block_metadata(
+    *,
+    source_root: Path,
+    split: str,
+    cache_key: str,
+    mutate_metadata,
+) -> None:
+    path = v15_block_path(source_root, split, cache_key)
+    header = read_v15_header_from_file(path)
+    payload, metadata = unpack_v15_block_bytes(path.read_bytes())
+    stale_metadata = dict(metadata)
+    mutate_metadata(stale_metadata)
+    write_v15_block_arrays(
+        source_root=source_root,
+        split=split,
+        cache_key=cache_key,
+        payload_metadata=header["payload_metadata"],
+        metadata=stale_metadata,
+        sar=payload.sar,
+        cloudy=payload.cloudy,
+        target=payload.target,
+    )
 
 
 def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list[list[dict[str, object]]]]) -> dict[str, object]:
@@ -556,6 +605,7 @@ def test_data_package_public_surface_is_minimal_and_explicit() -> None:
 
     assert set(data_mod.__all__) == {
         "BLOCK_SIZE",
+        "CACHE_BLOCK_SIZE",
         "CachedRowDataset",
         "DATASET_ID",
         "DATA_COLUMNS",
@@ -564,8 +614,10 @@ def test_data_package_public_surface_is_minimal_and_explicit() -> None:
         "SAR_CHANNELS",
         "SamplePlan",
         "SelectionTrace",
+        "V14ToV15ConversionResult",
         "build_collate_fn",
         "build_dataloader",
+        "convert_v14_cache_to_v15",
         "decode_row",
         "move_batch_to_device",
         "plan_sample",
@@ -837,6 +889,83 @@ def test_load_block_does_not_call_torch_load(monkeypatch, tmp_path: Path) -> Non
 
     assert len(payload) == 1
     assert payload[0]["scene"] == "0"
+
+
+def test_convert_v14_cache_to_v15_splits_and_packs_blocks(tmp_path: Path) -> None:
+    import cr_train.data.source as source_mod
+
+    source_cache_root = tmp_path / "cache"
+    v14_source_root = source_cache_root / "layout-v14" / "unit-v14"
+    rows = [_small_b2_row(index) for index in range(CACHE_BLOCK_SIZE + 1)]
+    descriptor = {
+        "cache_layout_version": 14,
+        "dataset_name": "unit/test",
+        "revision": None,
+        "source_signature": "unit-v14",
+        "split_sizes": {"train": len(rows)},
+    }
+    source_mod.write_json_atomic(source_mod.resolve_source_metadata_path(v14_source_root), descriptor)
+    source_mod.write_json_atomic(
+        source_mod.resolve_catalog_path(v14_source_root, "train"),
+        {
+            "cache_layout_version": 14,
+            "split": "train",
+            "total_rows": len(rows),
+            "total_blocks": 1,
+            "blocks": [
+                {
+                    "index": 0,
+                    "shard_index": 3,
+                    "cache_key": "v14-block",
+                    "source_file": "hf://datasets/unit/test/train/0003.parquet",
+                    "row_groups": [3],
+                }
+            ],
+        },
+    )
+    save_block(
+        resolve_block_cache_paths(v14_source_root, "train"),
+        cache_key="v14-block",
+        rows=rows,
+        metadata={
+            "cache_key": "v14-block",
+            "split": "train",
+            "block_index": 0,
+            "shard_index": 3,
+            "source_file": "hf://datasets/unit/test/train/0003.parquet",
+            "row_groups": [3],
+            "row_count": len(rows),
+        },
+    )
+
+    result = convert_v14_cache_to_v15(
+        source_cache_root=source_cache_root,
+        dataset_name="unit/test",
+        revision=None,
+    )
+
+    catalog = source_mod.read_json(source_mod.resolve_catalog_path(result.destination_root, "train"))
+    first_key = str(catalog["blocks"][0]["cache_key"])
+    second_key = str(catalog["blocks"][1]["cache_key"])
+    first_payload = load_v15_block(result.destination_root, "train", first_key)
+    second_payload = load_v15_block(result.destination_root, "train", second_key)
+
+    assert isinstance(result, V14ToV15ConversionResult)
+    assert result.source_root == v14_source_root
+    assert result.splits == ("train",)
+    assert result.samples == CACHE_BLOCK_SIZE + 1
+    assert result.blocks == 2
+    assert result.raw_bytes > 0
+    assert result.compressed_bytes > 0
+    assert catalog["cache_layout_version"] == 15
+    assert catalog["cache_block_size"] == CACHE_BLOCK_SIZE
+    assert catalog["block_row_counts"] == [CACHE_BLOCK_SIZE, 1]
+    assert catalog["blocks"][0]["row_start"] == 0
+    assert catalog["blocks"][1]["row_start"] == CACHE_BLOCK_SIZE
+    assert len(first_payload) == CACHE_BLOCK_SIZE
+    assert len(second_payload) == 1
+    assert first_payload[0]["scene"] == "b2-scene-0"
+    assert second_payload[0]["scene"] == f"b2-scene-{CACHE_BLOCK_SIZE}"
 
 
 def test_plan_sample_is_block_reproducible_within_total_block_domain() -> None:
@@ -1141,6 +1270,7 @@ def test_load_source_descriptor_retries_closed_client_failures_and_resets_hf_sta
     )
 
     retry_events = [event for event in startup_events if event["stage"] == "remote retry"]
+    assert descriptor["cache_layout_version"] == source_mod.CACHE_LAYOUT_VERSION
     assert descriptor["split_sizes"] == {"train": 128, "validation": 64}
     assert call_count == 3
     assert len(retry_events) == 2
@@ -1429,13 +1559,23 @@ def test_build_catalog_records_shard_index(monkeypatch, parquet_row_group_path: 
         total_rows=(11 * BLOCK_SIZE) + 11,
     )
 
-    assert len(catalog["blocks"]) == 12
+    assert len(catalog["blocks"]) == 23
     assert all("shard_index" in block for block in catalog["blocks"])
     assert all("cache_key" in block for block in catalog["blocks"])
     assert all("source_file" in block for block in catalog["blocks"])
     assert all("row_groups" in block for block in catalog["blocks"])
-    assert catalog["blocks"][11]["shard_index"] == 11
-    assert catalog["blocks"][11]["row_groups"] == [11]
+    assert all("row_start" in block for block in catalog["blocks"])
+    assert all("row_count" in block for block in catalog["blocks"])
+    assert catalog["blocks"][0]["shard_index"] == 0
+    assert catalog["blocks"][0]["row_start"] == 0
+    assert catalog["blocks"][0]["row_count"] == CACHE_BLOCK_SIZE
+    assert catalog["blocks"][1]["shard_index"] == 0
+    assert catalog["blocks"][1]["row_start"] == CACHE_BLOCK_SIZE
+    assert catalog["blocks"][1]["row_count"] == CACHE_BLOCK_SIZE
+    assert catalog["blocks"][22]["shard_index"] == 11
+    assert catalog["blocks"][22]["row_groups"] == [11]
+    assert catalog["blocks"][22]["row_start"] == 0
+    assert catalog["blocks"][22]["row_count"] == 11
 
 
 def test_ensure_source_root_skips_remote_descriptor_for_verified_full_source(monkeypatch, tmp_path: Path) -> None:
@@ -1668,10 +1808,9 @@ def test_verified_full_split_revokes_and_recovers_after_missing_payload(monkeypa
     patched["remote_state"]["descriptor_mode"] = "fail"
     patched["remote_state"]["catalog_mode"] = "fail"
 
-    cache_paths = resolve_block_cache_paths(patched["source_root"], "train")
     first_block = patched["catalogs"]["train"]["blocks"][0]
     cache_key = str(first_block["cache_key"])
-    (block_data_path(cache_paths, cache_key) / "sar.npy").unlink()
+    v15_block_path(patched["source_root"], "train", cache_key).unlink()
 
     ensure_split_cache(
         split="train",
@@ -1685,7 +1824,7 @@ def test_verified_full_split_revokes_and_recovers_after_missing_payload(monkeypa
     assert patched["descriptor_calls"] == [dataset_name]
     assert patched["catalog_calls"] == ["train"]
     assert patched["load_counts"][cache_key] == 2
-    assert block_is_cached(cache_paths, cache_key) is True
+    assert v15_block_is_cached(patched["source_root"], "train", cache_key) is True
     assert source_mod.load_source_local_state(patched["source_root"])["verified_full_splits"] == ["train"]
 
 
@@ -1730,18 +1869,16 @@ def test_ensure_split_cache_refills_stale_block_cache(
         cache_root=tmp_path,
     )
 
-    cache_paths = resolve_block_cache_paths(patched["source_root"], "train")
-    metadata_path = block_metadata_path(cache_paths, cache_key)
-    metadata = load_block_metadata(cache_paths, cache_key)
+    metadata = load_v15_block_metadata(patched["source_root"], "train", cache_key)
 
     assert metadata is not None
     assert patched["load_counts"][cache_key] == 1
-    marker_path = cache_paths.completed_root / f"{cache_key}.{int(metadata['row_count'])}.ok"
-    marker_path.unlink()
-
-    stale_metadata = dict(metadata)
-    mutate_metadata(stale_metadata)
-    metadata_path.write_text(json.dumps(stale_metadata, sort_keys=True, indent=2), encoding="utf-8")
+    _rewrite_v15_block_metadata(
+        source_root=patched["source_root"],
+        split="train",
+        cache_key=cache_key,
+        mutate_metadata=mutate_metadata,
+    )
 
     ensure_split_cache(
         split="train",
@@ -1752,17 +1889,17 @@ def test_ensure_split_cache_refills_stale_block_cache(
         cache_root=tmp_path,
     )
 
-    refilled_metadata = load_block_metadata(cache_paths, cache_key)
+    refilled_metadata = load_v15_block_metadata(patched["source_root"], "train", cache_key)
 
     assert refilled_metadata is not None
     assert patched["load_counts"][cache_key] == 2
     assert refilled_metadata["shard_index"] == block["shard_index"]
     assert refilled_metadata["source_file"] == block["source_file"]
     assert refilled_metadata["row_groups"] == block["row_groups"]
-    assert 0 < int(refilled_metadata["row_count"]) <= BLOCK_SIZE
+    assert 0 < int(refilled_metadata["row_count"]) <= CACHE_BLOCK_SIZE
 
 
-def test_ensure_split_cache_backfills_completed_marker_from_legacy_metadata(monkeypatch, tmp_path: Path) -> None:
+def test_ensure_split_cache_reuses_v15_header_metadata(monkeypatch, tmp_path: Path) -> None:
     split_blocks = {"train": _make_block_splits(1)}
     patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
     block = patched["catalogs"]["train"]["blocks"][0]
@@ -1777,11 +1914,8 @@ def test_ensure_split_cache_backfills_completed_marker_from_legacy_metadata(monk
         cache_root=tmp_path,
     )
 
-    cache_paths = resolve_block_cache_paths(patched["source_root"], "train")
-    metadata = load_block_metadata(cache_paths, cache_key)
+    metadata = load_v15_block_metadata(patched["source_root"], "train", cache_key)
     assert metadata is not None
-    marker_path = cache_paths.completed_root / f"{cache_key}.{int(metadata['row_count'])}.ok"
-    marker_path.unlink()
     patched["load_counts"][cache_key] = 0
 
     ensure_split_cache(
@@ -1794,10 +1928,10 @@ def test_ensure_split_cache_backfills_completed_marker_from_legacy_metadata(monk
     )
 
     assert patched["load_counts"][cache_key] == 0
-    assert find_completed_block_row_count(cache_paths, cache_key) == int(metadata["row_count"])
+    assert load_v15_block_metadata(patched["source_root"], "train", cache_key) == metadata
 
 
-def test_broken_payload_clears_completed_marker_and_next_warmup_refills(monkeypatch, tmp_path: Path) -> None:
+def test_broken_crpack_next_warmup_refills(monkeypatch, tmp_path: Path) -> None:
     split_blocks = {"train": _make_block_splits(1)}
     patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
     block = patched["catalogs"]["train"]["blocks"][0]
@@ -1812,9 +1946,7 @@ def test_broken_payload_clears_completed_marker_and_next_warmup_refills(monkeypa
         cache_root=tmp_path,
     )
 
-    cache_paths = resolve_block_cache_paths(patched["source_root"], "train")
-    payload_path = block_data_path(cache_paths, cache_key)
-    (payload_path / "sar.npy").unlink()
+    v15_block_path(patched["source_root"], "train", cache_key).write_bytes(b"not a crpack")
 
     ensure_split_cache(
         split="train",
@@ -1826,8 +1958,8 @@ def test_broken_payload_clears_completed_marker_and_next_warmup_refills(monkeypa
     )
 
     assert patched["load_counts"][cache_key] == 2
-    assert block_is_cached(cache_paths, cache_key) is True
-    assert find_completed_block_row_count(cache_paths, cache_key) == BLOCK_SIZE
+    assert v15_block_is_cached(patched["source_root"], "train", cache_key) is True
+    assert load_v15_block_metadata(patched["source_root"], "train", cache_key)["row_count"] == CACHE_BLOCK_SIZE
 
     ensure_split_cache(
         split="train",
@@ -1839,10 +1971,10 @@ def test_broken_payload_clears_completed_marker_and_next_warmup_refills(monkeypa
     )
 
     assert patched["load_counts"][cache_key] == 2
-    assert block_is_cached(cache_paths, cache_key) is True
+    assert v15_block_is_cached(patched["source_root"], "train", cache_key) is True
 
 
-def test_marker_backed_cache_hit_skips_metadata_revalidation(monkeypatch, tmp_path: Path) -> None:
+def test_v15_header_cache_hit_skips_refill(monkeypatch, tmp_path: Path) -> None:
     import cr_train.data.runtime as runtime_mod
 
     split_blocks = {"train": _make_block_splits(2)}
@@ -1857,11 +1989,7 @@ def test_marker_backed_cache_hit_skips_metadata_revalidation(monkeypatch, tmp_pa
         cache_root=tmp_path,
     )
 
-    monkeypatch.setattr(
-        runtime_mod,
-        "load_block_metadata",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("metadata reload should not run")),
-    )
+    monkeypatch.setattr(runtime_mod, "load_block_rows", lambda **kwargs: (_ for _ in ()).throw(AssertionError("refill should not run")))
 
     ensure_split_cache(
         split="train",
@@ -1873,7 +2001,7 @@ def test_marker_backed_cache_hit_skips_metadata_revalidation(monkeypatch, tmp_pa
     )
 
 
-def test_resolve_prepared_split_state_uses_completed_markers(monkeypatch, tmp_path: Path) -> None:
+def test_resolve_prepared_split_state_uses_v15_header_metadata(monkeypatch, tmp_path: Path) -> None:
     split_blocks = {"train": _make_block_splits(2)}
     patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
 
@@ -1895,10 +2023,10 @@ def test_resolve_prepared_split_state_uses_completed_markers(monkeypatch, tmp_pa
         cache_root=tmp_path,
     )
 
-    assert state.required_blocks == 2
-    assert len(state.row_counts_by_key) == 2
+    assert state.required_blocks == 4
+    assert len(state.row_counts_by_key) == 4
     assert sum(state.row_counts_by_key.values()) == 2 * BLOCK_SIZE
-    assert set(state.row_counts_by_key.values()) == {BLOCK_SIZE}
+    assert set(state.row_counts_by_key.values()) == {CACHE_BLOCK_SIZE}
 
 
 def test_prepare_split_reads_cached_blocks_in_selected_order(monkeypatch, tmp_path: Path) -> None:
@@ -2018,7 +2146,7 @@ def test_b2_cache_missing_payload_fails_without_local_fallback(monkeypatch, tmp_
         rows=[_small_b2_row(0)],
         cache_prefix=cache_prefix,
     )
-    missing_key = next(key for key in objects if key.endswith("/target.npy"))
+    missing_key = next(key for key in objects if key.endswith(".crpack"))
     del objects[missing_key]
 
     def fake_resolve_b2_cache_repository(*, prefix=None):
@@ -2036,7 +2164,7 @@ def test_b2_cache_missing_payload_fails_without_local_fallback(monkeypatch, tmp_
         fake_resolve_b2_cache_repository,
     )
     local_cache = tmp_path / "local-cache-must-not-exist"
-    with pytest.raises(FileNotFoundError, match="B2 cache object is missing"):
+    with pytest.raises(FileNotFoundError, match="B2 split cache is missing requested blocks"):
         prepare_split(
             split="validation",
             dataset_name="unit/test",
@@ -2063,7 +2191,6 @@ def test_b2_cache_reads_large_payloads_with_range_requests(
         rows=[_small_b2_row(0), _small_b2_row(1)],
         cache_prefix=cache_prefix,
     )
-    monkeypatch.setattr(cache_backend, "_B2_DOWNLOAD_CHUNK_SIZE", 128)
     monkeypatch.setattr(cache_backend, "_B2_DOWNLOAD_WORKERS", 16)
     fake_client = _FakeB2Client(objects)
     def fake_resolve_b2_cache_repository(*, prefix=None):
@@ -2108,18 +2235,20 @@ def test_b2_cache_reads_large_payloads_with_range_requests(
         for request in fake_client.requests
         if request["operation"] == "get_object" and request.get("range") is not None
     ]
-    head_requests = [
+    full_payload_requests = [
         request
         for request in fake_client.requests
-        if request["operation"] == "head_object"
+        if request["operation"] == "get_object"
+        and request.get("range") is None
+        and str(request["key"]).endswith(".crpack")
     ]
     assert tuple(batch["sar"].shape) == (2, 2, 4, 4)
-    assert len(head_requests) == 3
     assert range_requests
+    assert full_payload_requests
     assert all("bytes=" in str(request["range"]) for request in range_requests)
 
 
-def test_b2_staging_downloader_uses_shared_range_scheduler(
+def test_b2_staging_downloader_stages_crpack_objects(
     monkeypatch, tmp_path: Path
 ) -> None:
     import cr_train.data.cache_backend as cache_backend
@@ -2133,8 +2262,6 @@ def test_b2_staging_downloader_uses_shared_range_scheduler(
     )
     fake_client = _FakeB2Client(objects)
     monkeypatch.setattr(cache_backend, "_new_s3_client", lambda **kwargs: fake_client)
-    monkeypatch.setattr(cache_backend, "_B2_DOWNLOAD_CHUNK_SIZE", 128)
-    monkeypatch.setattr(cache_backend, "_B2_STAGING_TARGET_INFLIGHT_BYTES", 512)
 
     staging_root = tmp_path / "stage"
     cache_keys = tuple(rows_by_key)
@@ -2143,23 +2270,27 @@ def test_b2_staging_downloader_uses_shared_range_scheduler(
         endpoint_url="https://example.invalid",
         key_id="key-id",
         app_key="app-key",
-        source_prefix="cache/layout-v14/unit-source",
+        source_prefix="cache/layout-v15/unit-source",
         split="validation",
         staging_source_root=str(staging_root),
         cache_keys=cache_keys,
         max_staged_blocks=2,
     )
 
-    cache_paths = resolve_block_cache_paths(staging_root, "validation")
-    range_requests = [
+    full_payload_requests = [
         request
         for request in fake_client.requests
-        if request["operation"] == "get_object" and request.get("range") is not None
+        if request["operation"] == "get_object" and request.get("range") is None
     ]
 
-    assert all(block_is_cached(cache_paths, cache_key) for cache_key in cache_keys)
-    assert range_requests
-    assert {request["key"].split("/blocks/", 1)[1].split("/", 1)[0] for request in range_requests} == set(cache_keys)
+    assert all(v15_block_is_cached(staging_root, "validation", cache_key) for cache_key in cache_keys)
+    assert full_payload_requests
+    assert {
+        request["key"].split("/blocks/", 1)[1].removesuffix(".crpack")
+        for request in full_payload_requests
+    } == set(cache_keys)
+    for cache_key in cache_keys:
+        assert len(load_v15_block(staging_root, "validation", cache_key)) == 1
 
 
 def test_b2_cache_missing_configured_cache_prefix_fails(monkeypatch) -> None:

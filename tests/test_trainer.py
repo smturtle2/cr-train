@@ -15,9 +15,9 @@ import pytest
 import torch
 
 from cr_train import Trainer
-from cr_train.data import BLOCK_SIZE, build_collate_fn
+from cr_train.data import BLOCK_SIZE, CACHE_BLOCK_SIZE, build_collate_fn
 from cr_train.progress import resolve_progress_bar_ncols
-from cr_train.data.store import resolve_block_cache_paths
+from cr_train.data.v15 import load_v15_block_metadata, resolve_v15_block_root
 from cr_train.trainer_reporting import (
     format_cache_summary,
     format_epoch_summary,
@@ -71,24 +71,35 @@ def _catalog(split: str, blocks: list[list[dict[str, object]]]) -> tuple[dict[st
 
     rows_by_key: dict[str, list[dict[str, object]]] = {}
     block_entries = []
+    block_row_counts = []
     total_rows = 0
-    for index, rows in enumerate(blocks):
-        cache_key = hashlib.sha256(f"{split}:{index}".encode("utf-8")).hexdigest()[:16]
-        rows_by_key[cache_key] = [dict(row) for row in rows]
-        block_entries.append(
-            {
-                "index": index,
-                "shard_index": index,
-                "cache_key": cache_key,
-                "source_file": f"hf://datasets/unit/test/{split}/{index:04d}.parquet",
-                "row_groups": [index],
-            }
-        )
+    for source_index, rows in enumerate(blocks):
+        for row_start in range(0, len(rows), CACHE_BLOCK_SIZE):
+            row_count = min(CACHE_BLOCK_SIZE, len(rows) - row_start)
+            cache_key = hashlib.sha256(
+                f"{split}:{source_index}:{row_start}:{row_count}".encode("utf-8")
+            ).hexdigest()[:16]
+            rows_by_key[cache_key] = [dict(row) for row in rows[row_start : row_start + row_count]]
+            block_entries.append(
+                {
+                    "index": len(block_entries),
+                    "shard_index": source_index,
+                    "cache_key": cache_key,
+                    "source_file": f"hf://datasets/unit/test/{split}/{source_index:04d}.parquet",
+                    "row_groups": [source_index],
+                    "row_start": row_start,
+                    "row_count": row_count,
+                }
+            )
+            block_row_counts.append(row_count)
         total_rows += len(rows)
     return {
+        "cache_layout_version": 15,
+        "cache_block_size": CACHE_BLOCK_SIZE,
         "split": split,
         "total_rows": total_rows,
         "total_blocks": len(block_entries),
+        "block_row_counts": block_row_counts,
         "blocks": block_entries,
     }, rows_by_key
 
@@ -850,7 +861,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
         for record in startup_records
         if record["stage"] == "warm split cache" and record["status"] == "done"
     ]
-    assert [record["selected_block_count"] for record in warmup_done_records[:3]] == [2, 1, 1]
+    assert [record["selected_block_count"] for record in warmup_done_records[:3]] == [4, 2, 2]
     assert all(record["planner_mode"] == "uniform_exact_k" for record in warmup_done_records[:3])
     assert all("timeline" in record for record in warmup_done_records[:3])
     assert all(len(str(record["timeline"])) == int(record["execution_block_count"]) for record in warmup_done_records[:3])
@@ -858,16 +869,15 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert all(record["resolved_blocks"] == record["selected_missing_blocks"] for record in warmup_done_records[:3])
 
     for split in ("train", "validation", "test"):
-        cache_paths = resolve_block_cache_paths(patched["source_root"], split)
         metadata_records = [
-            json.loads(path.read_text(encoding="utf-8"))
-            for path in cache_paths.metadata_root.glob("*.json")
+            load_v15_block_metadata(patched["source_root"], split, path.stem)
+            for path in resolve_v15_block_root(patched["source_root"], split).glob("*.crpack")
         ]
         assert metadata_records
         assert all("shard_index" in record for record in metadata_records)
 
     assert len(warmup_done_records) == 3
-    assert sum(patched["load_counts"].values()) == 4
+    assert sum(patched["load_counts"].values()) == 8
 
     with pytest.raises(RuntimeError):
         trainer.step()

@@ -159,19 +159,19 @@ def parse_args() -> argparse.Namespace:
         "--max-train-samples",
         type=parse_max_samples,
         default=None,
-        help="Requested train rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
+        help="Requested train rows; converted to cache-block count, or 'none'/'full'.",
     )
     parser.add_argument(
         "--max-val-samples",
         type=parse_max_samples,
         default=None,
-        help="Requested validation rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
+        help="Requested validation rows; converted to cache-block count, or 'none'/'full'.",
     )
     parser.add_argument(
         "--max-test-samples",
         type=parse_max_samples,
         default=None,
-        help="Requested test rows; converted to block count with the fixed 64-row BLOCK_SIZE, or 'none'/'full'.",
+        help="Requested test rows; converted to cache-block count, or 'none'/'full'.",
     )
     parser.add_argument(
         "--seed",

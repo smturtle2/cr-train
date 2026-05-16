@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from .constants import (
     BLOCK_SIZE,
+    CACHE_BLOCK_SIZE,
     DATA_COLUMNS,
     DATASET_ID,
     OPTICAL_CHANNELS,
     SAR_CHANNELS,
 )
+from .conversion import V14ToV15ConversionResult, convert_v14_cache_to_v15
 from .dataset import (
     CachedRowDataset,
     PreparedSplit,
@@ -28,6 +30,7 @@ from .planning import (
 
 __all__ = [
     "BLOCK_SIZE",
+    "CACHE_BLOCK_SIZE",
     "CachedRowDataset",
     "DATASET_ID",
     "DATA_COLUMNS",
@@ -36,8 +39,10 @@ __all__ = [
     "SAR_CHANNELS",
     "SamplePlan",
     "SelectionTrace",
+    "V14ToV15ConversionResult",
     "build_collate_fn",
     "build_dataloader",
+    "convert_v14_cache_to_v15",
     "decode_row",
     "move_batch_to_device",
     "plan_sample",
