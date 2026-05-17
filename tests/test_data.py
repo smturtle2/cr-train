@@ -4,6 +4,7 @@ import hashlib
 import io
 import importlib
 import json
+import multiprocessing as mp
 import pickle
 import time
 from collections import defaultdict
@@ -32,8 +33,8 @@ from cr_train.data.dataset import (
     prepare_split_from_state,
     resolve_prepared_split_state,
 )
-from cr_train.data.hf_v2 import _build_worker_staging_plan, _mark_consumed_block
-from cr_train.data.v15 import pack_v15_block, v15_block_path
+from cr_train.data.hf_v2 import _build_worker_staging_plan
+from cr_train.data.v15 import clear_v15_block, pack_v15_block, v15_block_path
 
 
 def _wait_for(predicate, *, timeout: float = 2.0) -> None:
@@ -778,6 +779,7 @@ def test_worker_owned_downloader_refills_released_worker_slot(monkeypatch, tmp_p
     import cr_train.data.hf_v2 as hf_v2_mod
 
     downloaded: list[str] = []
+    release_queue = mp.get_context("spawn").Queue()
 
     def fake_download_and_stage_crpack(
         *,
@@ -808,6 +810,8 @@ def test_worker_owned_downloader_refills_released_worker_slot(monkeypatch, tmp_p
             block_paths_by_key=block_paths_by_key,
             worker_queues=(("block-0", "block-2"), ("block-1", "block-3")),
             worker_quotas=(1, 1),
+            release_queue=release_queue,
+            max_staged_blocks=2,
             download_workers=2,
         )
 
@@ -815,15 +819,72 @@ def test_worker_owned_downloader_refills_released_worker_slot(monkeypatch, tmp_p
         assert "block-2" not in downloaded
         assert "block-3" not in downloaded
 
-        _mark_consumed_block(tmp_path, "train", "block-0")
+        clear_v15_block(tmp_path, "train", "block-0")
+        release_queue.put("block-0")
         _wait_for(lambda: "block-2" in downloaded)
         assert "block-3" not in downloaded
 
-        _mark_consumed_block(tmp_path, "train", "block-1")
+        clear_v15_block(tmp_path, "train", "block-1")
+        release_queue.put("block-1")
         _wait_for(lambda: "block-3" in downloaded)
 
-        _mark_consumed_block(tmp_path, "train", "block-2")
-        _mark_consumed_block(tmp_path, "train", "block-3")
+        assert downloaded.count("block-0") == 1
+        assert not v15_block_path(tmp_path, "train", "block-0").exists()
+
+        clear_v15_block(tmp_path, "train", "block-2")
+        release_queue.put("block-2")
+        clear_v15_block(tmp_path, "train", "block-3")
+        release_queue.put("block-3")
+        future.result(timeout=2)
+        assert not any((tmp_path / "block_store" / "train" / "blocks").glob("*.crpack"))
+
+
+def test_worker_owned_downloader_schedules_first_slots_round_robin(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.hf_v2 as hf_v2_mod
+
+    downloaded: list[str] = []
+    release_queue = mp.get_context("spawn").Queue()
+
+    def fake_download_and_stage_crpack(
+        *,
+        staging_source_root: Path,
+        split: str,
+        cache_key: str,
+        relative_path: str,
+    ) -> str:
+        del relative_path
+        downloaded.append(cache_key)
+        path = v15_block_path(staging_source_root, split, cache_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"ready")
+        return cache_key
+
+    monkeypatch.setattr(
+        hf_v2_mod,
+        "_download_and_stage_crpack",
+        fake_download_and_stage_crpack,
+    )
+
+    block_paths_by_key = {f"block-{index}": f"path-{index}" for index in range(6)}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            hf_v2_mod._run_hf_v2_staging_downloader,
+            split="train",
+            staging_source_root=str(tmp_path),
+            block_paths_by_key=block_paths_by_key,
+            worker_queues=(("block-0", "block-3"), ("block-1", "block-4"), ("block-2", "block-5")),
+            worker_quotas=(2, 2, 2),
+            release_queue=release_queue,
+            max_staged_blocks=6,
+            download_workers=1,
+        )
+
+        _wait_for(lambda: len(downloaded) >= 3)
+        assert downloaded[:3] == ["block-0", "block-1", "block-2"]
+
+        for index in range(6):
+            clear_v15_block(tmp_path, "train", f"block-{index}")
+            release_queue.put(f"block-{index}")
         future.result(timeout=2)
 
 
@@ -923,6 +984,46 @@ def test_build_dataloader_prepares_dataset_with_worker_count(monkeypatch) -> Non
 
     assert loader is not None
     assert prepared_worker_counts == [3]
+
+
+def test_build_dataloader_accepts_legacy_prepare_blocks_signature(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    prepared_block_counts: list[int] = []
+
+    class LegacyReader:
+        def prepare_blocks(self, blocks) -> None:
+            prepared_block_counts.append(len(blocks))
+
+        def load_block(self, cache_key: str):
+            return [{"scene": cache_key}]
+
+    class FakeDataLoader:
+        def __init__(self, dataset, **kwargs):
+            self.dataset = dataset
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(dataset_mod, "DataLoader", FakeDataLoader)
+
+    dataset = BlockIterableDataset(
+        block_reader=LegacyReader(),
+        blocks=({"cache_key": "block-0"}, {"cache_key": "block-1"}),
+        seed=5,
+        epoch=0,
+        split="train",
+        training=True,
+    )
+    loader = build_dataloader(
+        PreparedSplit(dataset=dataset, num_examples=2),
+        batch_size=1,
+        num_workers=2,
+        training=True,
+        seed=5,
+        epoch=0,
+    )
+
+    assert loader is not None
+    assert prepared_block_counts == [2]
 
 
 def test_build_dataloader_passes_multiprocessing_context(monkeypatch) -> None:

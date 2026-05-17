@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import os
 import random
@@ -33,6 +34,19 @@ from .runtime import (
 from .store import as_bytes
 
 _TRAIN_ACTIVE_BLOCK_COUNT = 8
+
+
+def _call_prepare_blocks(prepare_blocks, blocks: tuple[dict[str, Any], ...], *, worker_count: int) -> None:
+    signature = inspect.signature(prepare_blocks)
+    parameters = signature.parameters
+    accepts_worker_count = "worker_count" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_worker_count:
+        prepare_blocks(blocks, worker_count=worker_count)
+        return
+    prepare_blocks(blocks)
 
 
 @dataclass(slots=True)
@@ -324,7 +338,11 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
     def prepare_for_dataloader(self, *, num_workers: int) -> None:
         prepare_blocks = getattr(self.block_reader, "prepare_blocks", None)
         if prepare_blocks is not None:
-            prepare_blocks(tuple(self.blocks), worker_count=max(1, int(num_workers)))
+            _call_prepare_blocks(
+                prepare_blocks,
+                tuple(self.blocks),
+                worker_count=max(1, int(num_workers)),
+            )
         self._prepared_for_dataloader = True
 
     def _load_block_cursor(
@@ -535,7 +553,9 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
         if worker_info is None and not self._prepared_for_dataloader:
             self.prepare_for_dataloader(num_workers=0)
         elif worker_info is not None and not self._prepared_for_dataloader:
-            raise RuntimeError("BlockIterableDataset must be prepared before worker iteration")
+            if getattr(self.block_reader, "requires_dataloader_prepare", False):
+                raise RuntimeError("BlockIterableDataset must be prepared before worker iteration")
+            self._prepared_for_dataloader = True
         worker_id = worker_info.id if worker_info is not None else 0
         worker_count = worker_info.num_workers if worker_info is not None else 1
         blocks = [block for index, block in enumerate(self.blocks) if index % worker_count == worker_id]
