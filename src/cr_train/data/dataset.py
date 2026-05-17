@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import random
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,7 @@ from .runtime import (
 from .store import as_bytes
 
 _TRAIN_ACTIVE_BLOCK_COUNT = 8
+_READY_BLOCK_POLL_SECONDS = 0.05
 
 
 @dataclass(slots=True)
@@ -381,54 +383,35 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
         )
         active_blocks: list[_ActiveBlockCursor] = []
         round_robin: list[_ActiveBlockCursor] = []
-        next_block_index = 0
-        prefetch_pool: ThreadPoolExecutor | None = None
-        prefetch_future: Future[_ActiveBlockCursor] | None = None
+        remaining_blocks = list(blocks)
 
-        def start_prefetch() -> None:
-            nonlocal next_block_index, prefetch_pool, prefetch_future
-            if not self._prefetch_blocks() or prefetch_future is not None:
-                return
-            if next_block_index >= len(blocks):
-                return
-            if prefetch_pool is None:
-                prefetch_pool = ThreadPoolExecutor(max_workers=1)
-            block = blocks[next_block_index]
-            next_block_index += 1
-            prefetch_future = prefetch_pool.submit(
-                self._load_block_cursor,
-                block=block,
-                shuffle_rows=True,
-            )
+        def pop_ready_block() -> dict[str, Any] | None:
+            for index, block in enumerate(remaining_blocks):
+                cache_key = str(block["cache_key"])
+                if self._block_is_ready(cache_key):
+                    return remaining_blocks.pop(index)
+            return None
 
-        def load_next_block(*, wait: bool) -> _ActiveBlockCursor | None:
-            nonlocal next_block_index, prefetch_future
-            if prefetch_future is not None:
-                if not wait and not prefetch_future.done():
+        def load_ready_block(*, wait: bool) -> _ActiveBlockCursor | None:
+            while remaining_blocks:
+                block = pop_ready_block()
+                if block is not None:
+                    return self._load_active_block(block=block)
+                if not wait:
                     return None
-                cursor = prefetch_future.result()
-                prefetch_future = None
-                return cursor
-            if next_block_index >= len(blocks):
-                return None
-            block = blocks[next_block_index]
-            cache_key = str(block["cache_key"])
-            if not wait and not self._block_is_ready(cache_key):
-                return None
-            next_block_index += 1
-            return self._load_active_block(block=block)
+                time.sleep(_READY_BLOCK_POLL_SECONDS)
+            return None
 
         def refill_active_blocks(*, target_count: int, wait: bool, max_new_blocks: int | None = None) -> None:
             added_blocks = 0
             while len(active_blocks) < target_count:
                 if max_new_blocks is not None and added_blocks >= max_new_blocks:
                     break
-                cursor = load_next_block(wait=wait)
+                cursor = load_ready_block(wait=wait)
                 if cursor is None:
                     break
                 active_blocks.append(cursor)
                 added_blocks += 1
-            start_prefetch()
 
         try:
             refill_active_blocks(target_count=1, wait=True)
@@ -456,17 +439,6 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                     if not active_blocks:
                         refill_active_blocks(target_count=1, wait=True)
         finally:
-            if prefetch_future is not None and prefetch_future.done():
-                try:
-                    prefetched_cursor = prefetch_future.result()
-                except Exception:
-                    pass
-                else:
-                    self._release_block(prefetched_cursor.cache_key)
-            if prefetch_future is not None:
-                prefetch_future.cancel()
-            if prefetch_pool is not None:
-                prefetch_pool.shutdown(wait=False, cancel_futures=True)
             for cursor in active_blocks:
                 self._release_block(cursor.cache_key)
             self._close_reader()

@@ -698,6 +698,10 @@ def test_training_iterator_does_not_block_to_fill_active_pool() -> None:
         def __init__(self) -> None:
             self.load_calls: list[str] = []
             self.ready_calls: list[str] = []
+            self.ready_by_key = {
+                "block-0": True,
+                "block-1": False,
+            }
 
         def load_block(self, cache_key: str) -> list[dict[str, str]]:
             self.load_calls.append(cache_key)
@@ -705,7 +709,7 @@ def test_training_iterator_does_not_block_to_fill_active_pool() -> None:
 
         def block_is_ready(self, cache_key: str) -> bool:
             self.ready_calls.append(cache_key)
-            return False
+            return self.ready_by_key[cache_key]
 
     reader = ReadinessBlockReader()
     dataset = BlockIterableDataset(
@@ -733,7 +737,145 @@ def test_training_iterator_does_not_block_to_fill_active_pool() -> None:
 
     assert next(iterator)["scene"] == "block-0"
     assert reader.load_calls == ["block-0"]
-    assert reader.ready_calls == ["block-1"]
+    assert reader.ready_calls == ["block-0", "block-1"]
+    iterator.close()
+
+
+def test_training_iterator_loads_ready_block_ahead_of_not_ready_block() -> None:
+    class ReadinessBlockReader:
+        def __init__(self) -> None:
+            self.load_calls: list[str] = []
+            self.release_calls: list[str] = []
+
+        def load_block(self, cache_key: str) -> list[dict[str, str]]:
+            self.load_calls.append(cache_key)
+            return [{"scene": cache_key}]
+
+        def block_is_ready(self, cache_key: str) -> bool:
+            return cache_key == "block-1"
+
+        def release_block(self, cache_key: str) -> None:
+            self.release_calls.append(cache_key)
+
+    reader = ReadinessBlockReader()
+    dataset = BlockIterableDataset(
+        block_reader=reader,
+        blocks=(
+            {"cache_key": "block-0"},
+            {"cache_key": "block-1"},
+        ),
+        seed=9,
+        epoch=0,
+        split="train",
+        training=True,
+    )
+
+    iterator = dataset._iter_training_rows(
+        blocks=[
+            {"cache_key": "block-0"},
+            {"cache_key": "block-1"},
+        ],
+        worker_id=0,
+    )
+
+    assert next(iterator)["scene"] == "block-1"
+    assert reader.load_calls == ["block-1"]
+
+    iterator.close()
+    assert reader.release_calls == ["block-1"]
+
+
+def test_training_iterator_waits_for_any_remaining_ready_block_after_release() -> None:
+    class ReadinessBlockReader:
+        def __init__(self) -> None:
+            self.load_calls: list[str] = []
+            self.release_calls: list[str] = []
+            self.ready_by_key = {
+                "block-0": True,
+                "block-1": False,
+            }
+
+        def load_block(self, cache_key: str) -> list[dict[str, str]]:
+            self.load_calls.append(cache_key)
+            return [{"scene": cache_key}]
+
+        def block_is_ready(self, cache_key: str) -> bool:
+            return self.ready_by_key[cache_key]
+
+        def release_block(self, cache_key: str) -> None:
+            self.release_calls.append(cache_key)
+            if cache_key == "block-0":
+                self.ready_by_key["block-1"] = True
+
+    reader = ReadinessBlockReader()
+    dataset = BlockIterableDataset(
+        block_reader=reader,
+        blocks=(
+            {"cache_key": "block-0"},
+            {"cache_key": "block-1"},
+        ),
+        seed=9,
+        epoch=0,
+        split="train",
+        training=True,
+    )
+
+    iterator = dataset._iter_training_rows(
+        blocks=[
+            {"cache_key": "block-0"},
+            {"cache_key": "block-1"},
+        ],
+        worker_id=0,
+    )
+
+    assert next(iterator)["scene"] == "block-0"
+    assert next(iterator)["scene"] == "block-1"
+    assert reader.load_calls == ["block-0", "block-1"]
+    assert reader.release_calls == ["block-0"]
+
+    iterator.close()
+    assert reader.release_calls == ["block-0", "block-1"]
+
+
+def test_training_iterator_consumes_each_worker_local_block_once() -> None:
+    class ReadyBlockReader:
+        def __init__(self) -> None:
+            self.load_calls: list[str] = []
+            self.release_calls: list[str] = []
+
+        def load_block(self, cache_key: str) -> list[dict[str, str]]:
+            self.load_calls.append(cache_key)
+            return [{"scene": cache_key}]
+
+        def block_is_ready(self, cache_key: str) -> bool:
+            return True
+
+        def release_block(self, cache_key: str) -> None:
+            self.release_calls.append(cache_key)
+
+    reader = ReadyBlockReader()
+    blocks = [
+        {"cache_key": "block-0"},
+        {"cache_key": "block-1"},
+        {"cache_key": "block-2"},
+    ]
+    dataset = BlockIterableDataset(
+        block_reader=reader,
+        blocks=tuple(blocks),
+        seed=9,
+        epoch=0,
+        split="train",
+        training=True,
+    )
+
+    scenes = [
+        row["scene"]
+        for row in dataset._iter_training_rows(blocks=blocks, worker_id=0)
+    ]
+
+    assert sorted(scenes) == ["block-0", "block-1", "block-2"]
+    assert sorted(reader.load_calls) == ["block-0", "block-1", "block-2"]
+    assert sorted(reader.release_calls) == ["block-0", "block-1", "block-2"]
 
 
 def test_prepare_split_training_mixes_samples_across_scene_local_blocks(
