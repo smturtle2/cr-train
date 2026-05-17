@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 from .constants import WARMUP_DOWNLOAD_SPEED_WINDOW_SEC, WARMUP_SPEED_EMA_ALPHA, WARMUP_TIMELINE_WIDTH
 from .planning import SamplePlan, plan_sample
 from .source import emit_startup_event, ensure_source_root, ensure_split_catalog, load_block_rows, resolve_catalog_path
-from .source import mark_verified_full_split, revoke_verified_full_split
+from .source import is_full_split_verified, mark_verified_full_split, revoke_verified_full_split
 from ..progress import resolve_progress_bar_ncols, set_progress_postfix_str
 from .store import file_lock
 from .v15 import (
@@ -252,6 +252,24 @@ def _resolve_effective_rows(
             return fallback_rows
         total_rows += row_count
     return total_rows
+
+
+def _build_verified_full_split_summary(
+    sample_plan: SamplePlan,
+    *,
+    selected_blocks: list[dict[str, Any]],
+) -> WarmupSummary:
+    return WarmupSummary(
+        requested_rows=sample_plan.requested_rows,
+        effective_rows=sum(int(block["row_count"]) for block in selected_blocks),
+        required_blocks=sample_plan.required_blocks,
+        planner_mode=sample_plan.planner_mode,
+        selected_block_count=sample_plan.required_blocks,
+        cached_selected_blocks=sample_plan.required_blocks,
+        selected_missing_blocks=0,
+        cache_only=True,
+        execution_block_count=int(sample_plan.execution_block_count),
+    )
 
 
 def _resolve_missing_selected_blocks(
@@ -513,6 +531,22 @@ def ensure_split_cache(
     )
     sample_plan = plan_sample(catalog, seed, max_samples, split=split)
     selected_blocks = _selected_blocks(catalog, sample_plan)
+    if is_full_split_verified(source_root, split):
+        summary = _build_verified_full_split_summary(sample_plan, selected_blocks=selected_blocks)
+        _emit_warmup_summary(startup_callback, split=split, status="start", summary=summary)
+        _emit_warmup_summary(
+            startup_callback,
+            split=split,
+            status="done",
+            summary=summary,
+            elapsed_sec=0.0,
+            timeline=_render_warmup_timeline(
+                sample_plan.selected_bitmap,
+                stop_block=sample_plan.execution_block_count,
+            ),
+        )
+        return resolve_catalog_path(source_root, split)
+
     completed_by_key = {
         str(block["cache_key"]): row_count
         for block in selected_blocks

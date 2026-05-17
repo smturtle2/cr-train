@@ -20,8 +20,8 @@ from .cache_backend import (
 )
 from .constants import OPTICAL_CHANNELS, SAR_CHANNELS
 from .planning import plan_sample
-from .runtime import get_rank, get_world_size
-from .source import ensure_source_root, ensure_split_catalog, run_startup_stage
+from .runtime import _render_warmup_timeline, get_rank, get_world_size
+from .source import emit_startup_event, ensure_source_root, ensure_split_catalog, run_startup_stage
 from .store import BlockCachePaths, as_bytes
 from .v15 import V15LocalBlockReader
 
@@ -577,6 +577,40 @@ def _resolve_catalog_selected_block_row_counts(
     return row_counts_by_key
 
 
+def _emit_catalog_cache_hit(
+    startup_callback,
+    *,
+    split: str,
+    sample_plan,
+    selected_blocks: list[dict[str, Any]],
+) -> None:
+    event = {
+        "stage": "warm split cache",
+        "split": split,
+        "requested_rows": sample_plan.requested_rows,
+        "effective_rows": sum(int(block["row_count"]) for block in selected_blocks),
+        "required_blocks": sample_plan.required_blocks,
+        "planner_mode": sample_plan.planner_mode,
+        "selected_block_count": sample_plan.required_blocks,
+        "cached_selected_blocks": sample_plan.required_blocks,
+        "selected_missing_blocks": 0,
+        "cache_only": True,
+        "execution_block_count": int(sample_plan.execution_block_count),
+        "resolved_blocks": 0,
+    }
+    emit_startup_event(startup_callback, status="start", **event)
+    emit_startup_event(
+        startup_callback,
+        status="done",
+        elapsed_sec=0.0,
+        timeline=_render_warmup_timeline(
+            sample_plan.selected_bitmap,
+            stop_block=sample_plan.execution_block_count,
+        ),
+        **event,
+    )
+
+
 def resolve_prepared_split_state(
     *,
     split: str,
@@ -638,13 +672,13 @@ def resolve_prepared_split_state(
         catalog,
         selected_indices=[int(index) for index in sample_plan.selected_blocks.tolist()],
     )
+    row_counts_by_key = _resolve_catalog_selected_block_row_counts(selected_blocks)
     if cache_src == "B2":
-        row_counts_by_key = _resolve_catalog_selected_block_row_counts(selected_blocks)
-    else:
-        row_counts_by_key = _resolve_reader_selected_block_row_counts(
-            block_reader,
-            selected_blocks,
-            source_name="local",
+        _emit_catalog_cache_hit(
+            startup_callback,
+            split=split,
+            sample_plan=sample_plan,
+            selected_blocks=selected_blocks,
         )
     return PreparedSplitState(
         split=split,

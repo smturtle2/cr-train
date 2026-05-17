@@ -784,6 +784,7 @@ class Trainer:
             b2_staging_dir=self.b2_staging_dir if self.cache_src == "B2" else None,
             b2_staging_max_blocks=self.b2_staging_max_blocks,
             b2_download_workers=self.b2_download_workers if self.cache_src == "B2" else None,
+            startup_callback=self._handle_startup_event,
         )
         self._prepared_split_states[key] = _PreparedSplitCacheEntry(
             split=split,

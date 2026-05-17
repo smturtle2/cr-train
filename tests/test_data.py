@@ -1791,10 +1791,10 @@ def test_verified_full_split_skips_hf_bootstrap_after_initial_full_warmup(monkey
     assert len(state.selected_blocks) == 1
 
 
-def test_verified_full_split_revokes_and_recovers_after_missing_payload(monkeypatch, tmp_path: Path) -> None:
+def test_verified_full_split_trusts_payload_without_revalidating(monkeypatch, tmp_path: Path) -> None:
     import cr_train.data.source as source_mod
 
-    dataset_name = "unit/offline-full-repair"
+    dataset_name = "unit/offline-full-trusted"
     patched = _patch_remote_source_cache(
         monkeypatch,
         tmp_path,
@@ -1829,8 +1829,8 @@ def test_verified_full_split_revokes_and_recovers_after_missing_payload(monkeypa
 
     assert patched["descriptor_calls"] == [dataset_name]
     assert patched["catalog_calls"] == ["train"]
-    assert patched["load_counts"][cache_key] == 2
-    assert v15_block_is_cached(patched["source_root"], "train", cache_key) is True
+    assert patched["load_counts"][cache_key] == 1
+    assert v15_block_is_cached(patched["source_root"], "train", cache_key) is False
     assert source_mod.load_source_local_state(patched["source_root"])["verified_full_splits"] == ["train"]
 
 
@@ -1861,9 +1861,10 @@ def test_ensure_split_cache_refills_stale_block_cache(
     mutate_metadata,
 ) -> None:
     del label
-    split_blocks = {"train": _make_block_splits(1)}
+    split_blocks = {"train": _make_block_splits(2)}
     patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
-    block = patched["catalogs"]["train"]["blocks"][0]
+    plan = plan_sample(patched["catalogs"]["train"], seed=7, max_samples=BLOCK_SIZE, split="train")
+    block = patched["catalogs"]["train"]["blocks"][int(plan.selected_blocks[0])]
     cache_key = str(block["cache_key"])
 
     ensure_split_cache(
@@ -1906,9 +1907,10 @@ def test_ensure_split_cache_refills_stale_block_cache(
 
 
 def test_ensure_split_cache_reuses_v15_header_metadata(monkeypatch, tmp_path: Path) -> None:
-    split_blocks = {"train": _make_block_splits(1)}
+    split_blocks = {"train": _make_block_splits(2)}
     patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
-    block = patched["catalogs"]["train"]["blocks"][0]
+    plan = plan_sample(patched["catalogs"]["train"], seed=7, max_samples=BLOCK_SIZE, split="train")
+    block = patched["catalogs"]["train"]["blocks"][int(plan.selected_blocks[0])]
     cache_key = str(block["cache_key"])
 
     ensure_split_cache(
@@ -1938,9 +1940,10 @@ def test_ensure_split_cache_reuses_v15_header_metadata(monkeypatch, tmp_path: Pa
 
 
 def test_broken_crpack_next_warmup_refills(monkeypatch, tmp_path: Path) -> None:
-    split_blocks = {"train": _make_block_splits(1)}
+    split_blocks = {"train": _make_block_splits(2)}
     patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
-    block = patched["catalogs"]["train"]["blocks"][0]
+    plan = plan_sample(patched["catalogs"]["train"], seed=7, max_samples=BLOCK_SIZE, split="train")
+    block = patched["catalogs"]["train"]["blocks"][int(plan.selected_blocks[0])]
     cache_key = str(block["cache_key"])
 
     ensure_split_cache(
@@ -2007,7 +2010,7 @@ def test_v15_header_cache_hit_skips_refill(monkeypatch, tmp_path: Path) -> None:
     )
 
 
-def test_resolve_prepared_split_state_uses_v15_header_metadata(monkeypatch, tmp_path: Path) -> None:
+def test_resolve_prepared_split_state_uses_catalog_metadata(monkeypatch, tmp_path: Path) -> None:
     split_blocks = {"train": _make_block_splits(2)}
     patched = _patch_split_cache(monkeypatch, tmp_path, split_blocks)
 
@@ -2018,6 +2021,13 @@ def test_resolve_prepared_split_state_uses_v15_header_metadata(monkeypatch, tmp_
         max_samples=2 * BLOCK_SIZE,
         seed=7,
         cache_root=tmp_path,
+    )
+    block = patched["catalogs"]["train"]["blocks"][0]
+    _rewrite_v15_block_metadata(
+        source_root=patched["source_root"],
+        split="train",
+        cache_key=str(block["cache_key"]),
+        mutate_metadata=lambda metadata: metadata.__setitem__("row_count", 1),
     )
 
     state = resolve_prepared_split_state(
@@ -2216,6 +2226,7 @@ def test_b2_cache_trusts_catalog_metadata_before_loading_payloads(
         "cr_train.data.dataset.resolve_b2_cache_repository",
         fake_resolve_b2_cache_repository,
     )
+    startup_events: list[dict[str, object]] = []
 
     prepared = prepare_split(
         split="validation",
@@ -2228,6 +2239,7 @@ def test_b2_cache_trusts_catalog_metadata_before_loading_payloads(
         cache_root=Path(cache_prefix),
         cache_src="B2",
         b2_staging_dir=tmp_path / "b2-staging",
+        startup_callback=startup_events.append,
     )
     loader = build_dataloader(
         prepared,
@@ -2254,6 +2266,13 @@ def test_b2_cache_trusts_catalog_metadata_before_loading_payloads(
     assert tuple(batch["sar"].shape) == (2, 2, 4, 4)
     assert range_requests == []
     assert full_payload_requests
+    warmup_done = next(
+        event
+        for event in startup_events
+        if event["stage"] == "warm split cache" and event["status"] == "done"
+    )
+    assert warmup_done["selected_missing_blocks"] == 0
+    assert warmup_done["cached_selected_blocks"] == warmup_done["selected_block_count"]
 
 
 def test_b2_staging_downloader_stages_crpack_objects(
