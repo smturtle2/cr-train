@@ -30,7 +30,12 @@ from cr_train.data import (
     plan_sample,
     trace_plan_sample,
 )
-from cr_train.data.dataset import prepare_split, prepare_split_from_state, resolve_prepared_split_state
+from cr_train.data.dataset import (
+    CachedBlockIterableDataset,
+    prepare_split,
+    prepare_split_from_state,
+    resolve_prepared_split_state,
+)
 from cr_train.data.runtime import ensure_split_cache
 from cr_train.data.cache_backend import B2CacheRepository
 from cr_train.data.store import (
@@ -2443,6 +2448,49 @@ def test_prepare_split_training_order_is_reproducible_for_same_seed_and_epoch(
     scenes_b = [scene for batch in loader_b for scene in batch["meta"]["scene"]]
 
     assert scenes_a == scenes_b
+
+
+def test_training_iterator_does_not_block_to_fill_active_pool() -> None:
+    class ReadinessBlockReader:
+        def __init__(self) -> None:
+            self.load_calls: list[str] = []
+            self.ready_calls: list[str] = []
+
+        def load_block(self, cache_key: str) -> list[dict[str, str]]:
+            self.load_calls.append(cache_key)
+            return [{"scene": cache_key}, {"scene": cache_key}]
+
+        def block_is_ready(self, cache_key: str) -> bool:
+            self.ready_calls.append(cache_key)
+            return False
+
+    reader = ReadinessBlockReader()
+    dataset = CachedBlockIterableDataset(
+        block_reader=reader,
+        blocks=(
+            {"cache_key": "block-0"},
+            {"cache_key": "block-1"},
+        ),
+        seed=9,
+        epoch=0,
+        split="train",
+        training=True,
+    )
+
+    iterator = dataset._iter_training_rows(
+        blocks=[
+            {"cache_key": "block-0"},
+            {"cache_key": "block-1"},
+        ],
+        worker_id=0,
+    )
+
+    assert next(iterator)["scene"] == "block-0"
+    assert reader.load_calls == ["block-0"]
+
+    assert next(iterator)["scene"] == "block-0"
+    assert reader.load_calls == ["block-0"]
+    assert reader.ready_calls == ["block-1"]
 
 
 def test_prepare_split_training_mixes_samples_across_scene_local_blocks(

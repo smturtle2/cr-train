@@ -40,6 +40,9 @@ class V15LocalBlockReader:
     def load_block(self, cache_key: str) -> MappedBlockPayload:
         return load_v15_block(self.source_root, self.split, cache_key)
 
+    def block_is_ready(self, cache_key: str) -> bool:
+        return v15_block_is_cached(self.source_root, self.split, cache_key)
+
     def load_block_metadata(self, cache_key: str) -> dict[str, Any] | None:
         return load_v15_block_metadata(self.source_root, self.split, cache_key)
 

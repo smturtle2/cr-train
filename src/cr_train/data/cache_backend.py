@@ -748,6 +748,13 @@ class B2StagedBlockReader:
             time.sleep(_B2_STAGING_POLL_SECONDS)
         return load_v15_block(self.staging_source_root, self.split, cache_key)
 
+    def block_is_ready(self, cache_key: str) -> bool:
+        _raise_if_staging_error(self.staging_source_root, self.split)
+        process = self._process if self._process_owner_pid == os.getpid() else None
+        if process is not None and not process.is_alive() and process.exitcode not in (None, 0):
+            raise RuntimeError(f"B2 staging downloader exited with code {process.exitcode}")
+        return v15_block_is_cached(self.staging_source_root, self.split, cache_key)
+
     def release_block(self, cache_key: str) -> None:
         clear_v15_block(self.staging_source_root, self.split, cache_key)
 

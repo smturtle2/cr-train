@@ -350,6 +350,12 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
         if release_block is not None:
             release_block(cache_key)
 
+    def _block_is_ready(self, cache_key: str) -> bool:
+        block_is_ready = getattr(self.block_reader, "block_is_ready", None)
+        if block_is_ready is None:
+            return True
+        return bool(block_is_ready(cache_key))
+
     def _iter_training_rows(self, *, blocks: list[dict[str, Any]], worker_id: int):
         if not blocks:
             return
@@ -384,28 +390,37 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                 shuffle_rows=True,
             )
 
-        def load_next_block() -> _ActiveBlockCursor | None:
+        def load_next_block(*, wait: bool) -> _ActiveBlockCursor | None:
             nonlocal next_block_index, prefetch_future
             if prefetch_future is not None:
+                if not wait and not prefetch_future.done():
+                    return None
                 cursor = prefetch_future.result()
                 prefetch_future = None
                 return cursor
             if next_block_index >= len(blocks):
                 return None
             block = blocks[next_block_index]
+            cache_key = str(block["cache_key"])
+            if not wait and not self._block_is_ready(cache_key):
+                return None
             next_block_index += 1
             return self._load_active_block(block=block)
 
-        def refill_active_blocks() -> None:
-            while len(active_blocks) < _TRAIN_ACTIVE_BLOCK_COUNT:
-                cursor = load_next_block()
+        def refill_active_blocks(*, target_count: int, wait: bool, max_new_blocks: int | None = None) -> None:
+            added_blocks = 0
+            while len(active_blocks) < target_count:
+                if max_new_blocks is not None and added_blocks >= max_new_blocks:
+                    break
+                cursor = load_next_block(wait=wait)
                 if cursor is None:
                     break
                 active_blocks.append(cursor)
+                added_blocks += 1
             start_prefetch()
 
         try:
-            refill_active_blocks()
+            refill_active_blocks(target_count=1, wait=True)
             while active_blocks:
                 if not round_robin:
                     round_robin = list(active_blocks)
@@ -413,6 +428,11 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
 
                 current_block = round_robin.pop()
                 yield current_block.pop()
+                refill_active_blocks(
+                    target_count=_TRAIN_ACTIVE_BLOCK_COUNT,
+                    wait=False,
+                    max_new_blocks=1,
+                )
 
                 if current_block.exhausted:
                     cache_key = current_block.cache_key
@@ -422,7 +442,8 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                     ]
                     del current_block
                     self._release_block(cache_key)
-                    refill_active_blocks()
+                    if not active_blocks:
+                        refill_active_blocks(target_count=1, wait=True)
         finally:
             if prefetch_future is not None and prefetch_future.done():
                 try:
