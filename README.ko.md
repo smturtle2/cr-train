@@ -327,7 +327,7 @@ from cr_train.data import BLOCK_SIZE, trace_plan_sample
 
 `Trainer`는 기본적으로 HuggingFace streaming으로 데이터를 읽고, row group 기준의 재사용 가능한 로컬 block cache를 유지하며, 시작 이벤트를 `metrics.jsonl`에 기록합니다. 부분 요청은 `seed` 기반의 결정적 uniform exact-k 논리 블록 선택을 사용하고, 전체 split 요청은 샘플링을 우회해 모든 row-group block을 순서대로 선택합니다. 학습 sample 순서는 `seed + epoch_index`에 따라 epoch마다 바뀌며, 한 block을 끝까지 비우지 않고 active cached block들 사이에서 섞어서 내보냅니다.
 
-`cache_src="B2"`를 설정하면 이미 materialized된 B2 캐시를 object storage에서 직접 읽습니다. B2 모드는 `B2_BUCKET`, `B2_ENDPOINT`, `B2_KEY_ID`, `B2_APP_KEY`가 필요하고, `cache_dir`를 B2 버킷 내부 prefix로 해석하며, `<cache_dir>/layout-v14/` 아래를 읽습니다(기본값은 `cache/layout-v14/`). B2 다운로드는 16 MiB range와 내부 range download worker 16개를 사용하고, `num_workers`는 여전히 PyTorch DataLoader process 수만 의미합니다. staging downloader는 여러 block의 range를 공유 queue에 넣고 queued/in-flight range를 2 GiB 수준으로 유지해 bandwidth가 덜 끊기게 합니다. block은 `b2_staging_dir` 아래에 받아 DataLoader worker들이 공유해서 읽고, 소비 후 삭제됩니다. 설정한 B2 prefix에 캐시가 없거나 선택된 캐시 객체가 없거나 읽을 수 없으면 즉시 실패합니다.
+streaming 모드에서는 producer process가 선택된 HF v2 block을 `~/.cache/cr-train/streaming-stage` 아래 shared staging directory로 받습니다. Staging capacity는 결정적인 worker-owned queue로 나뉘므로 staging buffer가 가득 차도 각 worker의 다음 block들이 계속 다운로드 대상에 남습니다. 소비된 staged block은 즉시 삭제되어, 별도 persistent local copy 없이 network download와 sample decoding이 파이프라인됩니다.
 
 local 모드에서 워밍업은 호출에 필요한 split만 로컬 캐시 기준으로 수행합니다. `step()`은 `train`과 `validation`, `test()`는 `test`를 준비하며, 선택된 row-group block이 이미 로컬에 있지 않을 때만 HuggingFace에서 누락된 블록을 가져옵니다.
 

@@ -4,7 +4,6 @@ import hashlib
 import math
 import os
 import random
-import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +33,6 @@ from .runtime import (
 from .store import as_bytes
 
 _TRAIN_ACTIVE_BLOCK_COUNT = 8
-_READY_BLOCK_POLL_SECONDS = 0.05
 
 
 @dataclass(slots=True)
@@ -321,6 +319,13 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
         self.epoch = epoch
         self.split = split
         self.training = training
+        self._prepared_for_dataloader = False
+
+    def prepare_for_dataloader(self, *, num_workers: int) -> None:
+        prepare_blocks = getattr(self.block_reader, "prepare_blocks", None)
+        if prepare_blocks is not None:
+            prepare_blocks(tuple(self.blocks), worker_count=max(1, int(num_workers)))
+        self._prepared_for_dataloader = True
 
     def _load_block_cursor(
         self,
@@ -383,35 +388,54 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
         )
         active_blocks: list[_ActiveBlockCursor] = []
         round_robin: list[_ActiveBlockCursor] = []
-        remaining_blocks = list(blocks)
+        next_block_index = 0
+        prefetch_pool: ThreadPoolExecutor | None = None
+        prefetch_future: Future[_ActiveBlockCursor] | None = None
 
-        def pop_ready_block() -> dict[str, Any] | None:
-            for index, block in enumerate(remaining_blocks):
-                cache_key = str(block["cache_key"])
-                if self._block_is_ready(cache_key):
-                    return remaining_blocks.pop(index)
-            return None
+        def start_prefetch() -> None:
+            nonlocal next_block_index, prefetch_pool, prefetch_future
+            if not self._prefetch_blocks() or prefetch_future is not None:
+                return
+            if next_block_index >= len(blocks):
+                return
+            if prefetch_pool is None:
+                prefetch_pool = ThreadPoolExecutor(max_workers=1)
+            block = blocks[next_block_index]
+            next_block_index += 1
+            prefetch_future = prefetch_pool.submit(
+                self._load_block_cursor,
+                block=block,
+                shuffle_rows=True,
+            )
 
-        def load_ready_block(*, wait: bool) -> _ActiveBlockCursor | None:
-            while remaining_blocks:
-                block = pop_ready_block()
-                if block is not None:
-                    return self._load_active_block(block=block)
-                if not wait:
+        def load_next_block(*, wait: bool) -> _ActiveBlockCursor | None:
+            nonlocal next_block_index, prefetch_future
+            if prefetch_future is not None:
+                if not wait and not prefetch_future.done():
                     return None
-                time.sleep(_READY_BLOCK_POLL_SECONDS)
-            return None
+                cursor = prefetch_future.result()
+                prefetch_future = None
+                return cursor
+            if next_block_index >= len(blocks):
+                return None
+            block = blocks[next_block_index]
+            cache_key = str(block["cache_key"])
+            if not wait and not self._block_is_ready(cache_key):
+                return None
+            next_block_index += 1
+            return self._load_active_block(block=block)
 
         def refill_active_blocks(*, target_count: int, wait: bool, max_new_blocks: int | None = None) -> None:
             added_blocks = 0
             while len(active_blocks) < target_count:
                 if max_new_blocks is not None and added_blocks >= max_new_blocks:
                     break
-                cursor = load_ready_block(wait=wait)
+                cursor = load_next_block(wait=wait)
                 if cursor is None:
                     break
                 active_blocks.append(cursor)
                 added_blocks += 1
+            start_prefetch()
 
         try:
             refill_active_blocks(target_count=1, wait=True)
@@ -439,6 +463,17 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                     if not active_blocks:
                         refill_active_blocks(target_count=1, wait=True)
         finally:
+            if prefetch_future is not None and prefetch_future.done():
+                try:
+                    prefetched_cursor = prefetch_future.result()
+                except Exception:
+                    pass
+                else:
+                    self._release_block(prefetched_cursor.cache_key)
+            if prefetch_future is not None:
+                prefetch_future.cancel()
+            if prefetch_pool is not None:
+                prefetch_pool.shutdown(wait=False, cancel_futures=True)
             for cursor in active_blocks:
                 self._release_block(cursor.cache_key)
             self._close_reader()
@@ -497,6 +532,10 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
 
     def __iter__(self):
         worker_info = get_worker_info()
+        if worker_info is None and not self._prepared_for_dataloader:
+            self.prepare_for_dataloader(num_workers=0)
+        elif worker_info is not None and not self._prepared_for_dataloader:
+            raise RuntimeError("BlockIterableDataset must be prepared before worker iteration")
         worker_id = worker_info.id if worker_info is not None else 0
         worker_count = worker_info.num_workers if worker_info is not None else 1
         blocks = [block for index, block in enumerate(self.blocks) if index % worker_count == worker_id]
@@ -687,9 +726,6 @@ def prepare_split_from_state(
     selected_blocks = list(state.selected_blocks)
     ordered_blocks = _shuffle_blocks(selected_blocks, seed=state.seed, split=state.split, epoch=epoch) if training else selected_blocks
     rank_blocks = _slice_blocks_for_rank(ordered_blocks)
-    prepare_blocks = getattr(state.block_reader, "prepare_blocks", None)
-    if prepare_blocks is not None:
-        prepare_blocks(tuple(rank_blocks))
     num_examples = _count_rows_from_state(state, rank_blocks)
     dataset = run_startup_stage(
         startup_callback,
@@ -1078,6 +1114,9 @@ def build_dataloader(
 ) -> DataLoader:
     """Create the split DataLoader for the block iterable dataset."""
     del seed, epoch
+    prepare_for_dataloader = getattr(prepared.dataset, "prepare_for_dataloader", None)
+    if prepare_for_dataloader is not None:
+        prepare_for_dataloader(num_workers=num_workers)
     dataloader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
         "collate_fn": build_collate_fn(

@@ -5,7 +5,9 @@ import io
 import importlib
 import json
 import pickle
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,7 +32,18 @@ from cr_train.data.dataset import (
     prepare_split_from_state,
     resolve_prepared_split_state,
 )
-from cr_train.data.v15 import pack_v15_block
+from cr_train.data.hf_v2 import _build_worker_staging_plan, _mark_consumed_block
+from cr_train.data.v15 import pack_v15_block, v15_block_path
+
+
+def _wait_for(predicate, *, timeout: float = 2.0) -> None:
+    started_at = time.monotonic()
+    while True:
+        if predicate():
+            return
+        if time.monotonic() - started_at > timeout:
+            raise AssertionError("timed out waiting for condition")
+        time.sleep(0.01)
 
 
 def _npy_bytes(array: np.ndarray) -> bytes:
@@ -698,10 +711,6 @@ def test_training_iterator_does_not_block_to_fill_active_pool() -> None:
         def __init__(self) -> None:
             self.load_calls: list[str] = []
             self.ready_calls: list[str] = []
-            self.ready_by_key = {
-                "block-0": True,
-                "block-1": False,
-            }
 
         def load_block(self, cache_key: str) -> list[dict[str, str]]:
             self.load_calls.append(cache_key)
@@ -709,7 +718,7 @@ def test_training_iterator_does_not_block_to_fill_active_pool() -> None:
 
         def block_is_ready(self, cache_key: str) -> bool:
             self.ready_calls.append(cache_key)
-            return self.ready_by_key[cache_key]
+            return False
 
     reader = ReadinessBlockReader()
     dataset = BlockIterableDataset(
@@ -737,145 +746,85 @@ def test_training_iterator_does_not_block_to_fill_active_pool() -> None:
 
     assert next(iterator)["scene"] == "block-0"
     assert reader.load_calls == ["block-0"]
-    assert reader.ready_calls == ["block-0", "block-1"]
-    iterator.close()
+    assert reader.ready_calls == ["block-1"]
 
 
-def test_training_iterator_loads_ready_block_ahead_of_not_ready_block() -> None:
-    class ReadinessBlockReader:
-        def __init__(self) -> None:
-            self.load_calls: list[str] = []
-            self.release_calls: list[str] = []
-
-        def load_block(self, cache_key: str) -> list[dict[str, str]]:
-            self.load_calls.append(cache_key)
-            return [{"scene": cache_key}]
-
-        def block_is_ready(self, cache_key: str) -> bool:
-            return cache_key == "block-1"
-
-        def release_block(self, cache_key: str) -> None:
-            self.release_calls.append(cache_key)
-
-    reader = ReadinessBlockReader()
-    dataset = BlockIterableDataset(
-        block_reader=reader,
-        blocks=(
-            {"cache_key": "block-0"},
-            {"cache_key": "block-1"},
-        ),
-        seed=9,
-        epoch=0,
-        split="train",
-        training=True,
+def test_worker_staging_plan_splits_queues_and_quotas_deterministically() -> None:
+    plan = _build_worker_staging_plan(
+        tuple(f"block-{index}" for index in range(7)),
+        max_staged_blocks=5,
+        worker_count=3,
     )
 
-    iterator = dataset._iter_training_rows(
-        blocks=[
-            {"cache_key": "block-0"},
-            {"cache_key": "block-1"},
-        ],
-        worker_id=0,
+    assert plan.worker_queues == (
+        ("block-0", "block-3", "block-6"),
+        ("block-1", "block-4"),
+        ("block-2", "block-5"),
+    )
+    assert plan.worker_quotas == (2, 2, 1)
+    assert plan.worker_by_key == {
+        "block-0": 0,
+        "block-1": 1,
+        "block-2": 2,
+        "block-3": 0,
+        "block-4": 1,
+        "block-5": 2,
+        "block-6": 0,
+    }
+    assert plan.effective_max_staged_blocks == 5
+
+
+def test_worker_owned_downloader_refills_released_worker_slot(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.hf_v2 as hf_v2_mod
+
+    downloaded: list[str] = []
+
+    def fake_download_and_stage_crpack(
+        *,
+        staging_source_root: Path,
+        split: str,
+        cache_key: str,
+        relative_path: str,
+    ) -> str:
+        del relative_path
+        downloaded.append(cache_key)
+        path = v15_block_path(staging_source_root, split, cache_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"ready")
+        return cache_key
+
+    monkeypatch.setattr(
+        hf_v2_mod,
+        "_download_and_stage_crpack",
+        fake_download_and_stage_crpack,
     )
 
-    assert next(iterator)["scene"] == "block-1"
-    assert reader.load_calls == ["block-1"]
+    block_paths_by_key = {f"block-{index}": f"path-{index}" for index in range(4)}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            hf_v2_mod._run_hf_v2_staging_downloader,
+            split="train",
+            staging_source_root=str(tmp_path),
+            block_paths_by_key=block_paths_by_key,
+            worker_queues=(("block-0", "block-2"), ("block-1", "block-3")),
+            worker_quotas=(1, 1),
+            download_workers=2,
+        )
 
-    iterator.close()
-    assert reader.release_calls == ["block-1"]
+        _wait_for(lambda: set(downloaded) == {"block-0", "block-1"})
+        assert "block-2" not in downloaded
+        assert "block-3" not in downloaded
 
+        _mark_consumed_block(tmp_path, "train", "block-0")
+        _wait_for(lambda: "block-2" in downloaded)
+        assert "block-3" not in downloaded
 
-def test_training_iterator_waits_for_any_remaining_ready_block_after_release() -> None:
-    class ReadinessBlockReader:
-        def __init__(self) -> None:
-            self.load_calls: list[str] = []
-            self.release_calls: list[str] = []
-            self.ready_by_key = {
-                "block-0": True,
-                "block-1": False,
-            }
+        _mark_consumed_block(tmp_path, "train", "block-1")
+        _wait_for(lambda: "block-3" in downloaded)
 
-        def load_block(self, cache_key: str) -> list[dict[str, str]]:
-            self.load_calls.append(cache_key)
-            return [{"scene": cache_key}]
-
-        def block_is_ready(self, cache_key: str) -> bool:
-            return self.ready_by_key[cache_key]
-
-        def release_block(self, cache_key: str) -> None:
-            self.release_calls.append(cache_key)
-            if cache_key == "block-0":
-                self.ready_by_key["block-1"] = True
-
-    reader = ReadinessBlockReader()
-    dataset = BlockIterableDataset(
-        block_reader=reader,
-        blocks=(
-            {"cache_key": "block-0"},
-            {"cache_key": "block-1"},
-        ),
-        seed=9,
-        epoch=0,
-        split="train",
-        training=True,
-    )
-
-    iterator = dataset._iter_training_rows(
-        blocks=[
-            {"cache_key": "block-0"},
-            {"cache_key": "block-1"},
-        ],
-        worker_id=0,
-    )
-
-    assert next(iterator)["scene"] == "block-0"
-    assert next(iterator)["scene"] == "block-1"
-    assert reader.load_calls == ["block-0", "block-1"]
-    assert reader.release_calls == ["block-0"]
-
-    iterator.close()
-    assert reader.release_calls == ["block-0", "block-1"]
-
-
-def test_training_iterator_consumes_each_worker_local_block_once() -> None:
-    class ReadyBlockReader:
-        def __init__(self) -> None:
-            self.load_calls: list[str] = []
-            self.release_calls: list[str] = []
-
-        def load_block(self, cache_key: str) -> list[dict[str, str]]:
-            self.load_calls.append(cache_key)
-            return [{"scene": cache_key}]
-
-        def block_is_ready(self, cache_key: str) -> bool:
-            return True
-
-        def release_block(self, cache_key: str) -> None:
-            self.release_calls.append(cache_key)
-
-    reader = ReadyBlockReader()
-    blocks = [
-        {"cache_key": "block-0"},
-        {"cache_key": "block-1"},
-        {"cache_key": "block-2"},
-    ]
-    dataset = BlockIterableDataset(
-        block_reader=reader,
-        blocks=tuple(blocks),
-        seed=9,
-        epoch=0,
-        split="train",
-        training=True,
-    )
-
-    scenes = [
-        row["scene"]
-        for row in dataset._iter_training_rows(blocks=blocks, worker_id=0)
-    ]
-
-    assert sorted(scenes) == ["block-0", "block-1", "block-2"]
-    assert sorted(reader.load_calls) == ["block-0", "block-1", "block-2"]
-    assert sorted(reader.release_calls) == ["block-0", "block-1", "block-2"]
+        _mark_consumed_block(tmp_path, "train", "block-2")
+        _mark_consumed_block(tmp_path, "train", "block-3")
+        future.result(timeout=2)
 
 
 def test_prepare_split_training_mixes_samples_across_scene_local_blocks(
@@ -944,6 +893,36 @@ def test_build_dataloader_defaults_to_non_persistent_workers(monkeypatch) -> Non
     assert captured["dataset"] is prepared.dataset
     assert captured["kwargs"]["persistent_workers"] is False
     assert "multiprocessing_context" not in captured["kwargs"]
+
+
+def test_build_dataloader_prepares_dataset_with_worker_count(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    prepared_worker_counts: list[int] = []
+
+    class PreparedDataset:
+        def prepare_for_dataloader(self, *, num_workers: int) -> None:
+            prepared_worker_counts.append(num_workers)
+
+    class FakeDataLoader:
+        def __init__(self, dataset, **kwargs):
+            self.dataset = dataset
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(dataset_mod, "DataLoader", FakeDataLoader)
+
+    prepared = PreparedSplit(dataset=PreparedDataset(), num_examples=4)
+    loader = build_dataloader(
+        prepared,
+        batch_size=2,
+        num_workers=3,
+        training=True,
+        seed=5,
+        epoch=0,
+    )
+
+    assert loader is not None
+    assert prepared_worker_counts == [3]
 
 
 def test_build_dataloader_passes_multiprocessing_context(monkeypatch) -> None:

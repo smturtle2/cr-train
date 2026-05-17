@@ -4,7 +4,6 @@ import json
 import multiprocessing as mp
 import os
 import time
-from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -457,8 +456,59 @@ def _write_staged_crpack(
     )
 
 
-def _count_staged_blocks(staging_source_root: Path, split: str, cache_keys: tuple[str, ...]) -> int:
-    return sum(1 for cache_key in cache_keys if v15_block_is_cached(staging_source_root, split, cache_key))
+def _consumed_root(staging_source_root: Path, split: str) -> Path:
+    return staging_source_root / "block_store" / split / "consumed"
+
+
+def _consumed_block_path(staging_source_root: Path, split: str, cache_key: str) -> Path:
+    return _consumed_root(staging_source_root, split) / f"{cache_key}.done"
+
+
+def _mark_consumed_block(staging_source_root: Path, split: str, cache_key: str) -> None:
+    path = _consumed_block_path(staging_source_root, split, cache_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+
+
+def _block_is_consumed(staging_source_root: Path, split: str, cache_key: str) -> bool:
+    return _consumed_block_path(staging_source_root, split, cache_key).is_file()
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkerStagingPlan:
+    worker_queues: tuple[tuple[str, ...], ...]
+    worker_quotas: tuple[int, ...]
+    worker_by_key: dict[str, int]
+    effective_max_staged_blocks: int
+
+
+def _build_worker_staging_plan(
+    cache_keys: tuple[str, ...],
+    *,
+    max_staged_blocks: int,
+    worker_count: int,
+) -> _WorkerStagingPlan:
+    resolved_worker_count = max(1, int(worker_count))
+    effective_max_staged_blocks = max(1, int(max_staged_blocks), resolved_worker_count)
+    base_quota, extra_slots = divmod(effective_max_staged_blocks, resolved_worker_count)
+    worker_quotas = tuple(
+        base_quota + (1 if worker_id < extra_slots else 0)
+        for worker_id in range(resolved_worker_count)
+    )
+    worker_queues = tuple(
+        tuple(cache_key for index, cache_key in enumerate(cache_keys) if index % resolved_worker_count == worker_id)
+        for worker_id in range(resolved_worker_count)
+    )
+    worker_by_key: dict[str, int] = {}
+    for worker_id, worker_queue in enumerate(worker_queues):
+        for cache_key in worker_queue:
+            worker_by_key[cache_key] = worker_id
+    return _WorkerStagingPlan(
+        worker_queues=worker_queues,
+        worker_quotas=worker_quotas,
+        worker_by_key=worker_by_key,
+        effective_max_staged_blocks=effective_max_staged_blocks,
+    )
 
 
 def _download_and_stage_crpack(
@@ -501,32 +551,61 @@ def _run_hf_v2_staging_downloader(
     split: str,
     staging_source_root: str,
     block_paths_by_key: dict[str, str],
-    cache_keys: tuple[str, ...],
-    max_staged_blocks: int,
+    worker_queues: tuple[tuple[str, ...], ...],
+    worker_quotas: tuple[int, ...],
     download_workers: int,
 ) -> None:
     staging_root_path = Path(staging_source_root)
     try:
-        pending_cache_keys: deque[str] = deque(cache_keys)
-        if pending_cache_keys:
-            first_cache_key = pending_cache_keys.popleft()
-            _download_and_stage_crpack(
-                staging_source_root=staging_root_path,
-                split=split,
-                cache_key=first_cache_key,
-                relative_path=block_paths_by_key[first_cache_key],
-            )
+        queue_positions = [0 for _queue in worker_queues]
+        active_by_worker = [set() for _queue in worker_queues]
+        active_owner_by_key: dict[str, int] = {}
+        active_order: list[str] = []
+
+        def fill_worker_slots(worker_id: int) -> None:
+            worker_queue = worker_queues[worker_id]
+            while len(active_by_worker[worker_id]) < worker_quotas[worker_id]:
+                if queue_positions[worker_id] >= len(worker_queue):
+                    return
+                cache_key = worker_queue[queue_positions[worker_id]]
+                queue_positions[worker_id] += 1
+                if _block_is_consumed(staging_root_path, split, cache_key):
+                    continue
+                active_by_worker[worker_id].add(cache_key)
+                active_owner_by_key[cache_key] = worker_id
+                active_order.append(cache_key)
+
+        def retire_consumed_blocks() -> None:
+            for cache_key, worker_id in list(active_owner_by_key.items()):
+                if not _block_is_consumed(staging_root_path, split, cache_key):
+                    continue
+                active_by_worker[worker_id].discard(cache_key)
+                active_owner_by_key.pop(cache_key, None)
+
+        for worker_id in range(len(worker_queues)):
+            fill_worker_slots(worker_id)
 
         with ThreadPoolExecutor(max_workers=download_workers) as pool:
             futures: dict[Future[str], str] = {}
-            while pending_cache_keys or futures:
-                while (
-                    pending_cache_keys
-                    and len(futures) < download_workers
-                    and _count_staged_blocks(staging_root_path, split, cache_keys) + len(futures)
-                    < max_staged_blocks
-                ):
-                    cache_key = pending_cache_keys.popleft()
+            while (
+                futures
+                or active_owner_by_key
+                or any(
+                    queue_positions[worker_id] < len(worker_queues[worker_id])
+                    for worker_id in range(len(worker_queues))
+                )
+            ):
+                retire_consumed_blocks()
+                for worker_id in range(len(worker_queues)):
+                    fill_worker_slots(worker_id)
+
+                in_flight_cache_keys = set(futures.values())
+                active_order = [cache_key for cache_key in active_order if cache_key in active_owner_by_key]
+                for cache_key in active_order:
+                    if len(futures) >= download_workers:
+                        break
+                    if cache_key in in_flight_cache_keys:
+                        continue
                     if v15_block_is_cached(staging_root_path, split, cache_key):
                         continue
                     futures[
@@ -538,6 +617,7 @@ def _run_hf_v2_staging_downloader(
                             relative_path=block_paths_by_key[cache_key],
                         )
                     ] = cache_key
+                    in_flight_cache_keys.add(cache_key)
 
                 if not futures:
                     time.sleep(_HF_V2_STAGING_POLL_SECONDS)
@@ -573,6 +653,9 @@ class HFV2StagedBlockReader:
         self.staging_source_root = self.staging_root / stage_key
         self.block_path_by_key: dict[str, str] = {}
         self.row_count_by_key: dict[str, int] = {}
+        self.worker_by_key: dict[str, int] = {}
+        self.worker_quotas: tuple[int, ...] = ()
+        self.effective_max_staged_blocks = self.max_staged_blocks
         self._process: mp.Process | None = None
         self._process_owner_pid: int | None = None
 
@@ -585,10 +668,18 @@ class HFV2StagedBlockReader:
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
 
-    def prepare_blocks(self, blocks: tuple[dict[str, Any], ...]) -> None:
+    def prepare_blocks(self, blocks: tuple[dict[str, Any], ...], *, worker_count: int = 1) -> None:
         self.block_path_by_key = _block_path_by_key(blocks)
         self.row_count_by_key = _row_count_by_key(blocks)
         cache_keys = tuple(str(block["cache_key"]) for block in blocks)
+        staging_plan = _build_worker_staging_plan(
+            cache_keys,
+            max_staged_blocks=self.max_staged_blocks,
+            worker_count=worker_count,
+        )
+        self.worker_by_key = dict(staging_plan.worker_by_key)
+        self.worker_quotas = staging_plan.worker_quotas
+        self.effective_max_staged_blocks = staging_plan.effective_max_staged_blocks
         remove_tree(self.staging_source_root)
         if self._process is not None and self._process.is_alive():
             self._process.terminate()
@@ -599,8 +690,8 @@ class HFV2StagedBlockReader:
                 "split": self.split,
                 "staging_source_root": os.fspath(self.staging_source_root),
                 "block_paths_by_key": dict(self.block_path_by_key),
-                "cache_keys": cache_keys,
-                "max_staged_blocks": self.max_staged_blocks,
+                "worker_queues": staging_plan.worker_queues,
+                "worker_quotas": staging_plan.worker_quotas,
                 "download_workers": self.download_workers,
             },
             daemon=True,
@@ -625,6 +716,7 @@ class HFV2StagedBlockReader:
         return v15_block_is_cached(self.staging_source_root, self.split, cache_key)
 
     def release_block(self, cache_key: str) -> None:
+        _mark_consumed_block(self.staging_source_root, self.split, cache_key)
         clear_v15_block(self.staging_source_root, self.split, cache_key)
 
     def close(self) -> None:
