@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 
-from .data.cache_backend import CacheSource, normalize_cache_src, resolve_b2_download_workers
+from .data.hf_v2 import resolve_dataset_root
 from .data.constants import DATASET_ID
 from .data.dataset import (
     PreparedSplitState,
@@ -28,9 +28,7 @@ from .data.dataset import (
     resolve_prepared_split_state,
     seed_everything,
 )
-from .data.runtime import ensure_split_cache, is_distributed, is_primary
-from .data.store import resolve_cache_root
-from .data.source import run_startup_stage
+from .data.runtime import is_distributed, is_primary, run_startup_stage
 from .progress import resolve_progress_bar_ncols
 from .trainer_reporting import (
     format_config_banner,
@@ -111,11 +109,8 @@ class Trainer:
         epochs: int = 1,
         seed: int = 42,
         output_dir: str | Path = "runs/default",
-        cache_dir: str | Path | None = None,
-        cache_src: CacheSource = "local",
-        b2_staging_dir: str | Path | None = None,
-        b2_staging_max_blocks: int = 80,
-        b2_download_workers: int | None = None,
+        streaming: bool = True,
+        dataset_dir: str | Path | None = None,
         num_workers: int | str = "auto",
         multiprocessing_context: str | None = None,
         train_crop_size: int | None = 128,
@@ -142,9 +137,6 @@ class Trainer:
             raise ValueError("train_crop_size must be greater than zero when provided")
         if grad_clip_norm is not None and grad_clip_norm <= 0:
             raise ValueError("grad_clip_norm must be greater than zero when provided")
-        if b2_staging_max_blocks <= 0:
-            raise ValueError("b2_staging_max_blocks must be greater than zero")
-
         self._validate_max_samples("max_train_samples", max_train_samples)
         self._validate_max_samples("max_val_samples", max_val_samples)
         self._validate_max_samples("max_test_samples", max_test_samples)
@@ -182,22 +174,12 @@ class Trainer:
         self.train_random_flip = bool(train_random_flip)
         self.train_random_rot90 = bool(train_random_rot90)
         self.grad_clip_norm = grad_clip_norm
-        self.cache_src = normalize_cache_src(cache_src)
+        self.streaming = bool(streaming)
 
         self.num_workers = resolve_num_workers(num_workers)
-        self.b2_download_workers = resolve_b2_download_workers(b2_download_workers)
         self.output_dir = Path(output_dir)
         self.metrics_path = self.output_dir / "metrics.jsonl"
-        if self.cache_src == "B2":
-            self.cache_root = Path(cache_dir) if cache_dir is not None else Path("cache")
-        else:
-            self.cache_root = resolve_cache_root(cache_dir)
-        self.b2_staging_dir = (
-            Path(b2_staging_dir)
-            if b2_staging_dir is not None
-            else Path.home() / ".cache" / "cr-train" / "b2-staging"
-        )
-        self.b2_staging_max_blocks = max(int(b2_staging_max_blocks), self.num_workers + 1)
+        self.dataset_root = resolve_dataset_root(dataset_dir)
 
         self.include_metadata = True
         self.pin_memory = True
@@ -208,7 +190,7 @@ class Trainer:
         self.current_epoch = 0
         self.global_step = 0
         self._config_written = False
-        self._cache_ready: set[str] = set()
+        self._data_ready: set[str] = set()
         self._prepared_split_states: dict[tuple[str, int | None], _PreparedSplitCacheEntry] = {}
 
         self.device = self._infer_module_device(self.model)
@@ -234,7 +216,7 @@ class Trainer:
         epoch_index = self.current_epoch
         self._seed_epoch(epoch_index)
         self._write_config_once()
-        self._ensure_training_startup_caches()
+        self._ensure_training_startup_data()
 
         train_lrs = self._get_learning_rates()
         train_started_at = time.perf_counter()
@@ -687,10 +669,8 @@ class Trainer:
                 "train_random_rot90": self.train_random_rot90,
                 "grad_clip_norm": self.grad_clip_norm,
                 "mixed_precision": self.mixed_precision,
-                "cache_src": self.cache_src,
-                "b2_download_workers": self.b2_download_workers if self.cache_src == "B2" else None,
-                "b2_staging_dir": str(self.b2_staging_dir) if self.cache_src == "B2" else None,
-                "b2_staging_max_blocks": self.b2_staging_max_blocks if self.cache_src == "B2" else None,
+                "streaming": self.streaming,
+                "dataset_dir": None if self.streaming else str(self.dataset_root),
             }
         )
         tqdm.write(
@@ -711,7 +691,7 @@ class Trainer:
                 scheduler_monitor=self.scheduler_monitor,
                 grad_clip_norm=self.grad_clip_norm,
                 mixed_precision=self.mixed_precision,
-                cache_src=self.cache_src,
+                streaming=self.streaming,
             )
         )
 
@@ -735,34 +715,21 @@ class Trainer:
             return self.model.module
         return self.model
 
-    def _ensure_split_cache(self, *, split: str, max_samples: int | None) -> None:
-        if split in self._cache_ready:
+    def _ensure_split_data(self, *, split: str, max_samples: int | None) -> None:
+        if split in self._data_ready:
             return
-        if self.cache_src == "B2":
-            self._cache_prepared_split_state(split=split, max_samples=max_samples)
-            self._cache_ready.add(split)
-            return
+        self._prepare_split_state(split=split, max_samples=max_samples)
+        self._data_ready.add(split)
 
-        ensure_split_cache(
-            split=split,
-            dataset_name=DATASET_ID,
-            revision=None,
-            max_samples=max_samples,
-            seed=self.seed,
-            cache_root=self.cache_root,
-            startup_callback=self._handle_startup_event,
-        )
-        self._cache_ready.add(split)
-
-    def _ensure_training_startup_caches(self) -> None:
+    def _ensure_training_startup_data(self) -> None:
         for split, max_samples in (
             ("train", self.max_train_samples),
             ("validation", self.max_val_samples),
             ("test", self.max_test_samples),
         ):
-            self._ensure_split_cache(split=split, max_samples=max_samples)
+            self._ensure_split_data(split=split, max_samples=max_samples)
 
-    def _cache_prepared_split_state(
+    def _prepare_split_state(
         self,
         *,
         split: str,
@@ -779,11 +746,8 @@ class Trainer:
             revision=None,
             max_samples=max_samples,
             seed=self.seed,
-            cache_root=self.cache_root,
-            cache_src=self.cache_src,
-            b2_staging_dir=self.b2_staging_dir if self.cache_src == "B2" else None,
-            b2_staging_max_blocks=self.b2_staging_max_blocks,
-            b2_download_workers=self.b2_download_workers if self.cache_src == "B2" else None,
+            dataset_root=None if self.streaming else self.dataset_root,
+            streaming=self.streaming,
             startup_callback=self._handle_startup_event,
         )
         self._prepared_split_states[key] = _PreparedSplitCacheEntry(
@@ -804,12 +768,12 @@ class Trainer:
         if cached is not None:
             return cached.state
 
-        self._ensure_split_cache(split=split, max_samples=max_samples)
+        self._ensure_split_data(split=split, max_samples=max_samples)
         cached = self._prepared_split_states.get(key)
         if cached is not None:
             return cached.state
 
-        return self._cache_prepared_split_state(split=split, max_samples=max_samples)
+        return self._prepare_split_state(split=split, max_samples=max_samples)
 
     def _build_loader(
         self,

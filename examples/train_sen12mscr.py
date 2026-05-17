@@ -1,7 +1,7 @@
 """SEN12MS-CR training example built around ``Trainer``.
 
 Create a model, optimizer, loss, and custom scheduler, then let ``Trainer``
-handle dataset access, cache warmup, dataloaders, and metrics.
+handle dataset access, dataloaders, and metrics.
 
 Usage:
     uv run python examples/train_sen12mscr.py \\
@@ -35,9 +35,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from cr_train import Trainer, cleanup_distributed, setup_distributed_from_env
-from cr_train.data.cache_backend import b2_download_worker_count
-
-
 # --- Model ---
 
 class FusionBaseline(nn.Module):
@@ -160,19 +157,19 @@ def parse_args() -> argparse.Namespace:
         "--max-train-samples",
         type=parse_max_samples,
         default=None,
-        help="Requested train rows; converted to cache-block count, or 'none'/'full'.",
+        help="Requested train rows; converted to HF v2 block count, or 'none'/'full'.",
     )
     parser.add_argument(
         "--max-val-samples",
         type=parse_max_samples,
         default=None,
-        help="Requested validation rows; converted to cache-block count, or 'none'/'full'.",
+        help="Requested validation rows; converted to HF v2 block count, or 'none'/'full'.",
     )
     parser.add_argument(
         "--max-test-samples",
         type=parse_max_samples,
         default=None,
-        help="Requested test rows; converted to cache-block count, or 'none'/'full'.",
+        help="Requested test rows; converted to HF v2 block count, or 'none'/'full'.",
     )
     parser.add_argument(
         "--seed",
@@ -204,32 +201,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default="runs/sen12mscr-example")
     parser.add_argument(
-        "--cache-dir",
+        "--streaming",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream HF v2 crpack blocks instead of using a persistent local dataset.",
+    )
+    parser.add_argument(
+        "--dataset-dir",
         default=None,
-        help="Local cache root for local mode, or B2 bucket prefix for B2 mode.",
-    )
-    parser.add_argument(
-        "--cache-src",
-        choices=("local", "B2"),
-        default="local",
-        help="Cache source. local uses cache_dir; B2 reads existing B2 cache objects on demand.",
-    )
-    parser.add_argument(
-        "--b2-staging-dir",
-        default=None,
-        help="Local staging directory for B2 blocks. B2 mode only.",
-    )
-    parser.add_argument(
-        "--b2-staging-max-blocks",
-        type=parse_positive_int,
-        default=80,
-        help="Maximum number of B2 blocks staged locally ahead of consumption. This is not a worker count.",
-    )
-    parser.add_argument(
-        "--b2-download-workers",
-        type=parse_positive_int,
-        default=b2_download_worker_count(),
-        help="Number of internal B2 object download workers. This is separate from DataLoader workers.",
+        help="Persistent local HF v2 dataset directory used when --no-streaming is set.",
     )
     parser.add_argument("--device", default=None)
     parser.add_argument("--hidden-channels", type=int, default=64)
@@ -348,11 +328,8 @@ def main() -> None:
             epochs=args.epochs,
             seed=args.seed,
             output_dir=args.output_dir,
-            cache_dir=args.cache_dir,
-            cache_src=args.cache_src,
-            b2_staging_dir=args.b2_staging_dir,
-            b2_staging_max_blocks=args.b2_staging_max_blocks,
-            b2_download_workers=args.b2_download_workers,
+            streaming=args.streaming,
+            dataset_dir=args.dataset_dir,
             train_crop_size=args.train_crop_size,
             train_random_flip=args.train_random_flip,
             train_random_rot90=args.train_random_rot90,

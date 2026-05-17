@@ -10,7 +10,8 @@ import torch
 from .data.constants import WARMUP_TIMELINE_WIDTH
 
 PRINTED_STARTUP_STAGES: dict[str, set[str]] = {
-    "warm split cache": {"done"},
+    "warm streaming data": {"done"},
+    "warm local dataset": {"done"},
     "remote retry": {"retry"},
 }
 
@@ -66,14 +67,14 @@ def _format_warmup_timeline(value: Any) -> str | None:
     return _compact_timeline(timeline)
 
 
-def format_cache_summary(event: dict[str, Any]) -> str:
+def format_data_summary(event: dict[str, Any]) -> str:
     split = str(event.get("split", "unknown"))
     selected_block_count = int(event.get("selected_block_count", 0))
     selected_missing_blocks = int(event.get("selected_missing_blocks", 0))
     resolved_blocks = int(event.get("resolved_blocks", 0))
-    prefix = f"cache {split}"
+    prefix = f"data {split}"
     if selected_missing_blocks == 0:
-        parts = [prefix, "cache-hit", f"selected: {selected_block_count}, fill: 0/0"]
+        parts = [prefix, "ready", f"selected: {selected_block_count}, fill: 0/0"]
     else:
         parts = [
             prefix,
@@ -103,8 +104,9 @@ def format_remote_retry_summary(event: dict[str, Any]) -> str:
         f"backoff {delay_sec:.1f}s",
         error_type,
     ]
-    if "cache_key" in event:
-        parts.append(f"cache_key={event['cache_key']}")
+    block_id = event.get("block_id", event.get("cache_key"))
+    if block_id is not None:
+        parts.append(f"block_id={block_id}")
     if "recovery" in event:
         parts.append(f"recovery={event['recovery']}")
     return _summary_separator().join(parts)
@@ -113,8 +115,8 @@ def format_remote_retry_summary(event: dict[str, Any]) -> str:
 def format_startup_message(event: dict[str, Any]) -> str:
     stage = str(event.get("stage", "startup"))
     split = str(event.get("split", "unknown"))
-    if stage == "warm split cache":
-        return format_cache_summary(event)
+    if stage in {"warm streaming data", "warm local dataset"}:
+        return format_data_summary(event)
     if stage == "remote retry":
         return format_remote_retry_summary(event)
 
@@ -126,7 +128,7 @@ def format_startup_message(event: dict[str, Any]) -> str:
         "required_blocks",
         "planner_mode",
         "selected_block_count",
-        "cached_selected_blocks",
+        "ready_selected_blocks",
         "selected_missing_blocks",
         "execution_block_count",
         "run_count",
@@ -140,8 +142,6 @@ def format_startup_message(event: dict[str, Any]) -> str:
     ):
         if field in event and not (field == "max_samples" and event[field] is None):
             parts.append(f"{field}={event[field]}")
-    if "cache_only" in event:
-        parts.append(f"cache_only={str(bool(event['cache_only'])).lower()}")
     if event.get("status") == "error" and event.get("error"):
         parts.append(f"error={event['error']}")
     return _summary_separator().join(parts)
@@ -269,7 +269,7 @@ def format_config_banner(
     scheduler_monitor: str | None,
     grad_clip_norm: float | None,
     mixed_precision: str,
-    cache_src: str,
+    streaming: bool,
 ) -> str:
     header = f"{_BOLD}cr-train{_RESET} {_DIM}── {dataset_name} ── {device}{_RESET}"
     splits = (
@@ -296,8 +296,7 @@ def format_config_banner(
         config_parts.append(f"clip {format_metric_value(grad_clip_norm)}")
     if mixed_precision != "off":
         config_parts.append(f"amp {mixed_precision}")
-    if cache_src != "local":
-        config_parts.append(f"cache {cache_src}")
+    config_parts.append("streaming" if streaming else "local data")
     config = f"  {_DIM}config{_RESET}  " + _summary_separator().join(config_parts)
     return f"{header}\n{splits}\n{config}"
 

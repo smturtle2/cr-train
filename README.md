@@ -1,13 +1,13 @@
 <h1 align="center">cr-train</h1>
 
 <p align="center">
-  <em>One-class training toolkit for satellite cloud removal -- deterministic sampling, smart caching, and DDP out of the box.</em>
+  <em>One-class training toolkit for satellite cloud removal -- deterministic sampling, fast HF block streaming, and DDP out of the box.</em>
 </p>
 
 <p align="center">
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue?logo=python&logoColor=white" alt="Python 3.12+"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.4%2B-ee4c2c?logo=pytorch&logoColor=white" alt="PyTorch 2.4+"></a>
-  <a href="https://huggingface.co/datasets/Hermanni/sen12mscr"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Hermanni%2Fsen12mscr-yellow" alt="Dataset"></a>
+  <a href="https://huggingface.co/datasets/Hermanni/sen12mscr-v2"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Hermanni%2Fsen12mscr--v2-yellow" alt="Dataset"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
 </p>
 
@@ -38,10 +38,10 @@
 
 - **Single-class API** -- `Trainer` with `step()` + `test()`, nothing else to learn
 - **Deterministic block sampling** -- one-seed system (`seed`) for exact reproducibility
-- **Smart cache warmup** -- fills only missing cache blocks and reuses them across plans
+- **HF v2 block data** -- streams compressed `.crpack` blocks or persists them locally
 - **Distributed training** -- automatic DDP wrapping, rank-aware block partitioning, all-reduce metrics
 - **JSONL experiment tracking** -- every train/validation epoch and startup event recorded to `metrics.jsonl`
-- **Zero config data** -- ingests directly from [`Hermanni/sen12mscr`](https://huggingface.co/datasets/Hermanni/sen12mscr) via `load_dataset(..., streaming=True)`; no manual download needed
+- **Zero config data** -- streams directly from [`Hermanni/sen12mscr-v2`](https://huggingface.co/datasets/Hermanni/sen12mscr-v2); no manual download needed
 
 ---
 
@@ -145,10 +145,10 @@ uv run python examples/train_sen12mscr.py \
   --output-dir runs/sen12mscr-example
 ```
 
-Pass `--max-train-samples none` (or `full`) to bypass sampling, warm every cache block, and train on the entire split.
-After a full split is completely warmed once, later runs reuse the cached source metadata and split catalog without contacting HF again unless the local cache becomes incomplete.
+Pass `--max-train-samples none` (or `full`) to bypass sampling and train on the entire split.
+By default the script streams HF v2 blocks. Pass `--no-streaming --dataset-dir PATH` to persist selected blocks locally and reuse a complete split without revalidation on later runs.
 Use `--accum-steps N` to accumulate gradients across `N` micro-batches before each optimizer update; `global_step` in `get_state()` and checkpoints counts optimizer updates, not micro-batches.
-Train batches use a deterministic sample-mixed order across active cached blocks, while validation and test keep the selected block order.
+Train batches use a deterministic sample-mixed order across active blocks, while validation and test keep the selected block order.
 Pass `--grad-clip-norm VALUE` to clip gradients before each optimizer update. Non-finite train losses and gradients fail fast before `optimizer.step()`.
 The bundled script uses a custom `WarmupCosineScheduler` subclass by default to show the public scheduler API end-to-end; pass `--scheduler none` to disable it.
 Use `--scheduler-timing after_validation|before_optimizer_step|after_optimizer_step` to control when `Trainer` calls `scheduler.step()`. The bundled warmup-cosine example stays on the default epoch-based `after_validation` timing.
@@ -173,14 +173,14 @@ Output shows the raw draw order, the final selected block indices, and a bitmap 
 
 Most users only need `from cr_train import Trainer`. Once you construct it, `Trainer` automatically:
 
-- resolves dataset metadata and local cache state
-- warms only the splits needed for the current call
+- resolves the HF v2 manifest and split catalogs
+- streams or locally prepares only the splits needed for the current call
 - builds iterable dataloaders, rank-aware block partitioning, and sample-mixed train order
 - writes `metrics.jsonl`
 - shows running-average loss and metrics with batch-level tqdm during training, then prints aligned train/validation summary lines with per-split elapsed time
 - appends metrics to `metrics.jsonl` in the output directory (one JSON object per line)
 
-You do not need any cache or dataloader setup code for the normal training flow.
+You do not need any dataset download or dataloader setup code for the normal training flow.
 Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoint()`, `save_weights()`, `load_weights()`, `predict()`, and `get_state()` when you need them.
 
 ---
@@ -198,7 +198,7 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `scheduler` | `LRScheduler \| None` | `None` | Optional scheduler built from the same optimizer. Standard schedulers step once after validation. `ReduceLROnPlateau` is also supported. |
 | `scheduler_timing` | `str` | `"after_validation"` | When `Trainer` calls `scheduler.step()`. Supported values: `after_validation`, `before_optimizer_step`, `after_optimizer_step`. Keep epoch-based schedulers such as the bundled warmup-cosine example on the default `after_validation` timing. |
 | `scheduler_monitor` | `str \| None` | `None` | Monitor path for `ReduceLROnPlateau`. Default is `val.loss`. Supported values are `val.loss` and `val.metrics.<name>`. |
-| `max_train_samples` | `int \| None` | `None` | Requested train rows. Converted to cache-block count using the active cache layout (`CACHE_BLOCK_SIZE=32` for layout-v15). `None` = full split. |
+| `max_train_samples` | `int \| None` | `None` | Requested train rows. Converted to 32-row HF v2 block count. `None` = full split. |
 | `max_val_samples` | `int \| None` | `None` | Same for validation. |
 | `max_test_samples` | `int \| None` | `None` | Same for test. |
 | `batch_size` | `int` | `4` | Batch size for all DataLoaders. |
@@ -206,12 +206,9 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `epochs` | `int` | `1` | Total training epochs. Call `step()` once per epoch. |
 | `seed` | `int` | `42` | Seed controlling deterministic block selection and epoch-wise train sample order. |
 | `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and the default `save_checkpoint()` / `save_weights()` output files. |
-| `cache_dir` | `str \| Path \| None` | `None` | Cache location. In local mode this is the local block cache root (`None` = `~/.cache/cr-train`). In B2 mode this is the B2 bucket prefix (`None` = `cache`). |
-| `cache_src` | `"local" \| "B2"` | `"local"` | Cache source. `"local"` uses a local cache; `"B2"` reads existing B2 cache objects on demand from the configured B2 prefix. |
-| `b2_staging_dir` | `str \| Path \| None` | `None` | Local directory used only in B2 mode to stage blocks before DataLoader workers read them (`None` = `~/.cache/cr-train/b2-staging`). |
-| `b2_staging_max_blocks` | `int` | `80` | B2 staging buffer size in blocks. This is not a worker count; `Trainer` raises it to at least `num_workers + 1` to avoid blocking DataLoader workers. |
-| `b2_download_workers` | `int \| None` | `None` | Internal B2 object download worker count (`None` = `24`). This is separate from PyTorch DataLoader workers. |
-| `num_workers` | `int \| "auto"` | `"auto"` | PyTorch DataLoader worker process count. `"auto"` resolves to `min(16, max(1, os.cpu_count() // 3))`; this is separate from B2 download workers. |
+| `streaming` | `bool` | `True` | Stream compressed HF v2 blocks through a shared staging pipeline. Consumed staged blocks are deleted automatically. |
+| `dataset_dir` | `str \| Path \| None` | `None` | Persistent local HF v2 dataset directory used when `streaming=False` (`None` = `~/.cache/cr-train/sen12mscr-v2`). Complete full splits are trusted without revalidation; partial/incomplete local splits verify selected block headers and refill missing or bad blocks. |
+| `num_workers` | `int \| "auto"` | `"auto"` | PyTorch DataLoader worker process count. `"auto"` resolves to `min(16, max(1, os.cpu_count() // 3))`. |
 | `multiprocessing_context` | `str \| None` | `None` | Explicit worker start method. When `num_workers > 0` on CUDA, `Trainer` defaults this to `"spawn"` for safer worker startup. |
 | `train_crop_size` | `int \| None` | `128` | Apply random square crops of this size to train batches before they leave the collate step. |
 | `train_random_flip` | `bool` | `True` | Apply independent random vertical/horizontal flips to train batches. |
@@ -326,19 +323,16 @@ See [`examples/bitmask_sampling_demo.py`](examples/bitmask_sampling_demo.py) for
 
 ## Architecture
 
-`Trainer` defaults to HuggingFace streaming plus a reusable local block cache. Layout-v15 splits each 64-row source row group into 32-row compressed `.crpack` cache blocks and records startup events in `metrics.jsonl`. Partial requests use deterministic uniform exact-k logical block selection keyed by `seed`, while full-split requests bypass sampling and select every cache block in order. Training sample order still changes by epoch through `seed + epoch_index`, but samples are mixed across active cached blocks instead of draining one block at a time.
+`Trainer` defaults to `streaming=True` against the HF v2 block dataset. Layout-v15 stores 32-row compressed `.crpack` blocks and records startup events in `metrics.jsonl`. Partial requests use deterministic uniform exact-k logical block selection keyed by `seed`, while full-split requests bypass sampling and select every block in order. Training sample order still changes by epoch through `seed + epoch_index`, but samples are mixed across active blocks instead of draining one block at a time.
 
-Set `cache_src="B2"` to read an already-materialized B2 cache directly from object storage. B2 mode requires `B2_BUCKET`, `B2_ENDPOINT`, `B2_KEY_ID`, and `B2_APP_KEY`; interprets `cache_dir` as the B2 bucket prefix; and reads under `<cache_dir>/layout-v15/` (`cache/layout-v15/` by default). B2 downloads use 24 internal object download workers by default, while `num_workers` still controls PyTorch DataLoader processes. The staging downloader downloads compressed `.crpack` block objects into `b2_staging_dir`, shares them across DataLoader workers, and deletes each staged block after consumption. If that configured B2 prefix has no matching cache, or a selected cached object is missing or unreadable, it fails fast.
+In streaming mode a producer process downloads selected HF v2 blocks into a shared staging directory under `~/.cache/cr-train/streaming-stage`. DataLoader workers read staged blocks as they become ready, and each consumed staged block is deleted immediately. This keeps network download and sample decoding pipelined without requiring a persistent local copy.
 
-Use `cr_train.data.convert_v14_cache_to_v15(...)` to convert an existing local layout-v14 cache into layout-v15 without downloading the dataset again.
+With `streaming=False`, `dataset_dir` points to a persistent local HF v2 mirror. `step()` prepares `train`, `validation`, and `test` once up front; later epochs reuse the prepared split state. Complete full splits are trusted without revalidation. If a local split is partial or incomplete, only the selected block headers are checked and missing or bad blocks are fetched from Hugging Face.
 
-In local mode, warmup prepares the selected splits from the local cache: `step()` prepares `train` and `validation`, while `test()` prepares `test`. Missing blocks are fetched from HuggingFace only when the selected cache blocks are not already cached locally.
-
-- Cache warmup shows a tqdm progress bar during block download and prints a one-line `■/□` block timeline on completion.
+- Startup output prints a one-line `■/□` block timeline on completion.
 - Equal `seed` values keep the same uniform exact-k block-selection membership for partial requests; full-split requests always include every block.
-- Once a full split has been fully verified locally, later runs reuse the cached descriptor/catalog view offline until the cache becomes incomplete or is deleted.
 - CUDA runs with worker processes default to the safer `"spawn"` multiprocessing context once `num_workers > 0`.
-- Finished caches are never auto-deleted. Remove them manually from the cache directory to reclaim disk space.
+- Persistent local datasets are never auto-deleted. Remove `dataset_dir` manually to reclaim disk space.
 
 ---
 

@@ -15,11 +15,11 @@ import pytest
 import torch
 
 from cr_train import Trainer
-from cr_train.data import BLOCK_SIZE, CACHE_BLOCK_SIZE, build_collate_fn
+from cr_train.data import BLOCK_SIZE, CRPACK_BLOCK_SIZE, build_collate_fn
 from cr_train.progress import resolve_progress_bar_ncols
-from cr_train.data.v15 import load_v15_block_metadata, resolve_v15_block_root
+from cr_train.data.v15 import pack_v15_block
 from cr_train.trainer_reporting import (
-    format_cache_summary,
+    format_data_summary,
     format_epoch_summary,
     format_startup_message,
     format_test_summary,
@@ -74,8 +74,8 @@ def _catalog(split: str, blocks: list[list[dict[str, object]]]) -> tuple[dict[st
     block_row_counts = []
     total_rows = 0
     for source_index, rows in enumerate(blocks):
-        for row_start in range(0, len(rows), CACHE_BLOCK_SIZE):
-            row_count = min(CACHE_BLOCK_SIZE, len(rows) - row_start)
+        for row_start in range(0, len(rows), CRPACK_BLOCK_SIZE):
+            row_count = min(CRPACK_BLOCK_SIZE, len(rows) - row_start)
             cache_key = hashlib.sha256(
                 f"{split}:{source_index}:{row_start}:{row_count}".encode("utf-8")
             ).hexdigest()[:16]
@@ -83,10 +83,9 @@ def _catalog(split: str, blocks: list[list[dict[str, object]]]) -> tuple[dict[st
             block_entries.append(
                 {
                     "index": len(block_entries),
-                    "shard_index": source_index,
+                    "block_id": cache_key,
                     "cache_key": cache_key,
-                    "source_file": f"hf://datasets/unit/test/{split}/{source_index:04d}.parquet",
-                    "row_groups": [source_index],
+                    "path": f"{split}/unit/scene_{source_index}/block-{len(block_entries):05d}.crpack",
                     "row_start": row_start,
                     "row_count": row_count,
                 }
@@ -95,7 +94,7 @@ def _catalog(split: str, blocks: list[list[dict[str, object]]]) -> tuple[dict[st
         total_rows += len(rows)
     return {
         "cache_layout_version": 15,
-        "cache_block_size": CACHE_BLOCK_SIZE,
+        "cache_block_size": CRPACK_BLOCK_SIZE,
         "split": split,
         "total_rows": total_rows,
         "total_blocks": len(block_entries),
@@ -104,9 +103,8 @@ def _catalog(split: str, blocks: list[list[dict[str, object]]]) -> tuple[dict[st
     }, rows_by_key
 
 
-def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list[list[dict[str, object]]]]) -> dict[str, object]:
-    source_root = tmp_path / "source"
-    source_root.mkdir(parents=True, exist_ok=True)
+def _patch_split_data(monkeypatch, tmp_path: Path, split_blocks: dict[str, list[list[dict[str, object]]]]) -> dict[str, object]:
+    del tmp_path
     catalogs: dict[str, dict[str, object]] = {}
     rows_by_key: dict[str, list[dict[str, object]]] = {}
     split_sizes: dict[str, int] = {}
@@ -116,58 +114,83 @@ def _patch_split_cache(monkeypatch, tmp_path: Path, split_blocks: dict[str, list
         rows_by_key.update(block_rows)
         split_sizes[split] = int(catalog["total_rows"])
 
-    descriptor = {
-        "dataset_name": "unit/test",
-        "revision": None,
-        "split_sizes": split_sizes,
-    }
     load_counts: dict[str, int] = defaultdict(int)
+    rows_by_path = {
+        str(block["path"]): rows_by_key[str(block["cache_key"])]
+        for catalog in catalogs.values()
+        for block in catalog["blocks"]
+    }
 
-    def fake_ensure_source_root(
-        *,
-        dataset_name: str,
-        revision: str | None,
-        cache_root: Path,
-        startup_callback=None,
-    ):
-        assert dataset_name in {"unit/test", "Hermanni/sen12mscr"}
-        del revision, cache_root, startup_callback
-        return source_root, descriptor
+    def fake_load_hf_v2_manifest(*, dataset_root=None, streaming=True):
+        del dataset_root, streaming
+        return {
+            "layout": "cr-hf-scene-v1",
+            "block_format_version": 15,
+            "splits": {
+                split: {
+                    "row_count": split_sizes[split],
+                    "block_count": int(catalogs[split]["total_blocks"]),
+                    "path": f"catalogs/{split}.json",
+                }
+                for split in split_sizes
+            },
+        }
 
-    def fake_ensure_split_catalog(*, source_root: Path, descriptor: dict[str, object], split: str, startup_callback):
-        del source_root, descriptor, startup_callback
+    def fake_load_hf_v2_split_catalog(*, split: str, dataset_root=None, streaming=True):
+        del dataset_root, streaming
         return catalogs[split]
 
-    def fake_load_block_rows(
-        *,
-        dataset_name: str,
-        revision: str | None,
-        split: str,
-        block: dict[str, object],
-        progress_callback=None,
-        startup_callback=None,
-    ):
-        del dataset_name, revision, split, startup_callback
-        cache_key = str(block["cache_key"])
+    def fake_download_remote_file(relative_path: str, target: Path) -> int:
+        rows = [dict(row) for row in rows_by_path[relative_path]]
+        cache_key = next(
+            str(block["cache_key"])
+            for catalog in catalogs.values()
+            for block in catalog["blocks"]
+            if str(block["path"]) == relative_path
+        )
         load_counts[cache_key] += 1
-        rows = [dict(row) for row in rows_by_key[cache_key]]
-        if progress_callback is not None:
-            for index, row in enumerate(rows, start=1):
-                downloaded_bytes = sum(
-                    len(value)
-                    for value in row.values()
-                    if isinstance(value, (bytes, bytearray, memoryview))
-                )
-                progress_callback(index, downloaded_bytes)
-        return rows
+        payload_metadata = {
+            "row_count": len(rows),
+            "season": [str(row["season"]) for row in rows],
+            "scene": [str(row["scene"]) for row in rows],
+            "patch": [str(row["patch"]) for row in rows],
+            "sar_shape": [list(row["sar_shape"]) for row in rows],
+            "opt_shape": [list(row["opt_shape"]) for row in rows],
+        }
+        sar = np.stack(
+            [
+                np.frombuffer(row["sar"], dtype=np.float32).reshape(row["sar_shape"])
+                for row in rows
+            ]
+        )
+        cloudy = np.stack(
+            [
+                np.frombuffer(row["cloudy"], dtype=np.int16).reshape(row["opt_shape"])
+                for row in rows
+            ]
+        )
+        target_array = np.stack(
+            [
+                np.frombuffer(row["target"], dtype=np.int16).reshape(row["opt_shape"])
+                for row in rows
+            ]
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(
+            pack_v15_block(
+                payload_metadata=payload_metadata,
+                metadata={"cache_key": cache_key, "row_count": len(rows)},
+                sar=sar,
+                cloudy=cloudy,
+                target=target_array,
+            )
+        )
+        return target.stat().st_size
 
-    monkeypatch.setattr("cr_train.data.runtime.ensure_source_root", fake_ensure_source_root)
-    monkeypatch.setattr("cr_train.data.runtime.ensure_split_catalog", fake_ensure_split_catalog)
-    monkeypatch.setattr("cr_train.data.runtime.load_block_rows", fake_load_block_rows)
-    monkeypatch.setattr("cr_train.data.dataset.ensure_source_root", fake_ensure_source_root)
-    monkeypatch.setattr("cr_train.data.dataset.ensure_split_catalog", fake_ensure_split_catalog)
+    monkeypatch.setattr("cr_train.data.dataset.load_hf_v2_manifest", fake_load_hf_v2_manifest)
+    monkeypatch.setattr("cr_train.data.dataset.load_hf_v2_split_catalog", fake_load_hf_v2_split_catalog)
+    monkeypatch.setattr("cr_train.data.hf_v2._download_remote_file", fake_download_remote_file)
     return {
-        "source_root": source_root,
         "catalogs": catalogs,
         "load_counts": load_counts,
     }
@@ -402,7 +425,7 @@ def _patch_epoch_execution(
     train_queue = iter(copy.deepcopy(train_summaries))
     validation_queue = iter(copy.deepcopy(validation_summaries))
 
-    monkeypatch.setattr(Trainer, "_ensure_training_startup_caches", lambda self: None)
+    monkeypatch.setattr(Trainer, "_ensure_training_startup_data", lambda self: None)
 
     def fake_run_training_epoch(self, epoch_index: int) -> dict[str, object]:
         del self, epoch_index
@@ -484,8 +507,8 @@ def test_top_level_package_exports_trainer_as_primary_entry_point() -> None:
     assert callable(namespace["setup_distributed_from_env"])
 
 
-def test_format_cache_summary_compacts_square_timeline_on_one_line() -> None:
-    summary = format_cache_summary(
+def test_format_data_summary_compacts_square_timeline_on_one_line() -> None:
+    summary = format_data_summary(
         {
             "split": "train",
             "selected_block_count": 20,
@@ -502,7 +525,7 @@ def test_format_cache_summary_compacts_square_timeline_on_one_line() -> None:
     assert "■□" in plain_summary
     assert "█" not in summary and "░" not in summary
     assert "…" in summary
-    assert "cache train │ warm │ selected: 20, fill: 3/3 │ 1.2s" in plain_summary
+    assert "data train │ warm │ selected: 20, fill: 3/3 │ 1.2s" in plain_summary
 
 
 def test_format_startup_message_uses_dim_separator() -> None:
@@ -531,7 +554,7 @@ def test_format_startup_message_formats_remote_retry_summary() -> None:
             "max_attempts": 10,
             "delay_sec": 4.0,
             "error_type": "ConnectionError",
-            "cache_key": "abc123",
+            "block_id": "abc123",
             "recovery": "reset_hf_session",
         }
     )
@@ -540,7 +563,7 @@ def test_format_startup_message_formats_remote_retry_summary() -> None:
     assert should_print_startup({"stage": "remote retry", "status": "retry"}) is True
     assert plain_summary == (
         "retry train │ load block rows │ attempt 2/10 │ backoff 4.0s │ ConnectionError"
-        " │ cache_key=abc123 │ recovery=reset_hf_session"
+        " │ block_id=abc123 │ recovery=reset_hf_session"
     )
 
 
@@ -683,7 +706,7 @@ def test_format_test_summary_uses_fixed_decimal_metrics() -> None:
     assert plain_summary.endswith("│ 2.1s")
 
 
-def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Path) -> None:
+def test_trainer_step_and_test_with_local_dataset_warmup(monkeypatch, tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metrics.jsonl"
@@ -691,7 +714,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
 
     FakeTqdm.instances.clear()
     FakeTqdm.writes.clear()
-    patched = _patch_split_cache(
+    patched = _patch_split_data(
         monkeypatch,
         tmp_path,
         {
@@ -700,9 +723,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
             "test": _make_block_splits(4),
         },
     )
-    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
     monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
-    monkeypatch.setattr("cr_train.data.runtime.resolve_progress_bar_ncols", lambda: 79)
     monkeypatch.setattr("cr_train.trainer.resolve_progress_bar_ncols", lambda: 79)
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
@@ -719,7 +740,8 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
         batch_size=8,
         seed=7,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     assert metrics_path.read_text(encoding="utf-8") == "old-record\n"
@@ -733,7 +755,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     warmup_splits_after_step = {
         record["split"]
         for record in startup_records_after_step
-        if record["stage"] == "warm split cache" and record["status"] == "done"
+        if record["stage"] == "warm local dataset" and record["status"] == "done"
     }
 
     test_summary = trainer.test()
@@ -750,11 +772,6 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     ]
     train_bars = [instance for instance in batch_bars if str(instance.desc).startswith("train")]
     eval_bars = [instance for instance in batch_bars if str(instance.desc).startswith(("val", "test"))]
-    warmup_bars = [
-        instance
-        for instance in FakeTqdm.instances
-        if any("cache " in desc for desc in instance.desc_history)
-    ]
     config_record = next(record for record in metrics_records if record["kind"] == "config")
     train_record = next(record for record in metrics_records if record["kind"] == "train_epoch")
 
@@ -786,8 +803,8 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert config_record["grad_clip_norm"] == 1.0
     assert config_record["mixed_precision"] == "off"
     assert warmup_splits_after_step == {"train", "validation", "test"}
-    assert "warm split cache" in startup_stages
-    assert "load local cache" in startup_stages
+    assert "warm local dataset" in startup_stages
+    assert "load local data" in startup_stages
     assert "build dataloader" in startup_stages
     assert "wait first batch" in startup_stages
     assert "start epoch" in startup_stages
@@ -823,21 +840,11 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert _elapsed_column_start(plain_train_message) == _elapsed_column_start(plain_val_message)
     assert _elapsed_column_start(plain_val_message) == _elapsed_column_start(plain_test_message)
     assert test_message.count("\n") == 0
-    warmup_messages = [message for message in FakeTqdm.writes if message.startswith("cache ")]
+    warmup_messages = [message for message in FakeTqdm.writes if message.startswith("data ")]
     assert len(warmup_messages) == 3
     assert all("\n" not in message for message in warmup_messages)
     assert all(("■" in message or "□" in message) for message in warmup_messages)
     assert all("█" not in message and "░" not in message for message in FakeTqdm.writes)
-
-    assert len(warmup_bars) == 3
-    assert all(int(bar.total) >= 1 for bar in warmup_bars)
-    assert all(sum(bar.updates) == int(bar.total) for bar in warmup_bars)
-    assert all(any("sel" in values for values in bar.postfixes) for bar in warmup_bars)
-    assert all(all("blk/s" not in values for values in bar.postfixes) for bar in warmup_bars)
-    assert all(any("MB/s" in values for values in bar.postfixes) for bar in warmup_bars)
-    assert all(len(bar.postfixes) > int(bar.total) for bar in warmup_bars)
-    assert all(len(bar.desc_history) == 1 for bar in warmup_bars)
-    assert all(bar.ncols == 79 for bar in warmup_bars)
 
     assert len(batch_bars) == 3
     assert len(train_bars) == 1
@@ -859,7 +866,7 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     warmup_done_records = [
         record
         for record in startup_records
-        if record["stage"] == "warm split cache" and record["status"] == "done"
+        if record["stage"] == "warm local dataset" and record["status"] == "done"
     ]
     assert [record["selected_block_count"] for record in warmup_done_records[:3]] == [4, 2, 2]
     assert all(record["planner_mode"] == "uniform_exact_k" for record in warmup_done_records[:3])
@@ -868,14 +875,6 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
     assert all(set(str(record["timeline"])) <= {"█", "░"} for record in warmup_done_records[:3])
     assert all(record["resolved_blocks"] == record["selected_missing_blocks"] for record in warmup_done_records[:3])
 
-    for split in ("train", "validation", "test"):
-        metadata_records = [
-            load_v15_block_metadata(patched["source_root"], split, path.stem)
-            for path in resolve_v15_block_root(patched["source_root"], split).glob("*.crpack")
-        ]
-        assert metadata_records
-        assert all("shard_index" in record for record in metadata_records)
-
     assert len(warmup_done_records) == 3
     assert sum(patched["load_counts"].values()) == 8
 
@@ -883,169 +882,11 @@ def test_trainer_step_and_test_with_block_cache_warmup(monkeypatch, tmp_path: Pa
         trainer.step()
 
 
-def test_trainer_b2_cache_src_skips_local_warmup_and_records_config(
-    monkeypatch, tmp_path: Path
-) -> None:
-    import cr_train.trainer as trainer_mod
-
-    warmup_calls: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        trainer_mod,
-        "ensure_split_cache",
-        lambda **kwargs: warmup_calls.append(dict(kwargs)),
-    )
-    b2_resolve_calls: list[dict[str, object]] = []
-
-    def fake_resolve_prepared_split_state(**kwargs):
-        b2_resolve_calls.append(dict(kwargs))
-        return SimpleNamespace(split=kwargs["split"])
-
-    monkeypatch.setattr(
-        trainer_mod,
-        "resolve_prepared_split_state",
-        fake_resolve_prepared_split_state,
-    )
-    cache_dir = Path("cache")
-    output_dir = tmp_path / "run"
-    model = TinyModel()
-    trainer = Trainer(
-        model,
-        torch.optim.SGD(model.parameters(), lr=1e-3),
-        loss_fn,
-        output_dir=output_dir,
-        cache_dir=cache_dir,
-        cache_src="B2",
-        num_workers=0,
-    )
-
-    trainer._ensure_training_startup_caches()
-    trainer._write_config_once()
-    records = [
-        json.loads(line)
-        for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    config_record = next(record for record in records if record["kind"] == "config")
-
-    assert warmup_calls == []
-    assert [call["split"] for call in b2_resolve_calls] == ["train", "validation", "test"]
-    assert [call["cache_src"] for call in b2_resolve_calls] == ["B2", "B2", "B2"]
-    assert trainer.cache_root == Path("cache")
-    assert config_record["cache_src"] == "B2"
-    assert config_record["dataloader_workers"] == 0
-    assert config_record["b2_download_workers"] == 24
-
-    custom_output_dir = tmp_path / "custom-run"
-    custom_model = TinyModel()
-    custom_trainer = Trainer(
-        custom_model,
-        torch.optim.SGD(custom_model.parameters(), lr=1e-3),
-        loss_fn,
-        output_dir=custom_output_dir,
-        cache_dir=cache_dir,
-        cache_src="B2",
-        b2_download_workers=7,
-        num_workers=0,
-    )
-    custom_trainer._write_config_once()
-    custom_records = [
-        json.loads(line)
-        for line in (custom_output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    custom_config_record = next(record for record in custom_records if record["kind"] == "config")
-    assert custom_config_record["b2_download_workers"] == 7
-
-
-def test_trainer_prints_and_records_remote_retry_startup_events(monkeypatch, tmp_path: Path) -> None:
-    import cr_train.data.runtime as runtime_mod
-
-    output_dir = tmp_path / "run"
-    metrics_path = output_dir / "metrics.jsonl"
-    FakeTqdm.instances.clear()
-    FakeTqdm.writes.clear()
-    _patch_split_cache(
-        monkeypatch,
-        tmp_path,
-        {
-            "train": _make_block_splits(2),
-            "validation": _make_block_splits(1),
-            "test": _make_block_splits(1),
-        },
-    )
-    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
-    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
-    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
-
-    real_load_block_rows = runtime_mod.load_block_rows
-    emitted = False
-
-    def emit_retry_then_load(**kwargs):
-        nonlocal emitted
-        if not emitted:
-            startup_callback = kwargs.get("startup_callback")
-            assert startup_callback is not None
-            startup_callback(
-                {
-                    "stage": "remote retry",
-                    "status": "retry",
-                    "split": str(kwargs["split"]),
-                    "operation": "load block rows",
-                    "attempt": 1,
-                    "max_attempts": 10,
-                    "delay_sec": 2.0,
-                    "error_type": "ConnectionError",
-                    "error": "Server Disconnected",
-                    "cache_key": str(kwargs["block"]["cache_key"]),
-                    "recovery": "reset_hf_session",
-                }
-            )
-            emitted = True
-        return real_load_block_rows(**kwargs)
-
-    monkeypatch.setattr(runtime_mod, "load_block_rows", emit_retry_then_load)
-
-    model = TinyModel()
-    trainer = Trainer(
-        model,
-        torch.optim.AdamW(model.parameters(), lr=1e-3),
-        loss_fn,
-        metrics={"mae": mae_metric},
-        max_train_samples=BLOCK_SIZE,
-        max_val_samples=BLOCK_SIZE,
-        max_test_samples=BLOCK_SIZE,
-        epochs=1,
-        batch_size=8,
-        seed=7,
-        output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
-    )
-
-    trainer.step()
-
-    metrics_records = [
-        json.loads(line)
-        for line in metrics_path.read_text(encoding="utf-8").splitlines()
-    ]
-    retry_records = [
-        record
-        for record in metrics_records
-        if record.get("kind") == "startup" and record.get("stage") == "remote retry"
-    ]
-    plain_writes = [re.sub(r"\x1b\[[0-9;]*m", "", message) for message in FakeTqdm.writes]
-
-    assert emitted is True
-    assert len(retry_records) == 1
-    assert retry_records[0]["operation"] == "load block rows"
-    assert retry_records[0]["attempt"] == 1
-    assert retry_records[0]["recovery"] == "reset_hf_session"
-    assert any(message.startswith("retry train │ load block rows │ attempt 1/10") for message in plain_writes)
-    assert any("recovery=reset_hf_session" in message for message in plain_writes)
-
-
 def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(
     monkeypatch, tmp_path: Path
 ) -> None:
     output_dir = tmp_path / "run"
-    _patch_split_cache(
+    _patch_split_data(
         monkeypatch,
         tmp_path,
         {
@@ -1057,7 +898,6 @@ def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(
     FakeTqdm.instances.clear()
     FakeTqdm.writes.clear()
     monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
-    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
     model = TinyModel()
@@ -1074,7 +914,8 @@ def test_trainer_steps_scheduler_once_per_epoch_and_reports_learning_rate(
         epochs=2,
         batch_size=8,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     epoch_summary = trainer.step()
@@ -1120,7 +961,8 @@ def test_trainer_records_grad_clip_norm_in_config_and_banner(
         epochs=1,
         grad_clip_norm=0.75,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer.step()
@@ -1163,7 +1005,8 @@ def test_trainer_bf16_mixed_precision_autocasts_forward_and_records_config(
         loss_fn,
         mixed_precision="bf16",
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer._run_training_epoch(0)
@@ -1210,7 +1053,8 @@ def test_trainer_steps_scheduler_before_optimizer_step_once_per_update(
         scheduler_timing="before_optimizer_step",
         accum_steps=2,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     summary = trainer._run_training_epoch(0)
@@ -1253,7 +1097,8 @@ def test_trainer_steps_scheduler_after_optimizer_step_once_per_update(
         scheduler_timing="after_optimizer_step",
         accum_steps=2,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     summary = trainer._run_training_epoch(0)
@@ -1297,7 +1142,8 @@ def test_trainer_steps_after_optimizer_scheduler_for_final_partial_window(
         scheduler_timing="after_optimizer_step",
         accum_steps=2,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer._run_training_epoch(0)
@@ -1316,7 +1162,7 @@ def test_trainer_reports_first_effective_learning_rate_for_before_optimizer_sche
     FakeTqdm.writes.clear()
     monkeypatch.setattr(trainer_mod, "tqdm", FakeTqdm)
     monkeypatch.setattr(trainer_mod, "resolve_num_workers", lambda _value: 0)
-    monkeypatch.setattr(Trainer, "_ensure_training_startup_caches", lambda self: None)
+    monkeypatch.setattr(Trainer, "_ensure_training_startup_data", lambda self: None)
     monkeypatch.setattr(
         Trainer,
         "_run_evaluation",
@@ -1343,7 +1189,8 @@ def test_trainer_reports_first_effective_learning_rate_for_before_optimizer_sche
         accum_steps=2,
         epochs=1,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     result = trainer.step()
@@ -1386,7 +1233,8 @@ def test_trainer_accum_steps_count_optimizer_updates_not_micro_batches(
         loss_fn,
         accum_steps=2,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     summary = trainer._run_training_epoch(0)
@@ -1422,7 +1270,8 @@ def test_trainer_flushes_last_partial_accumulation_window(monkeypatch, tmp_path:
         loss_fn,
         accum_steps=2,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     summary = trainer._run_training_epoch(0)
@@ -1461,7 +1310,8 @@ def test_trainer_uses_actual_batch_stream_for_optimizer_steps(
         batch_size=2,
         accum_steps=1,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     summary = trainer._run_training_epoch(0)
@@ -1490,7 +1340,8 @@ def test_trainer_accumulated_updates_match_equivalent_larger_batches(
         loss_fn,
         accum_steps=1,
         output_dir=tmp_path / "baseline-run",
-        cache_dir=tmp_path / "baseline-cache",
+        dataset_dir=tmp_path / "baseline-cache",
+        streaming=False,
     )
     accumulated_trainer = Trainer(
         accumulated_model,
@@ -1498,7 +1349,8 @@ def test_trainer_accumulated_updates_match_equivalent_larger_batches(
         loss_fn,
         accum_steps=2,
         output_dir=tmp_path / "accum-run",
-        cache_dir=tmp_path / "accum-cache",
+        dataset_dir=tmp_path / "accum-cache",
+        streaming=False,
     )
 
     _patch_training_batches(
@@ -1549,7 +1401,8 @@ def test_trainer_scales_final_partial_accumulation_window_like_full_batch(
         loss_fn,
         accum_steps=1,
         output_dir=tmp_path / "baseline-run",
-        cache_dir=tmp_path / "baseline-cache",
+        dataset_dir=tmp_path / "baseline-cache",
+        streaming=False,
     )
     accumulated_trainer = Trainer(
         accumulated_model,
@@ -1557,7 +1410,8 @@ def test_trainer_scales_final_partial_accumulation_window_like_full_batch(
         loss_fn,
         accum_steps=4,
         output_dir=tmp_path / "accum-run",
-        cache_dir=tmp_path / "accum-cache",
+        dataset_dir=tmp_path / "accum-cache",
+        streaming=False,
     )
 
     _patch_training_batches(
@@ -1613,7 +1467,8 @@ def test_trainer_raises_on_non_finite_loss_before_optimizer_step(
         optimizer,
         nan_loss,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     with pytest.raises(FloatingPointError, match="non-finite training loss before backward") as exc_info:
@@ -1650,7 +1505,8 @@ def test_trainer_raises_on_non_finite_gradients_before_optimizer_step(
         optimizer,
         loss_fn,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     with pytest.raises(FloatingPointError, match="non-finite gradients before optimizer.step") as exc_info:
@@ -1704,7 +1560,8 @@ def test_trainer_clips_gradients_once_per_optimizer_update(
         accum_steps=2,
         grad_clip_norm=0.75,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     summary = trainer._run_training_epoch(0)
@@ -1735,7 +1592,8 @@ def test_trainer_runs_with_dsen2cr_nan_filled_sar_batch(
         optimizer,
         loss_fn,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     summary = trainer._run_training_epoch(0)
@@ -1770,7 +1628,8 @@ def test_trainer_uses_no_sync_on_non_update_micro_batches(monkeypatch, tmp_path:
         loss_fn,
         accum_steps=2,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
     trainer.model = TrackingDDP(trainer.model)
 
@@ -1815,7 +1674,8 @@ def test_trainer_steps_reduce_lr_on_plateau_with_default_val_loss_monitor(
         scheduler=scheduler,
         epochs=2,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     first_epoch = trainer.step()
@@ -1870,7 +1730,8 @@ def test_trainer_steps_reduce_lr_on_plateau_with_metric_monitor(
         scheduler_monitor="val.metrics.mae",
         epochs=2,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer.step()
@@ -1919,7 +1780,8 @@ def test_trainer_save_and_load_checkpoint_round_trip_with_reduce_lr_on_plateau(
         scheduler=scheduler,
         epochs=2,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer.step()
@@ -1944,7 +1806,7 @@ def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path
     output_dir = tmp_path / "run"
     FakeTqdm.instances.clear()
     FakeTqdm.writes.clear()
-    _patch_split_cache(
+    _patch_split_data(
         monkeypatch,
         tmp_path,
         {
@@ -1953,7 +1815,6 @@ def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path
             "test": _make_block_splits(4),
         },
     )
-    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
     monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
@@ -1973,7 +1834,8 @@ def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path
         batch_size=8,
         seed=11,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer.step()
@@ -2021,7 +1883,7 @@ def test_trainer_load_checkpoint_keeps_scheduler_state_when_legacy_checkpoint_ha
     monkeypatch, tmp_path: Path
 ) -> None:
     output_dir = tmp_path / "run"
-    _patch_split_cache(
+    _patch_split_data(
         monkeypatch,
         tmp_path,
         {
@@ -2031,7 +1893,6 @@ def test_trainer_load_checkpoint_keeps_scheduler_state_when_legacy_checkpoint_ha
         },
     )
     monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
-    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
     model = TinyModel()
@@ -2048,7 +1909,8 @@ def test_trainer_load_checkpoint_keeps_scheduler_state_when_legacy_checkpoint_ha
         epochs=1,
         batch_size=8,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer.step()
@@ -2073,7 +1935,7 @@ def test_trainer_load_checkpoint_keeps_scheduler_state_when_legacy_checkpoint_ha
 
 def test_trainer_save_and_load_weights_preserves_runtime_state(monkeypatch, tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
-    _patch_split_cache(
+    _patch_split_data(
         monkeypatch,
         tmp_path,
         {
@@ -2083,7 +1945,6 @@ def test_trainer_save_and_load_weights_preserves_runtime_state(monkeypatch, tmp_
         },
     )
     monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
-    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
     model = TinyModel()
@@ -2099,7 +1960,8 @@ def test_trainer_save_and_load_weights_preserves_runtime_state(monkeypatch, tmp_
         batch_size=8,
         seed=13,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer.step()
@@ -2133,7 +1995,7 @@ def test_trainer_load_weights_from_checkpoint_preserves_scheduler_and_runtime(
     monkeypatch, tmp_path: Path
 ) -> None:
     output_dir = tmp_path / "run"
-    _patch_split_cache(
+    _patch_split_data(
         monkeypatch,
         tmp_path,
         {
@@ -2143,7 +2005,6 @@ def test_trainer_load_weights_from_checkpoint_preserves_scheduler_and_runtime(
         },
     )
     monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
-    monkeypatch.setattr("cr_train.data.runtime.tqdm", FakeTqdm)
     monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
 
     model = TinyModel()
@@ -2160,7 +2021,8 @@ def test_trainer_load_weights_from_checkpoint_preserves_scheduler_and_runtime(
         epochs=1,
         batch_size=8,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer.step()
@@ -2203,7 +2065,8 @@ def test_trainer_predict_preserves_training_mode(monkeypatch, tmp_path: Path) ->
         torch.optim.AdamW(model.parameters(), lr=1e-3),
         loss_fn,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
     trainer.model.train(True)
 
@@ -2237,7 +2100,8 @@ def test_trainer_predict_uses_unwrapped_model_in_distributed_mode(monkeypatch, t
         torch.optim.AdamW(model.parameters(), lr=1e-3),
         loss_fn,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
     trainer.model.train(True)
 
@@ -2264,7 +2128,8 @@ def test_trainer_get_state_reports_runtime_values(monkeypatch, tmp_path: Path) -
         loss_fn,
         epochs=3,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
     trainer.current_epoch = 2
     trainer.global_step = 17
@@ -2484,7 +2349,8 @@ def test_trainer_defers_output_dir_creation_until_first_write(monkeypatch, tmp_p
         torch.optim.AdamW(model.parameters(), lr=1e-3),
         loss_fn,
         output_dir=output_dir,
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     assert not output_dir.exists()
@@ -2503,7 +2369,8 @@ def test_trainer_wraps_model_for_distributed_without_device_bootstrap_bug(monkey
         torch.optim.AdamW(model.parameters(), lr=1e-3),
         loss_fn,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     assert isinstance(trainer.model, FakeDDP)
@@ -2531,7 +2398,8 @@ def test_trainer_rejects_cuda_model_on_wrong_local_rank(monkeypatch, tmp_path: P
             torch.optim.AdamW(model.parameters(), lr=1e-3),
             loss_fn,
             output_dir=tmp_path / "run",
-            cache_dir=tmp_path / "cache",
+            dataset_dir=tmp_path / "cache",
+        streaming=False,
         )
 
 
@@ -2548,7 +2416,8 @@ def test_trainer_checkpoint_apis_use_unwrapped_model_state_in_distributed_mode(m
         torch.optim.AdamW(model.parameters(), lr=1e-3),
         loss_fn,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
     trainer.current_epoch = 3
     trainer.global_step = 21
@@ -2571,7 +2440,8 @@ def test_trainer_checkpoint_apis_use_unwrapped_model_state_in_distributed_mode(m
         torch.optim.AdamW(restored_model.parameters(), lr=1e-3),
         loss_fn,
         output_dir=tmp_path / "restore-run",
-        cache_dir=tmp_path / "cache-restore",
+        dataset_dir=tmp_path / "cache-restore",
+        streaming=False,
     )
     load_summary = restored_trainer.load_checkpoint(checkpoint_path)
 
@@ -2596,7 +2466,8 @@ def test_trainer_resolves_spawn_context_on_cuda_workers(monkeypatch, tmp_path: P
         torch.optim.AdamW(model.parameters(), lr=1e-3),
         loss_fn,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
         num_workers=2,
     )
 
@@ -2619,7 +2490,8 @@ def test_trainer_respects_explicit_multiprocessing_context(monkeypatch, tmp_path
         torch.optim.AdamW(model.parameters(), lr=1e-3),
         loss_fn,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
         num_workers=2,
         multiprocessing_context="forkserver",
     )
@@ -2634,7 +2506,8 @@ def test_trainer_disables_multiprocessing_context_when_workers_are_disabled(tmp_
         torch.optim.AdamW(model.parameters(), lr=1e-3),
         loss_fn,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
         num_workers=0,
         multiprocessing_context="spawn",
     )
@@ -2649,7 +2522,7 @@ def test_trainer_reuses_prepared_split_state_across_epochs(monkeypatch, tmp_path
 
     FakeTqdm.instances.clear()
     FakeTqdm.writes.clear()
-    _patch_split_cache(
+    _patch_split_data(
         monkeypatch,
         tmp_path,
         {
@@ -2683,7 +2556,8 @@ def test_trainer_reuses_prepared_split_state_across_epochs(monkeypatch, tmp_path
         batch_size=8,
         seed=7,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
     )
 
     trainer.step()
@@ -2726,7 +2600,8 @@ def test_trainer_passes_spatial_transform_options_only_to_train_loader(monkeypat
         loss_fn,
         batch_size=4,
         output_dir=tmp_path / "run",
-        cache_dir=tmp_path / "cache",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
         train_crop_size=128,
         train_random_flip=True,
         train_random_rot90=True,

@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import zstandard as zstd
 
-from .constants import CACHE_BLOCK_SIZE, CACHE_LAYOUT_VERSION
+from .constants import CRPACK_BLOCK_SIZE, CRPACK_LAYOUT_VERSION
 from .store import (
     MappedBlockPayload,
     SaveBlockResult,
@@ -127,8 +127,8 @@ def pack_v15_block(
     target: np.ndarray,
 ) -> bytes:
     row_count = int(payload_metadata["row_count"])
-    if row_count <= 0 or row_count > CACHE_BLOCK_SIZE:
-        raise ValueError(f"row_count must be between 1 and {CACHE_BLOCK_SIZE}, got {row_count}")
+    if row_count <= 0 or row_count > CRPACK_BLOCK_SIZE:
+        raise ValueError(f"row_count must be between 1 and {CRPACK_BLOCK_SIZE}, got {row_count}")
 
     payload_parts: list[bytes] = []
     arrays: dict[str, dict[str, Any]] = {}
@@ -147,10 +147,10 @@ def pack_v15_block(
 
     compressed = zstd.ZstdCompressor(level=CRPACK_LEVEL).compress(b"".join(payload_parts))
     header = {
-        "version": CACHE_LAYOUT_VERSION,
+        "version": CRPACK_LAYOUT_VERSION,
         "codec": CRPACK_CODEC,
         "level": CRPACK_LEVEL,
-        "cache_block_size": CACHE_BLOCK_SIZE,
+        "cache_block_size": CRPACK_BLOCK_SIZE,
         "row_count": row_count,
         "raw_bytes": raw_bytes,
         "compressed_bytes": len(compressed),
@@ -190,7 +190,7 @@ def read_v15_header_from_file(path: Path) -> dict[str, Any]:
 
 def unpack_v15_block_bytes(blob: bytes) -> tuple[MappedBlockPayload, dict[str, Any]]:
     header, payload_offset = _read_header_from_bytes(blob)
-    if int(header.get("version", 0)) != CACHE_LAYOUT_VERSION:
+    if int(header.get("version", 0)) != CRPACK_LAYOUT_VERSION:
         raise ValueError(f"unsupported crpack version: {header.get('version')!r}")
     if header.get("codec") != CRPACK_CODEC:
         raise ValueError(f"unsupported crpack codec: {header.get('codec')!r}")

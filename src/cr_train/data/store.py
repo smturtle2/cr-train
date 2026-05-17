@@ -15,15 +15,6 @@ from .constants import BLOCK_SIZE, LOCK_POLL_INTERVAL_SECONDS, LOCK_TIMEOUT_SECO
 
 
 @dataclass(frozen=True, slots=True)
-class BlockCachePaths:
-    store_root: Path
-    block_root: Path
-    metadata_root: Path
-    lock_root: Path
-    completed_root: Path
-
-
-@dataclass(frozen=True, slots=True)
 class SaveBlockResult:
     payload_bytes: int
     metadata_bytes: int
@@ -68,44 +59,6 @@ class MappedBlockPayload(Sequence[dict[str, Any]]):
             yield self[index]
 
 
-_PAYLOAD_METADATA_FILENAME = "payload.json"
-_SAR_PAYLOAD_FILENAME = "sar.npy"
-_CLOUDY_PAYLOAD_FILENAME = "cloudy.npy"
-_TARGET_PAYLOAD_FILENAME = "target.npy"
-_BLOCK_PAYLOAD_FILENAMES = (
-    _PAYLOAD_METADATA_FILENAME,
-    _SAR_PAYLOAD_FILENAME,
-    _CLOUDY_PAYLOAD_FILENAME,
-    _TARGET_PAYLOAD_FILENAME,
-)
-_COMPLETED_MARKER_SUFFIX = ".ok"
-
-
-def resolve_cache_root(cache_dir: str | os.PathLike[str] | None) -> Path:
-    """Resolve the cache root directory. Defaults to ``~/.cache/cr-train``."""
-    return Path(cache_dir) if cache_dir is not None else (Path.home() / ".cache" / "cr-train")
-
-
-def resolve_block_cache_paths(source_root: Path, split: str) -> BlockCachePaths:
-    store_root = source_root / "block_store" / split
-    store_root.mkdir(parents=True, exist_ok=True)
-    block_root = store_root / "blocks"
-    block_root.mkdir(parents=True, exist_ok=True)
-    metadata_root = store_root / "metadata"
-    metadata_root.mkdir(parents=True, exist_ok=True)
-    lock_root = store_root / "locks"
-    lock_root.mkdir(parents=True, exist_ok=True)
-    completed_root = store_root / "completed"
-    completed_root.mkdir(parents=True, exist_ok=True)
-    return BlockCachePaths(
-        store_root=store_root,
-        block_root=block_root,
-        metadata_root=metadata_root,
-        lock_root=lock_root,
-        completed_root=completed_root,
-    )
-
-
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -144,6 +97,7 @@ def _is_stale_lock(lock_path: Path) -> bool:
 
 @contextmanager
 def file_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     started_at = time.monotonic()
     while True:
         try:
@@ -159,7 +113,7 @@ def file_lock(lock_path: Path):
                     pass
                 continue
             if time.monotonic() - started_at > LOCK_TIMEOUT_SECONDS:
-                raise TimeoutError(f"timed out waiting for cache lock: {lock_path}")
+                raise TimeoutError(f"timed out waiting for data lock: {lock_path}")
             time.sleep(LOCK_POLL_INTERVAL_SECONDS)
 
     try:
@@ -171,241 +125,79 @@ def file_lock(lock_path: Path):
             pass
 
 
-def block_data_path(paths: BlockCachePaths, cache_key: str) -> Path:
-    return paths.block_root / cache_key
-
-
-def block_metadata_path(paths: BlockCachePaths, cache_key: str) -> Path:
-    return paths.metadata_root / f"{cache_key}.json"
-
-
-def block_lock_path(paths: BlockCachePaths, cache_key: str) -> Path:
-    return paths.lock_root / f"{cache_key}.lock"
-
-
-def _completed_marker_name(cache_key: str, row_count: int) -> str:
-    return f"{cache_key}.{int(row_count)}{_COMPLETED_MARKER_SUFFIX}"
-
-
-def _parse_completed_marker_name(name: str) -> tuple[str, int] | None:
-    if not name.endswith(_COMPLETED_MARKER_SUFFIX):
-        return None
-    stem = name[: -len(_COMPLETED_MARKER_SUFFIX)]
-    parts = stem.rsplit(".", 1)
-    if len(parts) != 2:
-        return None
-    cache_key, row_count_str = parts
-    if not cache_key or not row_count_str.isdigit():
-        return None
-    row_count = int(row_count_str)
-    if row_count <= 0 or row_count > BLOCK_SIZE:
-        return None
-    return cache_key, row_count
-
-
-def parse_completed_marker_name(name: str) -> tuple[str, int] | None:
-    return _parse_completed_marker_name(name)
-
-
-def _completed_marker_paths(paths: BlockCachePaths, cache_key: str) -> list[Path]:
-    return sorted(
-        path
-        for path in paths.completed_root.glob(f"{cache_key}.*{_COMPLETED_MARKER_SUFFIX}")
-        if path.is_file()
-    )
-
-
-def find_completed_block_row_count(paths: BlockCachePaths, cache_key: str) -> int | None:
-    row_count: int | None = None
-    for path in _completed_marker_paths(paths, cache_key):
-        parsed = _parse_completed_marker_name(path.name)
-        if parsed is None:
-            continue
-        row_count = parsed[1]
-    return row_count
-
-
-def load_completed_block_index(paths: BlockCachePaths) -> dict[str, int]:
-    completed: dict[str, int] = {}
-    for path in sorted(paths.completed_root.glob(f"*{_COMPLETED_MARKER_SUFFIX}")):
-        if not path.is_file():
-            continue
-        parsed = _parse_completed_marker_name(path.name)
-        if parsed is None:
-            continue
-        cache_key, row_count = parsed
-        completed[cache_key] = row_count
-    return completed
-
-
-def write_completed_block_marker(paths: BlockCachePaths, cache_key: str, *, row_count: int) -> Path:
-    if row_count <= 0 or row_count > BLOCK_SIZE:
-        raise ValueError(f"row_count must be between 1 and {BLOCK_SIZE}, got {row_count}")
-
-    marker_path = paths.completed_root / _completed_marker_name(cache_key, row_count)
-    tmp_path = marker_path.with_suffix(marker_path.suffix + ".tmp")
-    tmp_path.write_text("", encoding="utf-8")
-    tmp_path.replace(marker_path)
-
-    for stale_path in _completed_marker_paths(paths, cache_key):
-        if stale_path != marker_path:
-            stale_path.unlink(missing_ok=True)
-    return marker_path
-
-
-def _tmp_path(path: Path) -> Path:
-    return path.with_suffix(path.suffix + ".tmp")
-
-
-def _payload_metadata_path(payload_path: Path) -> Path:
-    return payload_path / _PAYLOAD_METADATA_FILENAME
-
-
-def _payload_file_path(payload_path: Path, filename: str) -> Path:
-    return payload_path / filename
-
-
-def _payload_files_exist(payload_path: Path) -> bool:
-    return payload_path.is_dir() and all(_payload_file_path(payload_path, filename).is_file() for filename in _BLOCK_PAYLOAD_FILENAMES)
-
-
-def _path_size(path: Path) -> int:
-    if not path.exists():
-        return 0
-    if path.is_file():
-        return int(path.stat().st_size)
-    return sum(_path_size(child) for child in path.iterdir())
-
-
-def _as_shape(value: Any, *, field: str) -> tuple[int, int, int]:
-    del field
+def _shape_tuple(value: Any) -> tuple[int, int, int]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"shape must be a list or tuple, got {type(value)!r}")
     shape = tuple(int(dim) for dim in value)
+    if len(shape) != 3:
+        raise ValueError(f"expected a 3D tensor shape, got {shape!r}")
     return shape  # type: ignore[return-value]
 
 
-def _decode_image_array(buffer: Any, *, shape: tuple[int, int, int], dtype: np.dtype[Any], field: str) -> np.ndarray:
-    del field
+def as_bytes(value: Any) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, np.ndarray):
+        return np.ascontiguousarray(value).tobytes()
+    raise TypeError(f"expected bytes-like value, got {type(value)!r}")
+
+
+def _decode_array(buffer: Any, shape_value: Any, *, dtype: np.dtype[Any]) -> np.ndarray:
+    shape = _shape_tuple(shape_value)
+    if isinstance(buffer, np.ndarray):
+        array = np.asarray(buffer, dtype=dtype)
+        if array.shape != shape:
+            array = array.reshape(shape)
+        return np.ascontiguousarray(array)
     return np.frombuffer(as_bytes(buffer), dtype=dtype).reshape(shape)
 
 
-def _build_block_payload(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    row_count = len(rows)
-    sar_shape = _as_shape(rows[0]["sar_shape"], field="sar_shape")
-    opt_shape = _as_shape(rows[0]["opt_shape"], field="opt_shape")
-    sar = np.empty((row_count, *sar_shape), dtype=np.float32)
-    cloudy = np.empty((row_count, *opt_shape), dtype=np.int16)
-    target = np.empty((row_count, *opt_shape), dtype=np.int16)
-    season: list[str] = []
-    scene: list[str] = []
-    patch: list[str] = []
+def _build_block_payload(
+    rows: list[dict[str, Any]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    if not rows:
+        raise ValueError("cannot build an empty block")
+    if len(rows) > BLOCK_SIZE:
+        raise ValueError(f"block row count exceeds BLOCK_SIZE={BLOCK_SIZE}: {len(rows)}")
+
+    sar_arrays: list[np.ndarray] = []
+    cloudy_arrays: list[np.ndarray] = []
+    target_arrays: list[np.ndarray] = []
     sar_shapes: list[list[int]] = []
     opt_shapes: list[list[int]] = []
-
-    for index, row in enumerate(rows):
-        row_sar_shape = _as_shape(row["sar_shape"], field="sar_shape")
-        row_opt_shape = _as_shape(row["opt_shape"], field="opt_shape")
-        sar[index] = _decode_image_array(row["sar"], shape=row_sar_shape, dtype=np.dtype(np.float32), field="sar")
-        cloudy[index] = _decode_image_array(
-            row["cloudy"],
-            shape=row_opt_shape,
-            dtype=np.dtype(np.int16),
-            field="cloudy",
-        )
-        target[index] = _decode_image_array(
-            row["target"],
-            shape=row_opt_shape,
-            dtype=np.dtype(np.int16),
-            field="target",
-        )
-        season.append(str(row.get("season", "")))
-        scene.append(str(row.get("scene", "")))
-        patch.append(str(row.get("patch", "")))
-        sar_shapes.append(list(row_sar_shape))
-        opt_shapes.append(list(row_opt_shape))
+    seasons: list[str] = []
+    scenes: list[str] = []
+    patches: list[str] = []
+    for row in rows:
+        sar_shape = list(_shape_tuple(row["sar_shape"]))
+        opt_shape = list(_shape_tuple(row["opt_shape"]))
+        sar_arrays.append(_decode_array(row["sar"], sar_shape, dtype=np.dtype("float32")))
+        cloudy_arrays.append(_decode_array(row["cloudy"], opt_shape, dtype=np.dtype("int16")))
+        target_arrays.append(_decode_array(row["target"], opt_shape, dtype=np.dtype("int16")))
+        sar_shapes.append(sar_shape)
+        opt_shapes.append(opt_shape)
+        seasons.append(str(row.get("season", "")))
+        scenes.append(str(row.get("scene", "")))
+        patches.append(str(row.get("patch", "")))
 
     payload_metadata = {
-        "row_count": row_count,
-        "season": season,
-        "scene": scene,
-        "patch": patch,
+        "row_count": len(rows),
+        "season": seasons,
+        "scene": scenes,
+        "patch": patches,
         "sar_shape": sar_shapes,
         "opt_shape": opt_shapes,
     }
-    return sar, cloudy, target, payload_metadata
-
-
-def clear_block_cache_entry(paths: BlockCachePaths, cache_key: str, *, keep_lock: bool = False) -> None:
-    payload_path = block_data_path(paths, cache_key)
-    metadata_path = block_metadata_path(paths, cache_key)
-    lock_path = block_lock_path(paths, cache_key)
-
-    remove_tree(payload_path)
-    remove_tree(_tmp_path(payload_path))
-    remove_tree(metadata_path)
-    remove_tree(_tmp_path(metadata_path))
-    for marker_path in _completed_marker_paths(paths, cache_key):
-        remove_tree(marker_path)
-        remove_tree(_tmp_path(marker_path))
-    if not keep_lock:
-        remove_tree(lock_path)
-        remove_tree(_tmp_path(lock_path))
-
-
-def block_is_cached(paths: BlockCachePaths, cache_key: str) -> bool:
-    return _payload_files_exist(block_data_path(paths, cache_key)) and block_metadata_path(paths, cache_key).is_file()
-
-
-def load_block_metadata(paths: BlockCachePaths, cache_key: str) -> dict[str, Any] | None:
-    path = block_metadata_path(paths, cache_key)
-    if not path.exists():
-        return None
-    return read_json(path)
-
-
-def save_block(
-    paths: BlockCachePaths,
-    *,
-    cache_key: str,
-    rows: list[dict[str, Any]],
-    metadata: dict[str, Any],
-) -> SaveBlockResult:
-    payload_path = block_data_path(paths, cache_key)
-    metadata_path = block_metadata_path(paths, cache_key)
-    payload_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-
-    payload_tmp = _tmp_path(payload_path)
-    metadata_tmp = _tmp_path(metadata_path)
-    remove_tree(payload_tmp)
-    remove_tree(metadata_tmp)
-    remove_tree(payload_path)
-
-    sar, cloudy, target, payload_metadata = _build_block_payload(rows)
-    payload_tmp.mkdir(parents=True, exist_ok=True)
-    np.save(_payload_file_path(payload_tmp, _SAR_PAYLOAD_FILENAME), sar, allow_pickle=False)
-    np.save(_payload_file_path(payload_tmp, _CLOUDY_PAYLOAD_FILENAME), cloudy, allow_pickle=False)
-    np.save(_payload_file_path(payload_tmp, _TARGET_PAYLOAD_FILENAME), target, allow_pickle=False)
-    _payload_metadata_path(payload_tmp).write_text(
-        json.dumps(payload_metadata, sort_keys=True, indent=2),
-        encoding="utf-8",
+    return (
+        np.stack(sar_arrays),
+        np.stack(cloudy_arrays),
+        np.stack(target_arrays),
+        payload_metadata,
     )
-    metadata_tmp.write_text(json.dumps(metadata, sort_keys=True, indent=2), encoding="utf-8")
-
-    payload_tmp.replace(payload_path)
-    metadata_tmp.replace(metadata_path)
-    write_completed_block_marker(paths, cache_key, row_count=len(rows))
-    return SaveBlockResult(
-        payload_bytes=_path_size(payload_path),
-        metadata_bytes=metadata_path.stat().st_size,
-    )
-
-
-def _load_payload_shapes(payload_metadata: dict[str, Any], *, field: str) -> tuple[tuple[int, int, int], ...]:
-    return tuple(_as_shape(shape, field=field) for shape in payload_metadata[field])
-
-
-def _load_payload_strings(payload_metadata: dict[str, Any], *, field: str) -> tuple[str, ...]:
-    return tuple(str(item) for item in payload_metadata[field])
 
 
 def build_mapped_block_payload(
@@ -419,86 +211,21 @@ def build_mapped_block_payload(
         sar=sar,
         cloudy=cloudy,
         target=target,
-        season=_load_payload_strings(payload_metadata, field="season"),
-        scene=_load_payload_strings(payload_metadata, field="scene"),
-        patch=_load_payload_strings(payload_metadata, field="patch"),
-        sar_shape=_load_payload_shapes(payload_metadata, field="sar_shape"),
-        opt_shape=_load_payload_shapes(payload_metadata, field="opt_shape"),
+        season=tuple(str(value) for value in payload_metadata["season"]),
+        scene=tuple(str(value) for value in payload_metadata["scene"]),
+        patch=tuple(str(value) for value in payload_metadata["patch"]),
+        sar_shape=tuple(tuple(int(dim) for dim in shape) for shape in payload_metadata["sar_shape"]),
+        opt_shape=tuple(tuple(int(dim) for dim in shape) for shape in payload_metadata["opt_shape"]),
     )
-
-
-def load_block(paths: BlockCachePaths, cache_key: str) -> MappedBlockPayload:
-    path = block_data_path(paths, cache_key)
-    try:
-        payload_metadata = read_json(_payload_metadata_path(path))
-        sar = np.load(_payload_file_path(path, _SAR_PAYLOAD_FILENAME), mmap_mode="r")
-        cloudy = np.load(_payload_file_path(path, _CLOUDY_PAYLOAD_FILENAME), mmap_mode="r")
-        target = np.load(_payload_file_path(path, _TARGET_PAYLOAD_FILENAME), mmap_mode="r")
-    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
-        clear_block_cache_entry(paths, cache_key)
-        raise RuntimeError(
-            f"cached block payload is unreadable for {cache_key}; cache entry was cleared"
-        ) from exc
-
-    return build_mapped_block_payload(
-        payload_metadata=payload_metadata,
-        sar=sar,
-        cloudy=cloudy,
-        target=target,
-    )
-
-
-def as_bytes(value: Any) -> bytes:
-    if isinstance(value, bytes):
-        return value
-    if isinstance(value, bytearray):
-        return bytes(value)
-    if isinstance(value, memoryview):
-        return value.tobytes()
-    raise TypeError(f"unsupported binary payload type: {type(value)!r}")
-
-
-def freeze_value(value: Any) -> Any:
-    if isinstance(value, memoryview):
-        return value.tobytes()
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value)
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, list):
-        return [freeze_value(item) for item in value]
-    return value
-
-
-def freeze_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {key: freeze_value(value) for key, value in row.items()}
 
 
 __all__ = [
-    "BlockCachePaths",
     "MappedBlockPayload",
     "SaveBlockResult",
     "as_bytes",
-    "block_data_path",
-    "block_is_cached",
-    "block_lock_path",
-    "block_metadata_path",
     "build_mapped_block_payload",
-    "clear_block_cache_entry",
-    "find_completed_block_row_count",
     "file_lock",
-    "freeze_row",
-    "load_completed_block_index",
-    "load_block",
-    "load_block_metadata",
-    "parse_completed_marker_name",
     "read_json",
     "remove_tree",
-    "resolve_block_cache_paths",
-    "resolve_cache_root",
-    "save_block",
-    "write_completed_block_marker",
     "write_json_atomic",
 ]

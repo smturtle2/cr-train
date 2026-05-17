@@ -13,24 +13,31 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset as TorchIterableDataset, get_worker_info
 
-from .cache_backend import (
+from .hf_v2 import (
     BlockReader,
-    CacheSource,
-    resolve_b2_cache_repository,
+    HFV2LocalBlockReader,
+    HFV2StagedBlockReader,
+    ensure_hf_v2_local_blocks,
+    load_hf_v2_manifest,
+    load_hf_v2_split_catalog,
 )
 from .constants import OPTICAL_CHANNELS, SAR_CHANNELS
 from .planning import plan_sample
-from .runtime import _render_warmup_timeline, get_rank, get_world_size
-from .source import emit_startup_event, ensure_source_root, ensure_split_catalog, run_startup_stage
-from .store import BlockCachePaths, as_bytes
-from .v15 import V15LocalBlockReader
+from .runtime import (
+    _render_warmup_timeline,
+    emit_startup_event,
+    get_rank,
+    get_world_size,
+    run_startup_stage,
+)
+from .store import as_bytes
 
 _TRAIN_ACTIVE_BLOCK_COUNT = 8
 
 
 @dataclass(slots=True)
 class PreparedSplit:
-    """DataLoader-ready split backed by the block cache."""
+    """DataLoader-ready split backed by HF v2 blocks."""
 
     dataset: TorchIterableDataset[dict[str, Any]]
     num_examples: int
@@ -38,13 +45,12 @@ class PreparedSplit:
 
 @dataclass(slots=True)
 class PreparedSplitState:
-    """Static split selection resolved against a block cache source."""
+    """Static split selection resolved against HF v2 blocks."""
 
     split: str
-    cache_paths: BlockCachePaths | None
     block_reader: BlockReader
-    cache_src: CacheSource
-    cache_stage: str
+    streaming: bool
+    source_stage: str
     seed: int
     requested_rows: int
     effective_rows: int
@@ -296,7 +302,7 @@ def _count_rows_from_state(state: PreparedSplitState, blocks: list[dict[str, Any
     return total
 
 
-class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
+class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
     def __init__(
         self,
         *,
@@ -355,6 +361,11 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
         if block_is_ready is None:
             return True
         return bool(block_is_ready(cache_key))
+
+    def _close_reader(self) -> None:
+        close = getattr(self.block_reader, "close", None)
+        if close is not None:
+            close()
 
     def _iter_training_rows(self, *, blocks: list[dict[str, Any]], worker_id: int):
         if not blocks:
@@ -458,17 +469,21 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                 prefetch_pool.shutdown(wait=False, cancel_futures=True)
             for cursor in active_blocks:
                 self._release_block(cursor.cache_key)
+            self._close_reader()
 
     def _iter_evaluation_rows(self, *, blocks: list[dict[str, Any]]):
         if not self._prefetch_blocks() or len(blocks) <= 1:
-            for block in blocks:
-                cache_key = str(block["cache_key"])
-                rows = self._load_block_rows(block=block)
-                try:
-                    yield from rows
-                finally:
-                    del rows
-                    self._release_block(cache_key)
+            try:
+                for block in blocks:
+                    cache_key = str(block["cache_key"])
+                    rows = self._load_block_rows(block=block)
+                    try:
+                        yield from rows
+                    finally:
+                        del rows
+                        self._release_block(cache_key)
+            finally:
+                self._close_reader()
             return
 
         prefetch_pool = ThreadPoolExecutor(max_workers=1)
@@ -506,6 +521,7 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
             if prefetch_future is not None:
                 prefetch_future.cancel()
             prefetch_pool.shutdown(wait=False, cancel_futures=True)
+            self._close_reader()
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -518,9 +534,6 @@ class CachedBlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
             return
 
         yield from self._iter_evaluation_rows(blocks=blocks)
-
-
-CachedRowDataset = CachedBlockIterableDataset
 
 
 def _resolve_selected_blocks(
@@ -563,7 +576,7 @@ def _resolve_reader_selected_block_row_counts(
             continue
         row_counts_by_key[cache_key] = row_count
     if missing_cache_keys:
-        raise FileNotFoundError(f"{source_name} split cache is missing requested blocks: {', '.join(missing_cache_keys)}")
+        raise FileNotFoundError(f"{source_name} split is missing requested blocks: {', '.join(missing_cache_keys)}")
     return row_counts_by_key
 
 
@@ -577,7 +590,7 @@ def _resolve_catalog_selected_block_row_counts(
     return row_counts_by_key
 
 
-def _emit_catalog_cache_hit(
+def _emit_streaming_selection_ready(
     startup_callback,
     *,
     split: str,
@@ -585,16 +598,15 @@ def _emit_catalog_cache_hit(
     selected_blocks: list[dict[str, Any]],
 ) -> None:
     event = {
-        "stage": "warm split cache",
+        "stage": "warm streaming data",
         "split": split,
         "requested_rows": sample_plan.requested_rows,
         "effective_rows": sum(int(block["row_count"]) for block in selected_blocks),
         "required_blocks": sample_plan.required_blocks,
         "planner_mode": sample_plan.planner_mode,
         "selected_block_count": sample_plan.required_blocks,
-        "cached_selected_blocks": sample_plan.required_blocks,
+        "ready_selected_blocks": sample_plan.required_blocks,
         "selected_missing_blocks": 0,
-        "cache_only": True,
         "execution_block_count": int(sample_plan.execution_block_count),
         "resolved_blocks": 0,
     }
@@ -618,49 +630,18 @@ def resolve_prepared_split_state(
     revision: str | None,
     max_samples: int | None,
     seed: int,
-    cache_root: Path,
-    cache_src: CacheSource = "local",
-    b2_staging_dir: Path | None = None,
-    b2_staging_max_blocks: int = 80,
-    b2_download_workers: int | None = None,
+    dataset_root: Path | None = None,
+    streaming: bool = True,
     startup_callback=None,
 ) -> PreparedSplitState:
-    """Resolve the static block selection for a split from the configured cache."""
-    cache_paths: BlockCachePaths | None = None
-    if cache_src == "local":
-        source_root, descriptor = ensure_source_root(
-            dataset_name=dataset_name,
-            revision=revision,
-            cache_root=cache_root,
-            startup_callback=startup_callback,
-        )
-        catalog = ensure_split_catalog(
-            source_root=source_root,
-            descriptor=descriptor,
-            split=split,
-            startup_callback=startup_callback,
-        )
-        block_reader: BlockReader = V15LocalBlockReader(source_root=source_root, split=split)
-        cache_stage = "load local cache"
-    else:
-        b2_repository = resolve_b2_cache_repository(
-            prefix=os.fspath(cache_root),
-            download_workers=b2_download_workers,
-        )
-        b2_source = b2_repository.find_source(dataset_name=dataset_name, revision=revision)
-        catalog = b2_repository.load_split_catalog(source=b2_source, split=split)
-        staging_root = (
-            Path.home() / ".cache" / "cr-train" / "b2-staging"
-            if b2_staging_dir is None
-            else b2_staging_dir
-        )
-        block_reader = b2_repository.staged_block_reader(
-            source=b2_source,
-            split=split,
-            staging_root=staging_root,
-            max_staged_blocks=b2_staging_max_blocks,
-        )
-        cache_stage = "load B2 cache"
+    """Resolve the static block selection for a split from the HF v2 block layout."""
+    del dataset_name, revision
+    load_hf_v2_manifest(dataset_root=dataset_root, streaming=streaming)
+    catalog = load_hf_v2_split_catalog(
+        split=split,
+        dataset_root=dataset_root,
+        streaming=streaming,
+    )
 
     sample_plan = plan_sample(
         catalog,
@@ -673,19 +654,46 @@ def resolve_prepared_split_state(
         selected_indices=[int(index) for index in sample_plan.selected_blocks.tolist()],
     )
     row_counts_by_key = _resolve_catalog_selected_block_row_counts(selected_blocks)
-    if cache_src == "B2":
-        _emit_catalog_cache_hit(
+    if streaming:
+        block_reader: BlockReader = HFV2StagedBlockReader(split=split)
+        source_stage = "load streaming data"
+        _emit_streaming_selection_ready(
             startup_callback,
             split=split,
             sample_plan=sample_plan,
             selected_blocks=selected_blocks,
         )
+    else:
+        if dataset_root is None:
+            raise ValueError("dataset_root must be provided when streaming=False")
+        ensure_hf_v2_local_blocks(
+            dataset_root=dataset_root,
+            split=split,
+            catalog=catalog,
+            selected_blocks=tuple(selected_blocks),
+            requested_rows=sample_plan.requested_rows,
+            effective_rows=int(sum(row_counts_by_key[str(block["cache_key"])] for block in selected_blocks)),
+            required_blocks=sample_plan.required_blocks,
+            planner_mode=sample_plan.planner_mode,
+            execution_block_count=sample_plan.execution_block_count,
+            full_split=sample_plan.planner_mode == "full_split",
+            timeline=_render_warmup_timeline(
+                sample_plan.selected_bitmap,
+                stop_block=sample_plan.execution_block_count,
+            ),
+            startup_callback=startup_callback,
+        )
+        block_reader = HFV2LocalBlockReader(
+            dataset_root=dataset_root,
+            block_path_by_key={str(block["cache_key"]): str(block["path"]) for block in selected_blocks},
+            row_count_by_key=row_counts_by_key,
+        )
+        source_stage = "load local data"
     return PreparedSplitState(
         split=split,
-        cache_paths=cache_paths,
         block_reader=block_reader,
-        cache_src=cache_src,
-        cache_stage=cache_stage,
+        streaming=streaming,
+        source_stage=source_stage,
         seed=seed,
         requested_rows=sample_plan.requested_rows,
         effective_rows=int(sum(row_counts_by_key[str(block["cache_key"])] for block in selected_blocks)),
@@ -713,9 +721,9 @@ def prepare_split_from_state(
     num_examples = _count_rows_from_state(state, rank_blocks)
     dataset = run_startup_stage(
         startup_callback,
-        stage=state.cache_stage,
+        stage=state.source_stage,
         split=state.split,
-        operation=lambda: CachedBlockIterableDataset(
+        operation=lambda: BlockIterableDataset(
             block_reader=state.block_reader,
             blocks=tuple(rank_blocks),
             seed=state.seed,
@@ -740,25 +748,19 @@ def prepare_split(
     seed: int,
     epoch: int,
     training: bool,
-    cache_root: Path,
-    cache_src: CacheSource = "local",
-    b2_staging_dir: Path | None = None,
-    b2_staging_max_blocks: int = 80,
-    b2_download_workers: int | None = None,
+    dataset_root: Path | None = None,
+    streaming: bool = True,
     startup_callback=None,
 ) -> PreparedSplit:
-    """Build a PreparedSplit from the configured block cache. Missing blocks are fatal."""
+    """Build a PreparedSplit from the HF v2 block dataset."""
     state = resolve_prepared_split_state(
         split=split,
         dataset_name=dataset_name,
         revision=revision,
         max_samples=max_samples,
         seed=seed,
-        cache_root=cache_root,
-        cache_src=cache_src,
-        b2_staging_dir=b2_staging_dir,
-        b2_staging_max_blocks=b2_staging_max_blocks,
-        b2_download_workers=b2_download_workers,
+        dataset_root=dataset_root,
+        streaming=streaming,
         startup_callback=startup_callback,
     )
     return prepare_split_from_state(
@@ -979,7 +981,7 @@ def _apply_spatial_transform(image: torch.Tensor, params: _SpatialTransformParam
 
 
 def decode_row(row: dict[str, Any], *, include_metadata: bool = True) -> dict[str, Any]:
-    """Decode one cached row into CHW float32 arrays."""
+    """Decode one block row into CHW float32 arrays."""
     sar = _decode_image(row["sar"], row["sar_shape"], dtype=np.float32, expected_channels=SAR_CHANNELS)
     _fill_nan_numpy(sar)
     _normalize_sar_numpy(sar)
@@ -1102,7 +1104,7 @@ def build_dataloader(
     random_flip: bool = False,
     random_rot90: bool = False,
 ) -> DataLoader:
-    """Create the split DataLoader for the cached iterable dataset."""
+    """Create the split DataLoader for the block iterable dataset."""
     del seed, epoch
     dataloader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
@@ -1135,7 +1137,7 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
 
 
 __all__ = [
-    "CachedRowDataset",
+    "BlockIterableDataset",
     "PreparedSplit",
     "PreparedSplitState",
     "build_collate_fn",
