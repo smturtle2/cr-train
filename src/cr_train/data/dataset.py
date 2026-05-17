@@ -234,7 +234,7 @@ def resolve_num_workers(num_workers: int | str) -> int:
     if num_workers != "auto":
         raise ValueError("num_workers must be an integer or 'auto'")
     cpu_count = os.cpu_count() or 1
-    return min(4, max(1, cpu_count // 4))
+    return min(16, max(1, cpu_count // 3))
 
 
 def seed_everything(seed: int) -> None:
@@ -556,7 +556,8 @@ def resolve_prepared_split_state(
     cache_root: Path,
     cache_src: CacheSource = "local",
     b2_staging_dir: Path | None = None,
-    b2_staging_max_blocks: int = 20,
+    b2_staging_max_blocks: int = 80,
+    b2_download_workers: int | None = None,
     startup_callback=None,
 ) -> PreparedSplitState:
     """Resolve the static block selection for a split from the configured cache."""
@@ -577,7 +578,10 @@ def resolve_prepared_split_state(
         block_reader: BlockReader = V15LocalBlockReader(source_root=source_root, split=split)
         cache_stage = "load local cache"
     else:
-        b2_repository = resolve_b2_cache_repository(prefix=os.fspath(cache_root))
+        b2_repository = resolve_b2_cache_repository(
+            prefix=os.fspath(cache_root),
+            download_workers=b2_download_workers,
+        )
         b2_source = b2_repository.find_source(dataset_name=dataset_name, revision=revision)
         catalog = b2_repository.load_split_catalog(source=b2_source, split=split)
         staging_root = (
@@ -671,7 +675,8 @@ def prepare_split(
     cache_root: Path,
     cache_src: CacheSource = "local",
     b2_staging_dir: Path | None = None,
-    b2_staging_max_blocks: int = 20,
+    b2_staging_max_blocks: int = 80,
+    b2_download_workers: int | None = None,
     startup_callback=None,
 ) -> PreparedSplit:
     """Build a PreparedSplit from the configured block cache. Missing blocks are fatal."""
@@ -685,6 +690,7 @@ def prepare_split(
         cache_src=cache_src,
         b2_staging_dir=b2_staging_dir,
         b2_staging_max_blocks=b2_staging_max_blocks,
+        b2_download_workers=b2_download_workers,
         startup_callback=startup_callback,
     )
     return prepare_split_from_state(

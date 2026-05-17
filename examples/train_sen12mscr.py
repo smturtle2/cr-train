@@ -35,6 +35,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from cr_train import Trainer, cleanup_distributed, setup_distributed_from_env
+from cr_train.data.cache_backend import b2_download_worker_count
 
 
 # --- Model ---
@@ -221,8 +222,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--b2-staging-max-blocks",
         type=parse_positive_int,
-        default=20,
+        default=80,
         help="Maximum number of B2 blocks staged locally ahead of consumption. This is not a worker count.",
+    )
+    parser.add_argument(
+        "--b2-download-workers",
+        type=parse_positive_int,
+        default=b2_download_worker_count(),
+        help="Number of internal B2 object download workers. This is separate from DataLoader workers.",
     )
     parser.add_argument("--device", default=None)
     parser.add_argument("--hidden-channels", type=int, default=64)
@@ -345,6 +352,7 @@ def main() -> None:
             cache_src=args.cache_src,
             b2_staging_dir=args.b2_staging_dir,
             b2_staging_max_blocks=args.b2_staging_max_blocks,
+            b2_download_workers=args.b2_download_workers,
             train_crop_size=args.train_crop_size,
             train_random_flip=args.train_random_flip,
             train_random_rot90=args.train_random_rot90,

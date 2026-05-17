@@ -2090,7 +2090,7 @@ def test_prepare_split_reads_b2_cache_without_local_cache(monkeypatch, tmp_path:
     fake_client = _FakeB2Client(objects)
     resolved_prefixes: list[str] = []
 
-    def fake_resolve_b2_cache_repository(*, prefix=None):
+    def fake_resolve_b2_cache_repository(*, prefix=None, download_workers=None):
         resolved_prefixes.append(str(prefix))
         return B2CacheRepository(
             bucket="unit-bucket",
@@ -2098,6 +2098,7 @@ def test_prepare_split_reads_b2_cache_without_local_cache(monkeypatch, tmp_path:
             key_id="key-id",
             app_key="app-key",
             prefix=prefix,
+            download_workers=download_workers,
             client=fake_client,
         )
 
@@ -2150,13 +2151,14 @@ def test_b2_cache_missing_payload_fails_without_local_fallback(monkeypatch, tmp_
     missing_key = next(key for key in objects if key.endswith(".crpack"))
     del objects[missing_key]
 
-    def fake_resolve_b2_cache_repository(*, prefix=None):
+    def fake_resolve_b2_cache_repository(*, prefix=None, download_workers=None):
         return B2CacheRepository(
             bucket="unit-bucket",
             endpoint_url="https://example.invalid",
             key_id="key-id",
             app_key="app-key",
             prefix=prefix,
+            download_workers=download_workers,
             client=_FakeB2Client(objects),
         )
 
@@ -2194,13 +2196,14 @@ def test_b2_cache_reads_large_payloads_with_range_requests(
     )
     monkeypatch.setattr(cache_backend, "_B2_DOWNLOAD_WORKERS", 16)
     fake_client = _FakeB2Client(objects)
-    def fake_resolve_b2_cache_repository(*, prefix=None):
+    def fake_resolve_b2_cache_repository(*, prefix=None, download_workers=None):
         return B2CacheRepository(
             bucket="unit-bucket",
             endpoint_url="https://example.invalid",
             key_id="key-id",
             app_key="app-key",
             prefix=prefix,
+            download_workers=download_workers,
             client=fake_client,
         )
 
@@ -2276,6 +2279,7 @@ def test_b2_staging_downloader_stages_crpack_objects(
         staging_source_root=str(staging_root),
         cache_keys=cache_keys,
         max_staged_blocks=2,
+        download_workers=2,
     )
 
     full_payload_requests = [
@@ -2301,13 +2305,14 @@ def test_b2_cache_missing_configured_cache_prefix_fails(monkeypatch) -> None:
         cache_prefix="cache",
     )
 
-    def fake_resolve_b2_cache_repository(*, prefix=None):
+    def fake_resolve_b2_cache_repository(*, prefix=None, download_workers=None):
         return B2CacheRepository(
             bucket="unit-bucket",
             endpoint_url="https://example.invalid",
             key_id="key-id",
             app_key="app-key",
             prefix=prefix,
+            download_workers=download_workers,
             client=_FakeB2Client(objects),
         )
 

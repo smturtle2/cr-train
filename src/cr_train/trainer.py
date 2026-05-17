@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 
-from .data.cache_backend import CacheSource, b2_download_worker_count, normalize_cache_src
+from .data.cache_backend import CacheSource, normalize_cache_src, resolve_b2_download_workers
 from .data.constants import DATASET_ID
 from .data.dataset import (
     PreparedSplitState,
@@ -114,7 +114,8 @@ class Trainer:
         cache_dir: str | Path | None = None,
         cache_src: CacheSource = "local",
         b2_staging_dir: str | Path | None = None,
-        b2_staging_max_blocks: int = 20,
+        b2_staging_max_blocks: int = 80,
+        b2_download_workers: int | None = None,
         num_workers: int | str = "auto",
         multiprocessing_context: str | None = None,
         train_crop_size: int | None = 128,
@@ -184,6 +185,7 @@ class Trainer:
         self.cache_src = normalize_cache_src(cache_src)
 
         self.num_workers = resolve_num_workers(num_workers)
+        self.b2_download_workers = resolve_b2_download_workers(b2_download_workers)
         self.output_dir = Path(output_dir)
         self.metrics_path = self.output_dir / "metrics.jsonl"
         if self.cache_src == "B2":
@@ -686,7 +688,7 @@ class Trainer:
                 "grad_clip_norm": self.grad_clip_norm,
                 "mixed_precision": self.mixed_precision,
                 "cache_src": self.cache_src,
-                "b2_download_workers": b2_download_worker_count() if self.cache_src == "B2" else None,
+                "b2_download_workers": self.b2_download_workers if self.cache_src == "B2" else None,
                 "b2_staging_dir": str(self.b2_staging_dir) if self.cache_src == "B2" else None,
                 "b2_staging_max_blocks": self.b2_staging_max_blocks if self.cache_src == "B2" else None,
             }
@@ -781,6 +783,7 @@ class Trainer:
             cache_src=self.cache_src,
             b2_staging_dir=self.b2_staging_dir if self.cache_src == "B2" else None,
             b2_staging_max_blocks=self.b2_staging_max_blocks,
+            b2_download_workers=self.b2_download_workers if self.cache_src == "B2" else None,
         )
         self._prepared_split_states[key] = _PreparedSplitCacheEntry(
             split=split,

@@ -919,7 +919,27 @@ def test_trainer_b2_cache_src_skips_local_warmup_and_records_config(
     assert trainer.cache_root == Path("cache")
     assert config_record["cache_src"] == "B2"
     assert config_record["dataloader_workers"] == 0
-    assert config_record["b2_download_workers"] == 16
+    assert config_record["b2_download_workers"] == 24
+
+    custom_output_dir = tmp_path / "custom-run"
+    custom_model = TinyModel()
+    custom_trainer = Trainer(
+        custom_model,
+        torch.optim.SGD(custom_model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=custom_output_dir,
+        cache_dir=cache_dir,
+        cache_src="B2",
+        b2_download_workers=7,
+        num_workers=0,
+    )
+    custom_trainer._write_config_once()
+    custom_records = [
+        json.loads(line)
+        for line in (custom_output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    custom_config_record = next(record for record in custom_records if record["kind"] == "config")
+    assert custom_config_record["b2_download_workers"] == 7
 
 
 def test_trainer_prints_and_records_remote_retry_startup_events(monkeypatch, tmp_path: Path) -> None:

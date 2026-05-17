@@ -34,11 +34,11 @@ CacheSource = Literal["local", "B2"]
 
 _B2_ENV_VARS = ("B2_BUCKET", "B2_ENDPOINT", "B2_KEY_ID", "B2_APP_KEY")
 _B2_CACHE_PREFIX = "cache"
-_B2_DOWNLOAD_WORKERS = 16
+_B2_DOWNLOAD_WORKERS = 24
 _B2_READ_ATTEMPTS = 4
 _B2_RETRY_BASE_DELAY_SECONDS = 0.25
 _B2_STAGING_POLL_SECONDS = 0.05
-_B2_STAGING_DEFAULT_MAX_BLOCKS = 20
+_B2_STAGING_DEFAULT_MAX_BLOCKS = 80
 
 
 class BlockReader(Protocol):
@@ -67,6 +67,15 @@ def normalize_cache_src(value: str) -> CacheSource:
 
 def b2_download_worker_count() -> int:
     return _B2_DOWNLOAD_WORKERS
+
+
+def resolve_b2_download_workers(download_workers: int | None = None) -> int:
+    if download_workers is None:
+        return _B2_DOWNLOAD_WORKERS
+    resolved = int(download_workers)
+    if resolved <= 0:
+        raise ValueError("b2_download_workers must be greater than zero")
+    return resolved
 
 
 def _join_key(*parts: str) -> str:
@@ -153,7 +162,7 @@ def _write_staged_crpack(
     )
 
 
-def _new_s3_client(*, endpoint_url: str, key_id: str, app_key: str):
+def _new_s3_client(*, endpoint_url: str, key_id: str, app_key: str, download_workers: int):
     import boto3
     from botocore.config import Config
 
@@ -163,7 +172,7 @@ def _new_s3_client(*, endpoint_url: str, key_id: str, app_key: str):
         aws_access_key_id=key_id,
         aws_secret_access_key=app_key,
         config=Config(
-            max_pool_connections=_B2_DOWNLOAD_WORKERS,
+            max_pool_connections=download_workers,
             retries={"max_attempts": _B2_READ_ATTEMPTS, "mode": "standard"},
         ),
     )
@@ -178,6 +187,7 @@ class B2CacheRepository:
         key_id: str,
         app_key: str,
         prefix: str | os.PathLike[str] = _B2_CACHE_PREFIX,
+        download_workers: int | None = None,
         client: Any | None = None,
     ) -> None:
         self.bucket = bucket
@@ -185,11 +195,17 @@ class B2CacheRepository:
         self.key_id = key_id
         self.app_key = app_key
         self.prefix = os.fspath(prefix).strip("/")
+        self.download_workers = resolve_b2_download_workers(download_workers)
         self._client = client
         self._client_provided = client is not None
 
     @classmethod
-    def from_env(cls, *, prefix: str | os.PathLike[str] | None = None) -> B2CacheRepository:
+    def from_env(
+        cls,
+        *,
+        prefix: str | os.PathLike[str] | None = None,
+        download_workers: int | None = None,
+    ) -> B2CacheRepository:
         missing = [name for name in _B2_ENV_VARS if not os.environ.get(name)]
         if missing:
             raise RuntimeError(f"B2 cache requires environment variables: {', '.join(missing)}")
@@ -199,6 +215,7 @@ class B2CacheRepository:
             key_id=os.environ["B2_KEY_ID"],
             app_key=os.environ["B2_APP_KEY"],
             prefix=_B2_CACHE_PREFIX if prefix is None else prefix,
+            download_workers=download_workers,
         )
 
     def _client_for_request(self):
@@ -207,6 +224,7 @@ class B2CacheRepository:
                 endpoint_url=self.endpoint_url,
                 key_id=self.key_id,
                 app_key=self.app_key,
+                download_workers=self.download_workers,
             )
         return self._client
 
@@ -285,6 +303,7 @@ class B2CacheRepository:
             app_key=self.app_key,
             source_prefix=source.source_prefix,
             split=split,
+            download_workers=self.download_workers,
             client=self._client,
         )
 
@@ -305,6 +324,7 @@ class B2CacheRepository:
             split=split,
             staging_root=staging_root,
             max_staged_blocks=max_staged_blocks,
+            download_workers=self.download_workers,
             client=self._client if self._client_provided else None,
         )
 
@@ -319,6 +339,7 @@ class B2BlockReader:
         app_key: str,
         source_prefix: str,
         split: str,
+        download_workers: int | None = None,
         client: Any | None = None,
     ) -> None:
         self.bucket = bucket
@@ -327,6 +348,7 @@ class B2BlockReader:
         self.app_key = app_key
         self.source_prefix = source_prefix.rstrip("/")
         self.split = split
+        self.download_workers = resolve_b2_download_workers(download_workers)
         self._client = client
 
     def __getstate__(self) -> dict[str, Any]:
@@ -343,6 +365,7 @@ class B2BlockReader:
                 endpoint_url=self.endpoint_url,
                 key_id=self.key_id,
                 app_key=self.app_key,
+                download_workers=self.download_workers,
             )
         return self._client
 
@@ -442,7 +465,7 @@ class B2BlockReader:
     def load_block_metadata_many(self, cache_keys: tuple[str, ...]) -> dict[str, dict[str, Any] | None]:
         if not cache_keys:
             return {}
-        with ThreadPoolExecutor(max_workers=min(_B2_DOWNLOAD_WORKERS, len(cache_keys))) as pool:
+        with ThreadPoolExecutor(max_workers=min(self.download_workers, len(cache_keys))) as pool:
             futures = {
                 pool.submit(self.load_block_metadata, cache_key): cache_key
                 for cache_key in cache_keys
@@ -517,6 +540,7 @@ def _run_b2_staging_downloader(
     staging_source_root: str,
     cache_keys: tuple[str, ...],
     max_staged_blocks: int,
+    download_workers: int,
 ) -> None:
     staging_root_path = Path(staging_source_root)
     reader = B2BlockReader(
@@ -526,6 +550,7 @@ def _run_b2_staging_downloader(
         app_key=app_key,
         source_prefix=source_prefix,
         split=split,
+        download_workers=download_workers,
     )
     try:
         pending_cache_keys: deque[str] = deque(cache_keys)
@@ -538,12 +563,12 @@ def _run_b2_staging_downloader(
                 cache_key=first_cache_key,
             )
 
-        with ThreadPoolExecutor(max_workers=_B2_DOWNLOAD_WORKERS) as pool:
+        with ThreadPoolExecutor(max_workers=download_workers) as pool:
             futures: dict[Future[str], str] = {}
             while pending_cache_keys or futures:
                 while (
                     pending_cache_keys
-                    and len(futures) < _B2_DOWNLOAD_WORKERS
+                    and len(futures) < download_workers
                     and _count_staged_blocks(staging_root_path, split, cache_keys) + len(futures)
                     < max_staged_blocks
                 ):
@@ -589,6 +614,7 @@ class B2StagedBlockReader:
         split: str,
         staging_root: Path,
         max_staged_blocks: int = _B2_STAGING_DEFAULT_MAX_BLOCKS,
+        download_workers: int | None = None,
         client: Any | None = None,
     ) -> None:
         self.bucket = bucket
@@ -599,6 +625,7 @@ class B2StagedBlockReader:
         self.split = split
         self.staging_root = Path(staging_root)
         self.max_staged_blocks = max(1, int(max_staged_blocks))
+        self.download_workers = resolve_b2_download_workers(download_workers)
         source_key = str(abs(hash((self.source_prefix, os.getpid(), id(self)))))
         self.staging_source_root = self.staging_root / source_key
         self._client = client
@@ -609,6 +636,7 @@ class B2StagedBlockReader:
             app_key=app_key,
             source_prefix=source_prefix,
             split=split,
+            download_workers=self.download_workers,
             client=client,
         )
         self._process: mp.Process | None = None
@@ -634,6 +662,7 @@ class B2StagedBlockReader:
                 app_key=self.app_key,
                 source_prefix=self.source_prefix,
                 split=self.split,
+                download_workers=self.download_workers,
                 client=self._client,
             )
         return self._remote_reader.load_completed_block_index()
@@ -647,6 +676,7 @@ class B2StagedBlockReader:
                 app_key=self.app_key,
                 source_prefix=self.source_prefix,
                 split=self.split,
+                download_workers=self.download_workers,
                 client=self._client,
             )
         return self._remote_reader.load_block_metadata(cache_key)
@@ -660,6 +690,7 @@ class B2StagedBlockReader:
                 app_key=self.app_key,
                 source_prefix=self.source_prefix,
                 split=self.split,
+                download_workers=self.download_workers,
                 client=self._client,
             )
         return self._remote_reader.load_block_metadata_many(cache_keys)
@@ -676,6 +707,7 @@ class B2StagedBlockReader:
                     app_key=self.app_key,
                     source_prefix=self.source_prefix,
                     split=self.split,
+                    download_workers=self.download_workers,
                     client=self._client,
                 )
             for cache_key in cache_keys:
@@ -700,6 +732,7 @@ class B2StagedBlockReader:
                 "staging_source_root": os.fspath(self.staging_source_root),
                 "cache_keys": cache_keys,
                 "max_staged_blocks": self.max_staged_blocks,
+                "download_workers": self.download_workers,
             },
             daemon=True,
         )
@@ -720,9 +753,9 @@ class B2StagedBlockReader:
 
 
 def resolve_b2_cache_repository(
-    *, prefix: str | os.PathLike[str] | None = None
+    *, prefix: str | os.PathLike[str] | None = None, download_workers: int | None = None
 ) -> B2CacheRepository:
-    return B2CacheRepository.from_env(prefix=prefix)
+    return B2CacheRepository.from_env(prefix=prefix, download_workers=download_workers)
 
 
 __all__ = [
@@ -735,5 +768,6 @@ __all__ = [
     "LocalBlockReader",
     "b2_download_worker_count",
     "normalize_cache_src",
+    "resolve_b2_download_workers",
     "resolve_b2_cache_repository",
 ]

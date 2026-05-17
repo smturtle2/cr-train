@@ -77,8 +77,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--b2-staging-max-blocks",
         type=parse_positive_int,
-        default=20,
+        default=80,
         help="Maximum number of B2 blocks staged locally ahead of consumption.",
+    )
+    parser.add_argument(
+        "--b2-download-workers",
+        type=parse_positive_int,
+        default=b2_download_worker_count(),
+        help="Number of internal B2 object download workers. This is separate from DataLoader workers.",
     )
     parser.add_argument(
         "--split",
@@ -147,6 +153,7 @@ def main() -> None:
         cache_src=cache_src,
         b2_staging_dir=b2_staging_dir if cache_src == "B2" else None,
         b2_staging_max_blocks=b2_staging_max_blocks,
+        b2_download_workers=args.b2_download_workers if cache_src == "B2" else None,
     )
     prepare_split_sec = time.perf_counter() - prepare_started_at
 
@@ -199,7 +206,7 @@ def main() -> None:
         "prepared_rows": prepared.num_examples,
         "batch_size": args.batch_size,
         "dataloader_workers": dataloader_workers,
-        "b2_download_workers": b2_download_worker_count() if cache_src == "B2" else None,
+        "b2_download_workers": args.b2_download_workers if cache_src == "B2" else None,
         "b2_staging_dir": str(b2_staging_dir) if cache_src == "B2" else None,
         "b2_staging_max_blocks": b2_staging_max_blocks if cache_src == "B2" else None,
         "warmup_excluded": True,
@@ -225,7 +232,7 @@ def main() -> None:
         f"{samples_per_sec:.2f} samples/sec after first batch "
         f"({num_samples} measured samples, {num_batches} batches, {elapsed_sec:.2f}s; "
         f"DataLoader workers {dataloader_workers}; "
-        f"B2 download workers {b2_download_worker_count() if cache_src == 'B2' else 'n/a'}; "
+        f"B2 download workers {args.b2_download_workers if cache_src == 'B2' else 'n/a'}; "
         f"B2 staging buffer {b2_staging_max_blocks if cache_src == 'B2' else 'n/a'} blocks; "
         f"first batch wait {first_batch_wait_sec:.2f}s)"
     )
