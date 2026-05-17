@@ -894,6 +894,17 @@ def test_trainer_b2_cache_src_skips_local_warmup_and_records_config(
         "ensure_split_cache",
         lambda **kwargs: warmup_calls.append(dict(kwargs)),
     )
+    b2_resolve_calls: list[dict[str, object]] = []
+
+    def fake_resolve_prepared_split_state(**kwargs):
+        b2_resolve_calls.append(dict(kwargs))
+        return SimpleNamespace(split=kwargs["split"])
+
+    monkeypatch.setattr(
+        trainer_mod,
+        "resolve_prepared_split_state",
+        fake_resolve_prepared_split_state,
+    )
     cache_dir = Path("cache")
     output_dir = tmp_path / "run"
     model = TinyModel()
@@ -916,6 +927,8 @@ def test_trainer_b2_cache_src_skips_local_warmup_and_records_config(
     config_record = next(record for record in records if record["kind"] == "config")
 
     assert warmup_calls == []
+    assert [call["split"] for call in b2_resolve_calls] == ["train", "validation", "test"]
+    assert [call["cache_src"] for call in b2_resolve_calls] == ["B2", "B2", "B2"]
     assert trainer.cache_root == Path("cache")
     assert config_record["cache_src"] == "B2"
     assert config_record["dataloader_workers"] == 0

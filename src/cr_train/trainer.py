@@ -739,6 +739,7 @@ class Trainer:
         if split in self._cache_ready:
             return
         if self.cache_src == "B2":
+            self._cache_prepared_split_state(split=split, max_samples=max_samples)
             self._cache_ready.add(split)
             return
 
@@ -761,7 +762,7 @@ class Trainer:
         ):
             self._ensure_split_cache(split=split, max_samples=max_samples)
 
-    def _resolve_prepared_split_state(
+    def _cache_prepared_split_state(
         self,
         *,
         split: str,
@@ -772,7 +773,6 @@ class Trainer:
         if cached is not None:
             return cached.state
 
-        self._ensure_split_cache(split=split, max_samples=max_samples)
         state = resolve_prepared_split_state(
             split=split,
             dataset_name=DATASET_ID,
@@ -792,6 +792,24 @@ class Trainer:
             state=state,
         )
         return state
+
+    def _resolve_prepared_split_state(
+        self,
+        *,
+        split: str,
+        max_samples: int | None,
+    ) -> PreparedSplitState:
+        key = (split, max_samples)
+        cached = self._prepared_split_states.get(key)
+        if cached is not None:
+            return cached.state
+
+        self._ensure_split_cache(split=split, max_samples=max_samples)
+        cached = self._prepared_split_states.get(key)
+        if cached is not None:
+            return cached.state
+
+        return self._cache_prepared_split_state(split=split, max_samples=max_samples)
 
     def _build_loader(
         self,
