@@ -546,6 +546,16 @@ def _resolve_reader_selected_block_row_counts(
     return row_counts_by_key
 
 
+def _resolve_catalog_selected_block_row_counts(
+    selected_blocks: list[dict[str, Any]],
+) -> dict[str, int]:
+    row_counts_by_key: dict[str, int] = {}
+    for block in selected_blocks:
+        cache_key = str(block["cache_key"])
+        row_counts_by_key[cache_key] = int(block["row_count"])
+    return row_counts_by_key
+
+
 def resolve_prepared_split_state(
     *,
     split: str,
@@ -607,11 +617,14 @@ def resolve_prepared_split_state(
         catalog,
         selected_indices=[int(index) for index in sample_plan.selected_blocks.tolist()],
     )
-    row_counts_by_key = _resolve_reader_selected_block_row_counts(
-        block_reader,
-        selected_blocks,
-        source_name="local" if cache_src == "local" else "B2",
-    )
+    if cache_src == "B2":
+        row_counts_by_key = _resolve_catalog_selected_block_row_counts(selected_blocks)
+    else:
+        row_counts_by_key = _resolve_reader_selected_block_row_counts(
+            block_reader,
+            selected_blocks,
+            source_name="local",
+        )
     return PreparedSplitState(
         split=split,
         cache_paths=cache_paths,

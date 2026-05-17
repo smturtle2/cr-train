@@ -2167,7 +2167,7 @@ def test_b2_cache_missing_payload_fails_without_local_fallback(monkeypatch, tmp_
         fake_resolve_b2_cache_repository,
     )
     local_cache = tmp_path / "local-cache-must-not-exist"
-    with pytest.raises(FileNotFoundError, match="B2 split cache is missing requested blocks"):
+    with pytest.raises(FileNotFoundError, match="B2 cache object is missing"):
         prepare_split(
             split="validation",
             dataset_name="unit/test",
@@ -2183,7 +2183,7 @@ def test_b2_cache_missing_payload_fails_without_local_fallback(monkeypatch, tmp_
     assert not local_cache.exists()
 
 
-def test_b2_cache_reads_large_payloads_with_range_requests(
+def test_b2_cache_trusts_catalog_metadata_before_loading_payloads(
     monkeypatch, tmp_path: Path
 ) -> None:
     import cr_train.data.cache_backend as cache_backend
@@ -2247,9 +2247,8 @@ def test_b2_cache_reads_large_payloads_with_range_requests(
         and str(request["key"]).endswith(".crpack")
     ]
     assert tuple(batch["sar"].shape) == (2, 2, 4, 4)
-    assert range_requests
+    assert range_requests == []
     assert full_payload_requests
-    assert all("bytes=" in str(request["range"]) for request in range_requests)
 
 
 def test_b2_staging_downloader_stages_crpack_objects(
