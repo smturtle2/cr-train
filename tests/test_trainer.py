@@ -517,6 +517,60 @@ def test_top_level_package_exports_trainer_as_primary_entry_point() -> None:
     assert callable(namespace["setup_distributed_from_env"])
 
 
+def test_trainer_close_closes_cached_split_readers_once(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.trainer as trainer_mod
+
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+    close_calls: list[str] = []
+
+    class Reader:
+        def close(self) -> None:
+            close_calls.append("close")
+
+    reader = Reader()
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=tmp_path / "run",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
+    )
+    trainer._prepared_split_states[("train", None)] = trainer_mod._PreparedSplitCacheEntry(
+        split="train",
+        max_samples=None,
+        state=SimpleNamespace(block_reader=reader),
+    )
+    trainer._prepared_split_states[("validation", None)] = trainer_mod._PreparedSplitCacheEntry(
+        split="validation",
+        max_samples=None,
+        state=SimpleNamespace(block_reader=reader),
+    )
+
+    trainer.close()
+    trainer.close()
+
+    assert close_calls == ["close"]
+    assert trainer._prepared_split_states == {}
+
+
+def test_trainer_does_not_run_non_ddp_distributed_collectives() -> None:
+    trainer_source = (Path(__file__).resolve().parents[1] / "src" / "cr_train" / "trainer.py").read_text(
+        encoding="utf-8"
+    )
+
+    forbidden = (
+        "torch.distributed",
+        "dist.",
+        "all_reduce",
+        "all_gather",
+        "barrier(",
+        "new_group",
+    )
+    assert not any(token in trainer_source for token in forbidden)
+
+
 def test_format_data_summary_compacts_square_timeline_on_one_line() -> None:
     summary = format_data_summary(
         {

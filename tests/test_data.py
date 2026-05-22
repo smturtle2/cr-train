@@ -956,6 +956,60 @@ def test_prepare_split_distributed_training_balances_worker_batches(monkeypatch)
     assert rank_batch_counts == [20, 20]
 
 
+def test_prepare_split_distributed_keeps_exact_smoke_batch_counts_with_many_workers(
+    monkeypatch,
+) -> None:
+    if "fork" not in mp.get_all_start_methods():
+        pytest.skip("requires fork multiprocessing context")
+
+    import cr_train.data.dataset as dataset_mod
+
+    class RowReader:
+        def __init__(self, row_count: int) -> None:
+            self.row_count = row_count
+
+        def load_block(self, cache_key: str):
+            assert cache_key == "b0"
+            return [{"id": row_index} for row_index in range(self.row_count)]
+
+    monkeypatch.setattr(dataset_mod, "get_world_size", lambda: 2)
+
+    for total_rows in (1017, 1024, 503):
+        state = dataset_mod.PreparedSplitState(
+            split="train",
+            block_reader=RowReader(total_rows),
+            streaming=False,
+            source_stage="load local data",
+            seed=13,
+            requested_rows=total_rows,
+            effective_rows=total_rows,
+            required_blocks=1,
+            planner_mode="full_split",
+            selected_blocks=({"cache_key": "b0", "row_count": total_rows},),
+            row_counts_by_key={"b0": total_rows},
+        )
+
+        rank_row_counts: list[int] = []
+        rank_batch_counts: list[int] = []
+        for rank in (0, 1):
+            monkeypatch.setattr(dataset_mod, "get_rank", lambda rank=rank: rank)
+            prepared = prepare_split_from_state(state, epoch=0, training=True)
+            prepared.dataset.prepare_for_dataloader(num_workers=16)
+            loader = torch.utils.data.DataLoader(
+                prepared.dataset,
+                batch_size=8,
+                num_workers=16,
+                multiprocessing_context="fork",
+            )
+            batches = list(loader)
+            rank_row_counts.append(sum(len(batch["id"]) for batch in batches))
+            rank_batch_counts.append(len(batches))
+
+        expected_rank_rows = (total_rows // 2)
+        assert rank_row_counts == [expected_rank_rows, expected_rank_rows]
+        assert rank_batch_counts[0] == rank_batch_counts[1]
+
+
 def test_training_iterator_does_not_block_to_fill_active_pool() -> None:
     class ReadinessBlockReader:
         def __init__(self) -> None:

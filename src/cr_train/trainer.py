@@ -13,7 +13,6 @@ from typing import Any, Literal, cast
 import torch
 from torch import nn
 from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 
@@ -202,7 +201,6 @@ class Trainer:
         self.device = self._infer_module_device(self.model)
         self._wrap_model_for_ddp_if_needed()
         self.device = self._infer_module_device(self._model_state_owner())
-        self._metrics_process_group = self._create_metrics_process_group()
         self._validate_mixed_precision_for_device()
         self._grad_scaler = torch.amp.GradScaler(
             "cuda",
@@ -321,14 +319,7 @@ class Trainer:
         return result
 
     def close(self) -> None:
-        group = getattr(self, "_metrics_process_group", None)
-        self._metrics_process_group = None
-        if group is None or dist is None or not dist.is_available() or not dist.is_initialized():
-            return
-        try:
-            dist.destroy_process_group(group)
-        except RuntimeError:
-            pass
+        self._close_prepared_split_states()
 
     def __del__(self) -> None:
         try:
@@ -738,16 +729,6 @@ class Trainer:
             return
         self.model = DDP(self.model)
 
-    def _create_metrics_process_group(self):
-        if (
-            not is_distributed()
-            or dist is None
-            or not dist.is_available()
-            or not dist.is_initialized()
-        ):
-            return None
-        return dist.new_group(backend="gloo")
-
     def _model_state_owner(self) -> nn.Module:
         if isinstance(self.model, DDP):
             return self.model.module
@@ -813,6 +794,23 @@ class Trainer:
 
         return self._prepare_split_state(split=split, max_samples=max_samples)
 
+    def _close_prepared_split_states(self) -> None:
+        entries = tuple(self._prepared_split_states.values())
+        self._prepared_split_states.clear()
+        closed_reader_ids: set[int] = set()
+        for entry in entries:
+            reader = entry.state.block_reader
+            reader_id = id(reader)
+            if reader_id in closed_reader_ids:
+                continue
+            closed_reader_ids.add(reader_id)
+            close = getattr(reader, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
     def _build_loader(
         self,
         *,
@@ -856,12 +854,6 @@ class Trainer:
             num_examples=prepared.num_examples,
             batch_size=self.batch_size,
             training=training,
-        )
-        self._verify_distributed_loader_parity(
-            split=split,
-            epoch_index=epoch_index,
-            num_examples=prepared.num_examples,
-            total_batches=total_batches,
         )
         return loader, total_batches
 
@@ -928,41 +920,6 @@ class Trainer:
         if isinstance(self.model, DDP) and hasattr(self.model, "join"):
             return self.model.join(throw_on_early_termination=True)
         return nullcontext()
-
-    def _verify_distributed_loader_parity(
-        self,
-        *,
-        split: str,
-        epoch_index: int,
-        num_examples: int,
-        total_batches: int,
-    ) -> None:
-        if (
-            not is_distributed()
-            or dist is None
-            or not dist.is_available()
-            or not dist.is_initialized()
-        ):
-            return
-
-        assert dist is not None
-        local = torch.tensor([num_examples, total_batches], dtype=torch.int64)
-        group = self._metrics_process_group
-        gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
-        dist.all_gather(gathered, local, group=group)
-        values = [(int(item[0].item()), int(item[1].item())) for item in gathered]
-        row_counts = {row_count for row_count, _batches in values}
-        batch_counts = {batch_count for _rows, batch_count in values}
-        if len(row_counts) == 1 and len(batch_counts) == 1:
-            return
-
-        details = ", ".join(
-            f"rank{rank}: rows={rows}, batches={batches}"
-            for rank, (rows, batches) in enumerate(values)
-        )
-        raise RuntimeError(
-            f"distributed {split} loader is uneven before epoch {epoch_index + 1}: {details}"
-        )
 
     @staticmethod
     def _format_batch_meta_preview(batch: Mapping[str, Any]) -> str | None:
@@ -1176,7 +1133,7 @@ class Trainer:
             include_speed=True,
             reduce_int=self._reduce_int,
             reduce_sum=self._reduce_sum,
-            distributed=is_distributed(),
+            distributed=False,
         )
         if summary["num_samples"] == 0:
             raise RuntimeError("training epoch produced no batches")
@@ -1234,7 +1191,7 @@ class Trainer:
             include_speed=False,
             reduce_int=self._reduce_int,
             reduce_sum=self._reduce_sum,
-            distributed=is_distributed(),
+            distributed=False,
         )
         if summary["num_samples"] == 0:
             raise RuntimeError(f"{split} evaluation produced no batches")
@@ -1260,30 +1217,10 @@ class Trainer:
             sampler.set_epoch(epoch_index)
 
     def _reduce_sum(self, value: float) -> float:
-        if (
-            not is_distributed()
-            or dist is None
-            or not dist.is_available()
-            or not dist.is_initialized()
-        ):
-            return value
-
-        tensor = torch.tensor(value, dtype=torch.float64)
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self._metrics_process_group)
-        return float(tensor.item())
+        return value
 
     def _reduce_int(self, value: int) -> int:
-        if (
-            not is_distributed()
-            or dist is None
-            or not dist.is_available()
-            or not dist.is_initialized()
-        ):
-            return value
-
-        tensor = torch.tensor(value, dtype=torch.int64)
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self._metrics_process_group)
-        return int(tensor.item())
+        return value
 
     def _write_record(self, record: Mapping[str, Any]) -> None:
         self._ensure_output_dir()
