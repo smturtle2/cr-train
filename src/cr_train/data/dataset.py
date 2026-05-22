@@ -39,17 +39,29 @@ _ROW_START_KEY = "_cr_train_row_start"
 _ROW_STOP_KEY = "_cr_train_row_stop"
 
 
-def _call_prepare_blocks(prepare_blocks, blocks: tuple[dict[str, Any], ...], *, worker_count: int) -> None:
+def _call_prepare_blocks(
+    prepare_blocks,
+    blocks: tuple[dict[str, Any], ...],
+    *,
+    worker_count: int,
+    worker_blocks: tuple[tuple[dict[str, Any], ...], ...] | None = None,
+) -> None:
     signature = inspect.signature(prepare_blocks)
     parameters = signature.parameters
     accepts_worker_count = "worker_count" in parameters or any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters.values()
     )
+    accepts_worker_blocks = "worker_blocks" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    kwargs: dict[str, Any] = {}
     if accepts_worker_count:
-        prepare_blocks(blocks, worker_count=worker_count)
-        return
-    prepare_blocks(blocks)
+        kwargs["worker_count"] = worker_count
+    if accepts_worker_blocks:
+        kwargs["worker_blocks"] = worker_blocks
+    prepare_blocks(blocks, **kwargs)
 
 
 @dataclass(slots=True)
@@ -462,10 +474,22 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
     def prepare_for_dataloader(self, *, num_workers: int) -> None:
         prepare_blocks = getattr(self.block_reader, "prepare_blocks", None)
         if prepare_blocks is not None:
+            worker_count = max(1, int(num_workers))
+            worker_blocks = tuple(
+                tuple(
+                    _slice_blocks_for_worker(
+                        list(self.blocks),
+                        worker_id=worker_id,
+                        worker_count=worker_count,
+                    )
+                )
+                for worker_id in range(worker_count)
+            )
             _call_prepare_blocks(
                 prepare_blocks,
                 tuple(self.blocks),
-                worker_count=max(1, int(num_workers)),
+                worker_count=worker_count,
+                worker_blocks=worker_blocks,
             )
         self._prepared_for_dataloader = True
 
@@ -505,10 +529,19 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
     def _prefetch_blocks(self) -> bool:
         return bool(getattr(self.block_reader, "prefetch_blocks", False))
 
-    def _release_block(self, cache_key: str) -> None:
+    def _release_block(self, cache_key: str, *, worker_id: int | None = None) -> None:
         release_block = getattr(self.block_reader, "release_block", None)
         if release_block is not None:
-            release_block(cache_key)
+            signature = inspect.signature(release_block)
+            parameters = signature.parameters
+            accepts_worker_id = "worker_id" in parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if accepts_worker_id:
+                release_block(cache_key, worker_id=worker_id)
+            else:
+                release_block(cache_key)
 
     def _block_is_ready(self, cache_key: str) -> bool:
         block_is_ready = getattr(self.block_reader, "block_is_ready", None)
@@ -606,7 +639,7 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                         candidate for candidate in round_robin if candidate is not current_block
                     ]
                     del current_block
-                    self._release_block(cache_key)
+                    self._release_block(cache_key, worker_id=worker_id)
                     if not active_blocks:
                         refill_active_blocks(target_count=1, wait=True)
         finally:
@@ -616,16 +649,16 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                 except Exception:
                     pass
                 else:
-                    self._release_block(prefetched_cursor.cache_key)
+                    self._release_block(prefetched_cursor.cache_key, worker_id=worker_id)
             if prefetch_future is not None:
                 prefetch_future.cancel()
             if prefetch_pool is not None:
                 prefetch_pool.shutdown(wait=False, cancel_futures=True)
             for cursor in active_blocks:
-                self._release_block(cursor.cache_key)
+                self._release_block(cursor.cache_key, worker_id=worker_id)
             self._close_reader()
 
-    def _iter_evaluation_rows(self, *, blocks: list[dict[str, Any]]):
+    def _iter_evaluation_rows(self, *, blocks: list[dict[str, Any]], worker_id: int):
         if not self._prefetch_blocks() or len(blocks) <= 1:
             try:
                 for block in blocks:
@@ -635,7 +668,7 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                         yield from rows
                     finally:
                         del rows
-                        self._release_block(cache_key)
+                        self._release_block(cache_key, worker_id=worker_id)
             finally:
                 self._close_reader()
             return
@@ -660,7 +693,7 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                     yield from rows
                 finally:
                     del rows
-                    self._release_block(cache_key)
+                    self._release_block(cache_key, worker_id=worker_id)
         finally:
             if prefetch_future is not None and prefetch_future.done():
                 try:
@@ -671,7 +704,7 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
                     del prefetched_rows
                     next_index = index + 1
                     if next_index < len(blocks):
-                        self._release_block(str(blocks[next_index]["cache_key"]))
+                        self._release_block(str(blocks[next_index]["cache_key"]), worker_id=worker_id)
             if prefetch_future is not None:
                 prefetch_future.cancel()
             prefetch_pool.shutdown(wait=False, cancel_futures=True)
@@ -697,7 +730,7 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
             yield from self._iter_training_rows(blocks=blocks, worker_id=worker_id)
             return
 
-        yield from self._iter_evaluation_rows(blocks=blocks)
+        yield from self._iter_evaluation_rows(blocks=blocks, worker_id=worker_id)
 
 
 def _resolve_selected_blocks(

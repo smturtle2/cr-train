@@ -820,11 +820,18 @@ class Trainer:
             ),
             max_samples=max_samples,
         )
-        return loader, self._infer_total_batches(
+        total_batches = self._infer_total_batches(
             num_examples=prepared.num_examples,
             batch_size=self.batch_size,
             training=training,
         )
+        self._verify_distributed_loader_parity(
+            split=split,
+            epoch_index=epoch_index,
+            num_examples=prepared.num_examples,
+            total_batches=total_batches,
+        )
+        return loader, total_batches
 
     def _infer_total_batches(
         self,
@@ -878,6 +885,40 @@ class Trainer:
         if sync_gradients or not isinstance(self.model, DDP):
             return nullcontext()
         return self.model.no_sync()
+
+    def _distributed_training_join_context(self):
+        if isinstance(self.model, DDP) and hasattr(self.model, "join"):
+            return self.model.join(throw_on_early_termination=True)
+        return nullcontext()
+
+    def _verify_distributed_loader_parity(
+        self,
+        *,
+        split: str,
+        epoch_index: int,
+        num_examples: int,
+        total_batches: int,
+    ) -> None:
+        if not is_distributed():
+            return
+
+        assert dist is not None
+        local = torch.tensor([num_examples, total_batches], device=self.device, dtype=torch.int64)
+        gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, local)
+        values = [(int(item[0].item()), int(item[1].item())) for item in gathered]
+        row_counts = {row_count for row_count, _batches in values}
+        batch_counts = {batch_count for _rows, batch_count in values}
+        if len(row_counts) == 1 and len(batch_counts) == 1:
+            return
+
+        details = ", ".join(
+            f"rank{rank}: rows={rows}, batches={batches}"
+            for rank, (rows, batches) in enumerate(values)
+        )
+        raise RuntimeError(
+            f"distributed {split} loader is uneven before epoch {epoch_index + 1}: {details}"
+        )
 
     @staticmethod
     def _format_batch_meta_preview(batch: Mapping[str, Any]) -> str | None:
@@ -1024,62 +1065,63 @@ class Trainer:
             description=f"train {epoch_index + 1}/{self.epochs}",
         )
         try:
-            self.optimizer.zero_grad(set_to_none=True)
-            pending_accum_batches = 0
-            for batch_index, (batch, is_last_batch) in enumerate(
-                self._iter_batches_with_last_flag(batch_iterator)
-            ):
-                moved_batch = move_batch_to_device(batch, self.device)
-                pending_accum_batches += 1
-                sync_gradients = (
-                    pending_accum_batches == self.accum_steps or is_last_batch
-                )
-                with self._gradient_sync_context(sync_gradients=sync_gradients):
-                    with self._autocast_context():
-                        model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
-                        loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
-                    self._assert_finite_loss(
-                        loss=loss,
-                        epoch_index=epoch_index,
-                        batch_index=batch_index,
-                        batch=moved_batch,
+            with self._distributed_training_join_context():
+                self.optimizer.zero_grad(set_to_none=True)
+                pending_accum_batches = 0
+                for batch_index, (batch, is_last_batch) in enumerate(
+                    self._iter_batches_with_last_flag(batch_iterator)
+                ):
+                    moved_batch = move_batch_to_device(batch, self.device)
+                    pending_accum_batches += 1
+                    sync_gradients = (
+                        pending_accum_batches == self.accum_steps or is_last_batch
                     )
-                    scaled_loss = loss / self.accum_steps
-                    if self._uses_grad_scaler():
-                        self._grad_scaler.scale(scaled_loss).backward()
-                    else:
-                        scaled_loss.backward()
+                    with self._gradient_sync_context(sync_gradients=sync_gradients):
+                        with self._autocast_context():
+                            model_output = self.model(moved_batch["sar"], moved_batch["cloudy"])
+                            loss = compute_loss(self.loss_fn, model_output, moved_batch, self.device)
+                        self._assert_finite_loss(
+                            loss=loss,
+                            epoch_index=epoch_index,
+                            batch_index=batch_index,
+                            batch=moved_batch,
+                        )
+                        scaled_loss = loss / self.accum_steps
+                        if self._uses_grad_scaler():
+                            self._grad_scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
 
-                if sync_gradients:
-                    if self._uses_grad_scaler():
-                        self._grad_scaler.unscale_(self.optimizer)
-                    self._scale_gradients(self.accum_steps / pending_accum_batches)
-                    self._assert_finite_gradients(
-                        epoch_index=epoch_index,
-                        batch_index=batch_index,
-                        batch=moved_batch,
+                    if sync_gradients:
+                        if self._uses_grad_scaler():
+                            self._grad_scaler.unscale_(self.optimizer)
+                        self._scale_gradients(self.accum_steps / pending_accum_batches)
+                        self._assert_finite_gradients(
+                            epoch_index=epoch_index,
+                            batch_index=batch_index,
+                            batch=moved_batch,
+                        )
+                        self._apply_gradient_clipping()
+                        first_update_lrs = self._run_optimizer_update(
+                            first_update_lrs=first_update_lrs
+                        )
+                        self.optimizer.zero_grad(set_to_none=True)
+                        pending_accum_batches = 0
+
+                    batch_size = int(moved_batch["sar"].shape[0])
+
+                    metric_values = compute_metric_values(self.metric_fns, model_output, moved_batch)
+                    batch_values = {"loss": loss.item(), **metric_values}
+                    accumulator.update(batch_values, batch_size)
+                    update_progress_bar(
+                        progress,
+                        accumulator=accumulator,
+                        start_time=start_time,
+                        reduce_int=self._reduce_int,
+                        reduce_sum=self._reduce_sum,
+                        distributed=False,
+                        learning_rates=self._get_learning_rates(),
                     )
-                    self._apply_gradient_clipping()
-                    first_update_lrs = self._run_optimizer_update(
-                        first_update_lrs=first_update_lrs
-                    )
-                    self.optimizer.zero_grad(set_to_none=True)
-                    pending_accum_batches = 0
-
-                batch_size = int(moved_batch["sar"].shape[0])
-
-                metric_values = compute_metric_values(self.metric_fns, model_output, moved_batch)
-                batch_values = {"loss": loss.item(), **metric_values}
-                accumulator.update(batch_values, batch_size)
-                update_progress_bar(
-                    progress,
-                    accumulator=accumulator,
-                    start_time=start_time,
-                    reduce_int=self._reduce_int,
-                    reduce_sum=self._reduce_sum,
-                    distributed=is_distributed(),
-                    learning_rates=self._get_learning_rates(),
-                )
         finally:
             progress.close()
 

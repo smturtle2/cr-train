@@ -545,6 +545,7 @@ def _build_worker_staging_plan(
     *,
     max_staged_blocks: int,
     worker_count: int,
+    worker_queues: tuple[tuple[str, ...], ...] | None = None,
 ) -> _WorkerStagingPlan:
     resolved_worker_count = max(1, int(worker_count))
     effective_max_staged_blocks = max(1, int(max_staged_blocks), resolved_worker_count)
@@ -553,16 +554,19 @@ def _build_worker_staging_plan(
         base_quota + (1 if worker_id < extra_slots else 0)
         for worker_id in range(resolved_worker_count)
     )
-    worker_queues = tuple(
-        tuple(cache_key for index, cache_key in enumerate(cache_keys) if index % resolved_worker_count == worker_id)
-        for worker_id in range(resolved_worker_count)
-    )
+    if worker_queues is None:
+        resolved_worker_queues = tuple(
+            tuple(cache_key for index, cache_key in enumerate(cache_keys) if index % resolved_worker_count == worker_id)
+            for worker_id in range(resolved_worker_count)
+        )
+    else:
+        resolved_worker_queues = worker_queues
     worker_by_key: dict[str, int] = {}
-    for worker_id, worker_queue in enumerate(worker_queues):
+    for worker_id, worker_queue in enumerate(resolved_worker_queues):
         for cache_key in worker_queue:
             worker_by_key[cache_key] = worker_id
     return _WorkerStagingPlan(
-        worker_queues=worker_queues,
+        worker_queues=resolved_worker_queues,
         worker_quotas=worker_quotas,
         worker_by_key=worker_by_key,
         effective_max_staged_blocks=effective_max_staged_blocks,
@@ -615,7 +619,7 @@ class _WorkerStagingRuntime:
     max_staged_blocks: int
     queue_positions: list[int] = field(init=False)
     active_by_worker: list[set[str]] = field(init=False)
-    active_owner_by_key: dict[str, int] = field(init=False)
+    active_workers_by_key: dict[str, set[int]] = field(init=False)
     active_order: list[str] = field(init=False)
     released_cache_keys: set[str] = field(init=False)
     retry_attempts_by_key: dict[str, int] = field(init=False)
@@ -624,14 +628,14 @@ class _WorkerStagingRuntime:
     def __post_init__(self) -> None:
         self.queue_positions = [0 for _queue in self.worker_queues]
         self.active_by_worker = [set() for _queue in self.worker_queues]
-        self.active_owner_by_key = {}
+        self.active_workers_by_key = {}
         self.active_order = []
         self.released_cache_keys = set()
         self.retry_attempts_by_key = {}
         self.retry_ready_at_by_key = {}
 
     def has_pending_work(self) -> bool:
-        return bool(self.active_owner_by_key) or any(
+        return bool(self.active_workers_by_key) or any(
             self.queue_positions[worker_id] < len(self.worker_queues[worker_id])
             for worker_id in range(len(self.worker_queues))
         )
@@ -654,22 +658,41 @@ class _WorkerStagingRuntime:
         cache_key = worker_queue[self.queue_positions[worker_id]]
         self.queue_positions[worker_id] += 1
         self.active_by_worker[worker_id].add(cache_key)
-        self.active_owner_by_key[cache_key] = worker_id
+        self.active_workers_by_key.setdefault(cache_key, set()).add(worker_id)
         self.active_order.append(cache_key)
         return True
 
     def drain_released_blocks(self) -> None:
         while True:
             try:
-                cache_key = str(self.release_queue.get_nowait())
+                release_item = self.release_queue.get_nowait()
             except queue_mod.Empty:
                 return
-            self.released_cache_keys.add(cache_key)
-            clear_v15_block(self.staging_root, self.split, cache_key)
-            worker_id = self.active_owner_by_key.pop(cache_key, None)
+            if isinstance(release_item, tuple) and len(release_item) == 2:
+                worker_id = int(release_item[0])
+                cache_key = str(release_item[1])
+            else:
+                worker_id = None
+                cache_key = str(release_item)
             if worker_id is None:
+                active_workers = self.active_workers_by_key.pop(cache_key, set())
+                for active_worker_id in active_workers:
+                    self.active_by_worker[active_worker_id].discard(cache_key)
+                self.released_cache_keys.add(cache_key)
+                clear_v15_block(self.staging_root, self.split, cache_key)
+                continue
+            if worker_id < 0 or worker_id >= len(self.active_by_worker):
                 continue
             self.active_by_worker[worker_id].discard(cache_key)
+            active_workers = self.active_workers_by_key.get(cache_key)
+            if active_workers is None:
+                continue
+            active_workers.discard(worker_id)
+            if active_workers:
+                continue
+            self.active_workers_by_key.pop(cache_key, None)
+            self.released_cache_keys.add(cache_key)
+            clear_v15_block(self.staging_root, self.split, cache_key)
 
     def _retry_is_ready(self, cache_key: str) -> bool:
         return time.monotonic() >= self.retry_ready_at_by_key.get(cache_key, 0.0)
@@ -697,9 +720,13 @@ class _WorkerStagingRuntime:
         in_flight_cache_keys = set(futures.values())
         staged_or_in_flight = _count_staged_crpacks(self.staging_root, self.split) + len(futures)
         self.active_order = [
-            cache_key for cache_key in self.active_order if cache_key in self.active_owner_by_key
+            cache_key for cache_key in self.active_order if cache_key in self.active_workers_by_key
         ]
+        visited_cache_keys: set[str] = set()
         for cache_key in self.active_order:
+            if cache_key in visited_cache_keys:
+                continue
+            visited_cache_keys.add(cache_key)
             if len(futures) >= download_workers:
                 break
             if staged_or_in_flight >= self.max_staged_blocks:
@@ -732,7 +759,7 @@ class _WorkerStagingRuntime:
                 return
             raise
         self.clear_retry(cache_key)
-        if cache_key in self.released_cache_keys:
+        if cache_key in self.released_cache_keys and cache_key not in self.active_workers_by_key:
             clear_v15_block(self.staging_root, self.split, cache_key)
 
 
@@ -822,14 +849,27 @@ class HFV2StagedBlockReader:
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
 
-    def prepare_blocks(self, blocks: tuple[dict[str, Any], ...], *, worker_count: int = 1) -> None:
+    def prepare_blocks(
+        self,
+        blocks: tuple[dict[str, Any], ...],
+        *,
+        worker_count: int = 1,
+        worker_blocks: tuple[tuple[dict[str, Any], ...], ...] | None = None,
+    ) -> None:
         self.block_path_by_key = _block_path_by_key(blocks)
         self.row_count_by_key = _row_count_by_key(blocks)
         cache_keys = tuple(str(block["cache_key"]) for block in blocks)
+        worker_queues = None
+        if worker_blocks is not None:
+            worker_queues = tuple(
+                tuple(dict.fromkeys(str(block["cache_key"]) for block in worker_block_list))
+                for worker_block_list in worker_blocks
+            )
         staging_plan = _build_worker_staging_plan(
             cache_keys,
             max_staged_blocks=self.max_staged_blocks,
             worker_count=worker_count,
+            worker_queues=worker_queues,
         )
         self.worker_by_key = dict(staging_plan.worker_by_key)
         self.worker_quotas = staging_plan.worker_quotas
@@ -873,10 +913,14 @@ class HFV2StagedBlockReader:
             raise RuntimeError(f"HF v2 streaming downloader exited with code {process.exitcode}")
         return v15_block_is_cached(self.staging_source_root, self.split, cache_key)
 
-    def release_block(self, cache_key: str) -> None:
-        clear_v15_block(self.staging_source_root, self.split, cache_key)
-        if self._release_queue is not None:
+    def release_block(self, cache_key: str, *, worker_id: int | None = None) -> None:
+        if self._release_queue is None:
+            clear_v15_block(self.staging_source_root, self.split, cache_key)
+            return
+        if worker_id is None:
             self._release_queue.put(cache_key)
+        else:
+            self._release_queue.put((int(worker_id), cache_key))
 
     def close(self) -> None:
         process = self._process if self._process_owner_pid == os.getpid() else None

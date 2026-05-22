@@ -6,6 +6,7 @@ import importlib
 import json
 import multiprocessing as mp
 import pickle
+import queue
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +34,7 @@ from cr_train.data.dataset import (
     prepare_split_from_state,
     resolve_prepared_split_state,
 )
-from cr_train.data.hf_v2 import _build_worker_staging_plan
+from cr_train.data.hf_v2 import _WorkerStagingRuntime, _build_worker_staging_plan
 from cr_train.data.v15 import clear_v15_block, pack_v15_block, v15_block_path
 
 
@@ -1023,6 +1024,61 @@ def test_worker_staging_plan_splits_queues_and_quotas_deterministically() -> Non
     assert plan.effective_max_staged_blocks == 5
 
 
+def test_worker_staging_plan_accepts_actual_worker_block_slices() -> None:
+    plan = _build_worker_staging_plan(
+        ("block-0", "block-1"),
+        max_staged_blocks=4,
+        worker_count=3,
+        worker_queues=(("block-0",), ("block-0", "block-1"), ("block-1",)),
+    )
+
+    assert plan.worker_queues == (
+        ("block-0",),
+        ("block-0", "block-1"),
+        ("block-1",),
+    )
+    assert plan.worker_quotas == (2, 1, 1)
+    assert plan.effective_max_staged_blocks == 4
+
+
+def test_worker_staging_runtime_keeps_shared_block_until_all_workers_release(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import cr_train.data.hf_v2 as hf_v2_mod
+
+    cleared: list[str] = []
+    release_queue = queue.Queue()
+    runtime = _WorkerStagingRuntime(
+        split="train",
+        staging_root=tmp_path,
+        block_paths_by_key={"shared": "shared.crpack"},
+        worker_queues=(("shared",), ("shared",)),
+        worker_quotas=(1, 1),
+        release_queue=release_queue,
+        max_staged_blocks=2,
+    )
+
+    monkeypatch.setattr(
+        hf_v2_mod,
+        "clear_v15_block",
+        lambda _root, _split, cache_key: cleared.append(str(cache_key)),
+    )
+
+    runtime.fill_worker_slots()
+    assert runtime.active_workers_by_key == {"shared": {0, 1}}
+
+    release_queue.put((0, "shared"))
+    runtime.drain_released_blocks()
+    assert runtime.active_workers_by_key == {"shared": {1}}
+    assert cleared == []
+
+    release_queue.put((1, "shared"))
+    runtime.drain_released_blocks()
+    assert runtime.active_workers_by_key == {}
+    assert cleared == ["shared"]
+
+
 def test_worker_owned_downloader_refills_released_worker_slot(monkeypatch, tmp_path: Path) -> None:
     import cr_train.data.hf_v2 as hf_v2_mod
 
@@ -1383,6 +1439,65 @@ def test_build_dataloader_accepts_legacy_prepare_blocks_signature(monkeypatch) -
 
     assert loader is not None
     assert prepared_block_counts == [2]
+
+
+def test_build_dataloader_passes_actual_worker_block_slices(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    captured_worker_blocks: list[tuple[tuple[dict[str, Any], ...], ...]] = []
+
+    class SliceAwareReader:
+        def prepare_blocks(self, blocks, *, worker_count: int, worker_blocks=None) -> None:
+            del blocks, worker_count
+            captured_worker_blocks.append(worker_blocks)
+
+        def load_block(self, cache_key: str):
+            return [{"scene": cache_key} for _ in range(10)]
+
+    class FakeDataLoader:
+        def __init__(self, dataset, **kwargs):
+            self.dataset = dataset
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(dataset_mod, "DataLoader", FakeDataLoader)
+
+    dataset = BlockIterableDataset(
+        block_reader=SliceAwareReader(),
+        blocks=({"cache_key": "shared", "row_count": 10},),
+        seed=5,
+        epoch=0,
+        split="train",
+        training=True,
+    )
+    build_dataloader(
+        PreparedSplit(dataset=dataset, num_examples=10),
+        batch_size=1,
+        num_workers=2,
+        training=True,
+        seed=5,
+        epoch=0,
+    )
+
+    assert captured_worker_blocks == [
+        (
+            (
+                {
+                    "cache_key": "shared",
+                    "row_count": 10,
+                    "_cr_train_row_start": 0,
+                    "_cr_train_row_stop": 5,
+                },
+            ),
+            (
+                {
+                    "cache_key": "shared",
+                    "row_count": 10,
+                    "_cr_train_row_start": 5,
+                    "_cr_train_row_stop": 10,
+                },
+            ),
+        )
+    ]
 
 
 def test_build_dataloader_passes_multiprocessing_context(monkeypatch) -> None:
