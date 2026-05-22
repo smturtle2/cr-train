@@ -106,6 +106,7 @@ def test_training_example_main_forwards_scheduler_timing(monkeypatch, tmp_path: 
     example_path = Path(__file__).resolve().parents[1] / "examples" / "train_sen12mscr.py"
     namespace = runpy.run_path(str(example_path), run_name="example_module")
     trainer_kwargs: dict[str, object] = {}
+    events: list[str] = []
 
     class FakeTrainer:
         def __init__(self, model, optimizer, loss, **kwargs) -> None:
@@ -113,10 +114,18 @@ def test_training_example_main_forwards_scheduler_timing(monkeypatch, tmp_path: 
             trainer_kwargs.update(kwargs)
 
         def step(self) -> dict[str, object]:
+            events.append("step")
             return {}
 
         def test(self) -> dict[str, object]:
+            events.append("test")
             return {}
+
+        def close(self) -> None:
+            events.append("close")
+
+    def fake_cleanup_distributed() -> None:
+        events.append("cleanup")
 
     monkeypatch.setattr(
         sys,
@@ -137,12 +146,14 @@ def test_training_example_main_forwards_scheduler_timing(monkeypatch, tmp_path: 
     )
     main = namespace["main"]
     main.__globals__["Trainer"] = FakeTrainer
+    main.__globals__["cleanup_distributed"] = fake_cleanup_distributed
 
     main()
 
     assert trainer_kwargs["scheduler_timing"] == "after_optimizer_step"
     assert trainer_kwargs["grad_clip_norm"] == 1.25
     assert trainer_kwargs["mixed_precision"] == "bf16"
+    assert events == ["step", "test", "close", "cleanup"]
 
 
 def test_bitmask_demo_example_loads_without_running_main() -> None:

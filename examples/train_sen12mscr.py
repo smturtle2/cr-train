@@ -300,6 +300,7 @@ def build_scheduler(
 # --- Main ---
 
 def main() -> None:
+    trainer = None
     try:
         args = parse_args()
         device = resolve_device(args.device)
@@ -344,6 +345,10 @@ def main() -> None:
         # Test evaluation — Trainer prints test summary automatically
         trainer.test()
     finally:
+        if trainer is not None:
+            close = getattr(trainer, "close", None)
+            if callable(close):
+                close()
         cleanup_distributed()
 
 

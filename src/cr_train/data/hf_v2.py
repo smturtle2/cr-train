@@ -878,6 +878,9 @@ class HFV2StagedBlockReader:
         if self._process is not None and self._process.is_alive():
             self._process.terminate()
             self._process.join(timeout=5)
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join(timeout=5)
         context = mp.get_context("spawn")
         self._release_queue = context.Queue()
         self._process = context.Process(
@@ -927,6 +930,19 @@ class HFV2StagedBlockReader:
         if process is not None and process.is_alive():
             process.terminate()
             process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+        release_queue = self._release_queue if self._process_owner_pid == os.getpid() else None
+        if release_queue is not None:
+            close_queue = getattr(release_queue, "close", None)
+            if callable(close_queue):
+                close_queue()
+            join_thread = getattr(release_queue, "join_thread", None)
+            if callable(join_thread):
+                join_thread()
+            self._release_queue = None
+        self._process = None
         if self._process_owner_pid == os.getpid():
             remove_tree(self.staging_source_root)
 

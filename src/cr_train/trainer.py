@@ -7,7 +7,6 @@ import warnings
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from itertools import chain
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -197,6 +196,7 @@ class Trainer:
         self.device = self._infer_module_device(self.model)
         self._wrap_model_for_ddp_if_needed()
         self.device = self._infer_module_device(self._model_state_owner())
+        self._metrics_process_group = self._create_metrics_process_group()
         self._validate_mixed_precision_for_device()
         self._grad_scaler = torch.amp.GradScaler(
             "cuda",
@@ -313,6 +313,22 @@ class Trainer:
                 file=sys.stderr,
             )
         return result
+
+    def close(self) -> None:
+        group = getattr(self, "_metrics_process_group", None)
+        self._metrics_process_group = None
+        if group is None or dist is None or not dist.is_available() or not dist.is_initialized():
+            return
+        try:
+            dist.destroy_process_group(group)
+        except RuntimeError:
+            pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def save_checkpoint(self, path: str | Path | None = None) -> Path:
         """Persist model, optimizer, and runtime counters for resuming training."""
@@ -716,6 +732,16 @@ class Trainer:
             return
         self.model = DDP(self.model)
 
+    def _create_metrics_process_group(self):
+        if (
+            not is_distributed()
+            or dist is None
+            or not dist.is_available()
+            or not dist.is_initialized()
+        ):
+            return None
+        return dist.new_group(backend="gloo")
+
     def _model_state_owner(self) -> nn.Module:
         if isinstance(self.model, DDP):
             return self.model.module
@@ -873,6 +899,12 @@ class Trainer:
             current = next_batch
         yield current, True
 
+    @staticmethod
+    def _close_batch_iterator(batch_iterator) -> None:
+        close = getattr(batch_iterator, "close", None)
+        if callable(close):
+            close()
+
     def _scale_gradients(self, factor: float) -> None:
         if factor == 1.0:
             return
@@ -899,13 +931,19 @@ class Trainer:
         num_examples: int,
         total_batches: int,
     ) -> None:
-        if not is_distributed():
+        if (
+            not is_distributed()
+            or dist is None
+            or not dist.is_available()
+            or not dist.is_initialized()
+        ):
             return
 
         assert dist is not None
-        local = torch.tensor([num_examples, total_batches], device=self.device, dtype=torch.int64)
-        gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
-        dist.all_gather(gathered, local)
+        local = torch.tensor([num_examples, total_batches], dtype=torch.int64)
+        group = self._metrics_process_group
+        gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
+        dist.all_gather(gathered, local, group=group)
         values = [(int(item[0].item()), int(item[1].item())) for item in gathered]
         row_counts = {row_count for row_count, _batches in values}
         batch_counts = {batch_count for _rows, batch_count in values}
@@ -1123,6 +1161,7 @@ class Trainer:
                         learning_rates=self._get_learning_rates(),
                     )
         finally:
+            self._close_batch_iterator(batch_iterator)
             progress.close()
 
         summary = finalize_summary(
@@ -1177,9 +1216,10 @@ class Trainer:
                         start_time=start_time,
                         reduce_int=self._reduce_int,
                         reduce_sum=self._reduce_sum,
-                        distributed=is_distributed(),
+                        distributed=False,
                     )
         finally:
+            self._close_batch_iterator(batch_iterator)
             progress.close()
 
         summary = finalize_summary(
@@ -1214,21 +1254,29 @@ class Trainer:
             sampler.set_epoch(epoch_index)
 
     def _reduce_sum(self, value: float) -> float:
-        if not is_distributed():
+        if (
+            not is_distributed()
+            or dist is None
+            or not dist.is_available()
+            or not dist.is_initialized()
+        ):
             return value
 
-        tensor = torch.tensor(value, device=self.device, dtype=torch.float64)
-        assert dist is not None
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor = torch.tensor(value, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self._metrics_process_group)
         return float(tensor.item())
 
     def _reduce_int(self, value: int) -> int:
-        if not is_distributed():
+        if (
+            not is_distributed()
+            or dist is None
+            or not dist.is_available()
+            or not dist.is_initialized()
+        ):
             return value
 
-        tensor = torch.tensor(value, device=self.device, dtype=torch.int64)
-        assert dist is not None
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor = torch.tensor(value, dtype=torch.int64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self._metrics_process_group)
         return int(tensor.item())
 
     def _write_record(self, record: Mapping[str, Any]) -> None:
@@ -1265,4 +1313,14 @@ class Trainer:
             return iter(())
 
         first_batch, remainder = primed
-        return chain([first_batch], remainder)
+        return self._iter_primed_batches(first_batch, remainder)
+
+    @staticmethod
+    def _iter_primed_batches(first_batch, remainder):
+        try:
+            yield first_batch
+            yield from remainder
+        finally:
+            shutdown_workers = getattr(remainder, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
