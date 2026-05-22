@@ -839,6 +839,117 @@ def test_worker_owned_downloader_refills_released_worker_slot(monkeypatch, tmp_p
         assert not any((tmp_path / "block_store" / "train" / "blocks").glob("*.crpack"))
 
 
+def test_worker_owned_downloader_retries_retryable_download_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import cr_train.data.hf_v2 as hf_v2_mod
+
+    retryable_error_type = type("ConnectError", (Exception,), {"__module__": "httpx"})
+    attempts: dict[str, int] = defaultdict(int)
+    release_queue = mp.get_context("spawn").Queue()
+
+    monkeypatch.setattr(hf_v2_mod, "_HF_V2_BLOCK_RETRY_BASE_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(hf_v2_mod, "_HF_V2_BLOCK_RETRY_MAX_DELAY_SECONDS", 0.0)
+
+    def fake_download_and_stage_crpack(
+        *,
+        staging_source_root: Path,
+        split: str,
+        cache_key: str,
+        relative_path: str,
+    ) -> str:
+        del relative_path
+        attempts[cache_key] += 1
+        if attempts[cache_key] == 1:
+            raise RuntimeError("temporary dns failure") from retryable_error_type("dns")
+        path = v15_block_path(staging_source_root, split, cache_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"ready")
+        return cache_key
+
+    monkeypatch.setattr(
+        hf_v2_mod,
+        "_download_and_stage_crpack",
+        fake_download_and_stage_crpack,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            hf_v2_mod._run_hf_v2_staging_downloader,
+            split="train",
+            staging_source_root=str(tmp_path),
+            block_paths_by_key={"block-0": "path-0"},
+            worker_queues=(("block-0",),),
+            worker_quotas=(1,),
+            release_queue=release_queue,
+            max_staged_blocks=1,
+            download_workers=1,
+        )
+
+        _wait_for(lambda: attempts["block-0"] == 2)
+        assert v15_block_path(tmp_path, "train", "block-0").is_file()
+        assert not (tmp_path / "block_store" / "train" / "staging.error").exists()
+
+        clear_v15_block(tmp_path, "train", "block-0")
+        release_queue.put("block-0")
+        future.result(timeout=2)
+
+
+def test_worker_owned_downloader_fails_non_retryable_download_error(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import cr_train.data.hf_v2 as hf_v2_mod
+
+    class Response:
+        status_code = 404
+
+    class HTTPStatusError(Exception):
+        __module__ = "httpx"
+
+        def __init__(self, message: str) -> None:
+            super().__init__(message)
+            self.response = Response()
+
+    release_queue = mp.get_context("spawn").Queue()
+
+    def fake_download_and_stage_crpack(
+        *,
+        staging_source_root: Path,
+        split: str,
+        cache_key: str,
+        relative_path: str,
+    ) -> str:
+        del staging_source_root, split, cache_key, relative_path
+        raise RuntimeError("missing block") from HTTPStatusError("not found")
+
+    monkeypatch.setattr(
+        hf_v2_mod,
+        "_download_and_stage_crpack",
+        fake_download_and_stage_crpack,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            hf_v2_mod._run_hf_v2_staging_downloader,
+            split="train",
+            staging_source_root=str(tmp_path),
+            block_paths_by_key={"block-0": "path-0"},
+            worker_queues=(("block-0",),),
+            worker_quotas=(1,),
+            release_queue=release_queue,
+            max_staged_blocks=1,
+            download_workers=1,
+        )
+
+        with pytest.raises(RuntimeError, match="missing block"):
+            future.result(timeout=2)
+
+    error_path = tmp_path / "block_store" / "train" / "staging.error"
+    assert error_path.read_text(encoding="utf-8") == "missing block"
+
+
 def test_worker_owned_downloader_schedules_first_slots_round_robin(monkeypatch, tmp_path: Path) -> None:
     import cr_train.data.hf_v2 as hf_v2_mod
 

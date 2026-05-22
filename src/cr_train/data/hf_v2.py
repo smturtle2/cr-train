@@ -34,9 +34,20 @@ HF_V2_REVISION = "main"
 HF_V2_LAYOUT = "cr-hf-scene-v1"
 HF_V2_DOWNLOAD_WORKERS = 16
 HF_V2_STAGING_MAX_BLOCKS = 80
-_HF_V2_READ_ATTEMPTS = 4
-_HF_V2_RETRY_BASE_DELAY_SECONDS = 0.25
+_HF_V2_READ_ATTEMPTS = 8
+_HF_V2_RETRY_BASE_DELAY_SECONDS = 0.5
+_HF_V2_RETRY_MAX_DELAY_SECONDS = 8.0
+_HF_V2_BLOCK_RETRY_BASE_DELAY_SECONDS = 1.0
+_HF_V2_BLOCK_RETRY_MAX_DELAY_SECONDS = 60.0
 _HF_V2_STAGING_POLL_SECONDS = 0.05
+_HF_V2_RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+_HF_V2_RETRYABLE_MODULE_PREFIXES = (
+    "httpcore",
+    "httpx",
+    "huggingface_hub",
+    "requests",
+    "urllib3",
+)
 
 
 class BlockReader(Protocol):
@@ -87,24 +98,77 @@ def _hf_url(path: str) -> str:
     )
 
 
+def _retry_delay(attempt: int, *, base_delay: float, max_delay: float) -> float:
+    return min(base_delay * (2 ** attempt), max_delay)
+
+
 def _sleep_before_retry(attempt: int) -> None:
-    time.sleep(_HF_V2_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+    time.sleep(
+        _retry_delay(
+            attempt,
+            base_delay=_HF_V2_RETRY_BASE_DELAY_SECONDS,
+            max_delay=_HF_V2_RETRY_MAX_DELAY_SECONDS,
+        )
+    )
+
+
+def _iter_exception_chain(exc: BaseException):
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _remote_status_code(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is None:
+        status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        return None
+    try:
+        return int(status_code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_retryable_remote_error(exc: BaseException) -> bool:
+    for chained in _iter_exception_chain(exc):
+        status_code = _remote_status_code(chained)
+        if status_code is None:
+            continue
+        return status_code in _HF_V2_RETRYABLE_STATUS_CODES or status_code >= 500
+
+    for chained in _iter_exception_chain(exc):
+        module = type(chained).__module__
+        if any(
+            module == prefix or module.startswith(prefix + ".")
+            for prefix in _HF_V2_RETRYABLE_MODULE_PREFIXES
+        ):
+            return True
+    return False
 
 
 def _read_remote_bytes(path: str) -> bytes:
     last_exc: Exception | None = None
+    attempts_used = 0
     for attempt in range(_HF_V2_READ_ATTEMPTS):
+        attempts_used = attempt + 1
         try:
             response = get_session().get(_hf_url(path), follow_redirects=True)
             response.raise_for_status()
             return bytes(response.content)
         except Exception as exc:
             last_exc = exc
-            if attempt < _HF_V2_READ_ATTEMPTS - 1:
+            if _is_retryable_remote_error(exc) and attempt < _HF_V2_READ_ATTEMPTS - 1:
                 _sleep_before_retry(attempt)
                 continue
             break
-    raise RuntimeError(f"failed to read HF dataset object: {path}") from last_exc
+    raise RuntimeError(
+        f"failed to read HF dataset object after {attempts_used} attempts: {path}"
+    ) from last_exc
 
 
 def _download_remote_file(path: str, target: Path) -> int:
@@ -112,7 +176,9 @@ def _download_remote_file(path: str, target: Path) -> int:
     tmp_path = target.with_suffix(target.suffix + ".tmp")
     remove_tree(tmp_path)
     last_exc: Exception | None = None
+    attempts_used = 0
     for attempt in range(_HF_V2_READ_ATTEMPTS):
+        attempts_used = attempt + 1
         try:
             downloaded = 0
             with get_session().stream("GET", _hf_url(path), follow_redirects=True) as response:
@@ -128,11 +194,13 @@ def _download_remote_file(path: str, target: Path) -> int:
         except Exception as exc:
             last_exc = exc
             remove_tree(tmp_path)
-            if attempt < _HF_V2_READ_ATTEMPTS - 1:
+            if _is_retryable_remote_error(exc) and attempt < _HF_V2_READ_ATTEMPTS - 1:
                 _sleep_before_retry(attempt)
                 continue
             break
-    raise RuntimeError(f"failed to download HF dataset object: {path}") from last_exc
+    raise RuntimeError(
+        f"failed to download HF dataset object after {attempts_used} attempts: {path}"
+    ) from last_exc
 
 
 def _read_remote_json(path: str) -> dict[str, Any]:
@@ -550,6 +618,8 @@ class _WorkerStagingRuntime:
     active_owner_by_key: dict[str, int] = field(init=False)
     active_order: list[str] = field(init=False)
     released_cache_keys: set[str] = field(init=False)
+    retry_attempts_by_key: dict[str, int] = field(init=False)
+    retry_ready_at_by_key: dict[str, float] = field(init=False)
 
     def __post_init__(self) -> None:
         self.queue_positions = [0 for _queue in self.worker_queues]
@@ -557,6 +627,8 @@ class _WorkerStagingRuntime:
         self.active_owner_by_key = {}
         self.active_order = []
         self.released_cache_keys = set()
+        self.retry_attempts_by_key = {}
+        self.retry_ready_at_by_key = {}
 
     def has_pending_work(self) -> bool:
         return bool(self.active_owner_by_key) or any(
@@ -599,6 +671,22 @@ class _WorkerStagingRuntime:
                 continue
             self.active_by_worker[worker_id].discard(cache_key)
 
+    def _retry_is_ready(self, cache_key: str) -> bool:
+        return time.monotonic() >= self.retry_ready_at_by_key.get(cache_key, 0.0)
+
+    def defer_retry(self, cache_key: str) -> None:
+        attempt = self.retry_attempts_by_key.get(cache_key, 0)
+        self.retry_attempts_by_key[cache_key] = attempt + 1
+        self.retry_ready_at_by_key[cache_key] = time.monotonic() + _retry_delay(
+            attempt,
+            base_delay=_HF_V2_BLOCK_RETRY_BASE_DELAY_SECONDS,
+            max_delay=_HF_V2_BLOCK_RETRY_MAX_DELAY_SECONDS,
+        )
+
+    def clear_retry(self, cache_key: str) -> None:
+        self.retry_attempts_by_key.pop(cache_key, None)
+        self.retry_ready_at_by_key.pop(cache_key, None)
+
     def submit_downloads(
         self,
         *,
@@ -618,6 +706,8 @@ class _WorkerStagingRuntime:
                 break
             if cache_key in in_flight_cache_keys:
                 continue
+            if not self._retry_is_ready(cache_key):
+                continue
             if v15_block_is_cached(self.staging_root, self.split, cache_key):
                 continue
             futures[
@@ -634,7 +724,14 @@ class _WorkerStagingRuntime:
 
     def finish_download(self, future: Future[str], futures: dict[Future[str], str]) -> None:
         cache_key = futures.pop(future)
-        future.result()
+        try:
+            future.result()
+        except Exception as exc:
+            if _is_retryable_remote_error(exc):
+                self.defer_retry(cache_key)
+                return
+            raise
+        self.clear_retry(cache_key)
         if cache_key in self.released_cache_keys:
             clear_v15_block(self.staging_root, self.split, cache_key)
 
