@@ -707,6 +707,254 @@ def test_prepare_split_training_order_is_reproducible_for_same_seed_and_epoch(
     assert scenes_a == scenes_b
 
 
+def test_prepare_split_distributed_slices_rows_instead_of_whole_blocks(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    row_counts = {"b0": 5, "b1": 11, "b2": 7, "b3": 4}
+
+    class RowReader:
+        def load_block(self, cache_key: str):
+            return [
+                {"id": f"{cache_key}:{row_index}"}
+                for row_index in range(row_counts[cache_key])
+            ]
+
+    blocks = tuple(
+        {"cache_key": cache_key, "row_count": row_count}
+        for cache_key, row_count in row_counts.items()
+    )
+    state = dataset_mod.PreparedSplitState(
+        split="train",
+        block_reader=RowReader(),
+        streaming=False,
+        source_stage="load local data",
+        seed=9,
+        requested_rows=sum(row_counts.values()),
+        effective_rows=sum(row_counts.values()),
+        required_blocks=len(blocks),
+        planner_mode="full_split",
+        selected_blocks=blocks,
+        row_counts_by_key=dict(row_counts),
+    )
+    monkeypatch.setattr(dataset_mod, "get_world_size", lambda: 2)
+
+    def rows_for_rank(rank: int) -> tuple[list[str], int]:
+        monkeypatch.setattr(dataset_mod, "get_rank", lambda: rank)
+        prepared = prepare_split_from_state(state, epoch=0, training=False)
+        return [row["id"] for row in prepared.dataset], prepared.num_examples
+
+    rank0_rows, rank0_count = rows_for_rank(0)
+    rank1_rows, rank1_count = rows_for_rank(1)
+
+    assert rank0_count == rank1_count == 13
+    assert rank0_rows == [
+        "b0:0",
+        "b0:1",
+        "b0:2",
+        "b0:3",
+        "b0:4",
+        "b1:0",
+        "b1:1",
+        "b1:2",
+        "b1:3",
+        "b1:4",
+        "b1:5",
+        "b1:6",
+        "b1:7",
+    ]
+    assert rank1_rows == [
+        "b1:8",
+        "b1:9",
+        "b1:10",
+        "b2:0",
+        "b2:1",
+        "b2:2",
+        "b2:3",
+        "b2:4",
+        "b2:5",
+        "b2:6",
+        "b3:0",
+        "b3:1",
+        "b3:2",
+    ]
+    assert set(rank0_rows).isdisjoint(rank1_rows)
+
+
+def test_prepare_split_distributed_training_balances_variable_row_blocks(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    row_counts = {"b0": 53, "b1": 2, "b2": 31, "b3": 17, "b4": 44, "b5": 4}
+
+    class RowReader:
+        def load_block(self, cache_key: str):
+            return [
+                {"id": f"{cache_key}:{row_index}"}
+                for row_index in range(row_counts[cache_key])
+            ]
+
+    blocks = tuple(
+        {"cache_key": cache_key, "row_count": row_count}
+        for cache_key, row_count in row_counts.items()
+    )
+    state = dataset_mod.PreparedSplitState(
+        split="train",
+        block_reader=RowReader(),
+        streaming=False,
+        source_stage="load local data",
+        seed=13,
+        requested_rows=sum(row_counts.values()),
+        effective_rows=sum(row_counts.values()),
+        required_blocks=len(blocks),
+        planner_mode="full_split",
+        selected_blocks=blocks,
+        row_counts_by_key=dict(row_counts),
+    )
+    monkeypatch.setattr(dataset_mod, "get_world_size", lambda: 2)
+
+    rank_rows: list[list[str]] = []
+    rank_counts: list[int] = []
+    for rank in (0, 1):
+        monkeypatch.setattr(dataset_mod, "get_rank", lambda rank=rank: rank)
+        prepared = prepare_split_from_state(state, epoch=0, training=True)
+        rank_counts.append(prepared.num_examples)
+        rank_rows.append([row["id"] for row in prepared.dataset])
+
+    assert rank_counts == [75, 75]
+    assert [len(rows) for rows in rank_rows] == [75, 75]
+    assert set(rank_rows[0]).isdisjoint(rank_rows[1])
+    assert len(set(rank_rows[0]) | set(rank_rows[1])) == 150
+
+
+def test_prepare_split_distributed_training_balances_changing_epoch_orders(monkeypatch) -> None:
+    if "fork" not in mp.get_all_start_methods():
+        pytest.skip("requires fork multiprocessing context")
+
+    import cr_train.data.dataset as dataset_mod
+
+    row_counts = {
+        "b0": 53,
+        "b1": 2,
+        "b2": 31,
+        "b3": 17,
+        "b4": 44,
+        "b5": 4,
+        "b6": 29,
+    }
+
+    class RowReader:
+        def load_block(self, cache_key: str):
+            return [
+                {"id": f"{cache_key}:{row_index}"}
+                for row_index in range(row_counts[cache_key])
+            ]
+
+    blocks = tuple(
+        {"cache_key": cache_key, "row_count": row_count}
+        for cache_key, row_count in row_counts.items()
+    )
+    state = dataset_mod.PreparedSplitState(
+        split="train",
+        block_reader=RowReader(),
+        streaming=False,
+        source_stage="load local data",
+        seed=13,
+        requested_rows=sum(row_counts.values()),
+        effective_rows=sum(row_counts.values()),
+        required_blocks=len(blocks),
+        planner_mode="full_split",
+        selected_blocks=blocks,
+        row_counts_by_key=dict(row_counts),
+    )
+    monkeypatch.setattr(dataset_mod, "get_world_size", lambda: 3)
+
+    epoch_rank0_sets: set[frozenset[str]] = set()
+    for epoch in range(8):
+        rank_batch_counts: list[int] = []
+        rank_row_counts: list[int] = []
+        rank_rows: list[set[str]] = []
+        for rank in range(3):
+            monkeypatch.setattr(dataset_mod, "get_rank", lambda rank=rank: rank)
+            prepared = prepare_split_from_state(state, epoch=epoch, training=True)
+            prepared.dataset.prepare_for_dataloader(num_workers=2)
+            loader = torch.utils.data.DataLoader(
+                prepared.dataset,
+                batch_size=5,
+                num_workers=2,
+                multiprocessing_context="fork",
+            )
+            rows: list[str] = []
+            batch_count = 0
+            for batch in loader:
+                batch_count += 1
+                rows.extend(batch["id"])
+            rank_batch_counts.append(batch_count)
+            rank_row_counts.append(len(rows))
+            rank_rows.append(set(rows))
+
+        epoch_rank0_sets.add(frozenset(rank_rows[0]))
+        assert rank_row_counts == [60, 60, 60]
+        assert rank_batch_counts == [12, 12, 12]
+        assert rank_rows[0].isdisjoint(rank_rows[1])
+        assert rank_rows[0].isdisjoint(rank_rows[2])
+        assert rank_rows[1].isdisjoint(rank_rows[2])
+
+    assert len(epoch_rank0_sets) > 1
+
+
+def test_prepare_split_distributed_training_balances_worker_batches(monkeypatch) -> None:
+    if "fork" not in mp.get_all_start_methods():
+        pytest.skip("requires fork multiprocessing context")
+
+    import cr_train.data.dataset as dataset_mod
+
+    row_counts = {"b0": 53, "b1": 2, "b2": 31, "b3": 17, "b4": 44, "b5": 4}
+
+    class RowReader:
+        def load_block(self, cache_key: str):
+            return [
+                {"id": f"{cache_key}:{row_index}"}
+                for row_index in range(row_counts[cache_key])
+            ]
+
+    blocks = tuple(
+        {"cache_key": cache_key, "row_count": row_count}
+        for cache_key, row_count in row_counts.items()
+    )
+    state = dataset_mod.PreparedSplitState(
+        split="train",
+        block_reader=RowReader(),
+        streaming=False,
+        source_stage="load local data",
+        seed=13,
+        requested_rows=sum(row_counts.values()),
+        effective_rows=sum(row_counts.values()),
+        required_blocks=len(blocks),
+        planner_mode="full_split",
+        selected_blocks=blocks,
+        row_counts_by_key=dict(row_counts),
+    )
+    monkeypatch.setattr(dataset_mod, "get_world_size", lambda: 2)
+
+    rank_batch_counts: list[int] = []
+    rank_row_counts: list[int] = []
+    for rank in (0, 1):
+        monkeypatch.setattr(dataset_mod, "get_rank", lambda rank=rank: rank)
+        prepared = prepare_split_from_state(state, epoch=0, training=True)
+        prepared.dataset.prepare_for_dataloader(num_workers=2)
+        loader = torch.utils.data.DataLoader(
+            prepared.dataset,
+            batch_size=4,
+            num_workers=2,
+            multiprocessing_context="fork",
+        )
+        batches = list(loader)
+        rank_batch_counts.append(len(batches))
+        rank_row_counts.append(sum(len(batch["id"]) for batch in batches))
+
+    assert rank_row_counts == [75, 75]
+    assert rank_batch_counts == [20, 20]
+
+
 def test_training_iterator_does_not_block_to_fill_active_pool() -> None:
     class ReadinessBlockReader:
         def __init__(self) -> None:

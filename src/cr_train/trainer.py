@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 import warnings
 from collections.abc import Callable, Mapping
@@ -238,7 +239,8 @@ class Trainer:
                     epochs=self.epochs,
                     train=train_summary,
                     elapsed_sec=train_elapsed_sec,
-                )
+                ),
+                file=sys.stderr,
             )
 
         validation_started_at = time.perf_counter()
@@ -264,7 +266,8 @@ class Trainer:
                     val=validation_summary,
                     train_learning_rates=train_lrs,
                     elapsed_sec=validation_elapsed_sec,
-                )
+                ),
+                file=sys.stderr,
             )
 
         elapsed_sec = time.perf_counter() - step_started_at
@@ -306,7 +309,8 @@ class Trainer:
                     result,
                     learning_rates=test_lrs,
                     elapsed_sec=test_elapsed_sec,
-                )
+                ),
+                file=sys.stderr,
             )
         return result
 
@@ -363,7 +367,7 @@ class Trainer:
         self.current_epoch = int(checkpoint.get("epoch", 0))
         self.global_step = int(checkpoint.get("global_step", 0))
 
-        self._write_config_once()
+        self._write_config_once(reset_metrics=False)
         if is_primary():
             self._write_record(
                 {
@@ -638,7 +642,7 @@ class Trainer:
         self._ensure_output_dir()
         self.metrics_path.write_text("", encoding="utf-8")
 
-    def _write_config_once(self) -> None:
+    def _write_config_once(self, *, reset_metrics: bool = True) -> None:
         if self._config_written:
             return
         self._config_written = True
@@ -646,7 +650,8 @@ class Trainer:
         if not is_primary():
             return
 
-        self._reset_metrics_file()
+        if reset_metrics:
+            self._reset_metrics_file()
         self._write_record(
             {
                 "kind": "config",
@@ -692,7 +697,8 @@ class Trainer:
                 grad_clip_norm=self.grad_clip_norm,
                 mixed_precision=self.mixed_precision,
                 streaming=self.streaming,
-            )
+            ),
+            file=sys.stderr,
         )
 
     def _wrap_model_for_ddp_if_needed(self) -> None:
@@ -829,9 +835,23 @@ class Trainer:
     ) -> int:
         if num_examples <= 0:
             return 0
-        if training and self.drop_last:
-            return num_examples // batch_size
-        return (num_examples + batch_size - 1) // batch_size
+        worker_count = max(1, self.num_workers)
+        if worker_count <= 1:
+            if training and self.drop_last:
+                return num_examples // batch_size
+            return (num_examples + batch_size - 1) // batch_size
+
+        rows_per_worker, remainder = divmod(num_examples, worker_count)
+        total_batches = 0
+        for worker_id in range(worker_count):
+            worker_examples = rows_per_worker + (1 if worker_id < remainder else 0)
+            if worker_examples <= 0:
+                continue
+            if training and self.drop_last:
+                total_batches += worker_examples // batch_size
+            else:
+                total_batches += (worker_examples + batch_size - 1) // batch_size
+        return total_batches
 
     @staticmethod
     def _iter_batches_with_last_flag(batch_iterator):
@@ -1138,6 +1158,7 @@ class Trainer:
             total=total,
             desc=description,
             disable=not is_primary(),
+            file=sys.stderr,
             ncols=resolve_progress_bar_ncols(),
             leave=False,
             colour="#4caf50" if is_training else "#00bcd4",
@@ -1182,7 +1203,7 @@ class Trainer:
         self._write_record(record)
         if not should_print_startup(record):
             return
-        tqdm.write(format_startup_message(record))
+        tqdm.write(format_startup_message(record), file=sys.stderr)
 
     def _prime_loader(
         self,

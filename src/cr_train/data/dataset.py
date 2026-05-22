@@ -5,6 +5,7 @@ import inspect
 import math
 import os
 import random
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,8 @@ from .runtime import (
 from .store import as_bytes
 
 _TRAIN_ACTIVE_BLOCK_COUNT = 8
+_ROW_START_KEY = "_cr_train_row_start"
+_ROW_STOP_KEY = "_cr_train_row_stop"
 
 
 def _call_prepare_blocks(prepare_blocks, blocks: tuple[dict[str, Any], ...], *, worker_count: int) -> None:
@@ -301,18 +304,139 @@ def _shuffle_blocks(
     return [blocks[int(index)] for index in order.tolist()]
 
 
-def _slice_blocks_for_rank(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _block_row_range(block: dict[str, Any], *, row_count: int) -> tuple[int, int]:
+    row_start = int(block.get(_ROW_START_KEY, 0))
+    row_stop = int(block.get(_ROW_STOP_KEY, row_count))
+    if row_start < 0 or row_stop < row_start or row_stop > row_count:
+        raise ValueError(
+            f"invalid block row range for {block.get('cache_key')!r}: "
+            f"{row_start}:{row_stop} outside 0:{row_count}"
+        )
+    return row_start, row_stop
+
+
+def _copy_block_with_row_range(
+    block: dict[str, Any],
+    *,
+    row_start: int,
+    row_stop: int,
+    row_count: int,
+) -> dict[str, Any]:
+    sliced = dict(block)
+    if row_start == 0 and row_stop == row_count:
+        sliced.pop(_ROW_START_KEY, None)
+        sliced.pop(_ROW_STOP_KEY, None)
+        return sliced
+    sliced[_ROW_START_KEY] = row_start
+    sliced[_ROW_STOP_KEY] = row_stop
+    return sliced
+
+
+def _block_row_count_from_state(state: PreparedSplitState, block: dict[str, Any]) -> int:
+    source_row_count = int(state.row_counts_by_key[str(block["cache_key"])])
+    row_start, row_stop = _block_row_range(block, row_count=source_row_count)
+    return row_stop - row_start
+
+
+def _block_row_count_from_metadata(block: dict[str, Any]) -> int | None:
+    if "row_count" not in block:
+        return None
+    source_row_count = int(block["row_count"])
+    row_start, row_stop = _block_row_range(block, row_count=source_row_count)
+    return row_stop - row_start
+
+
+def _slice_blocks_by_row_offsets(
+    blocks: list[dict[str, Any]],
+    *,
+    row_start: int,
+    row_stop: int,
+    source_row_count_for_block: Callable[[dict[str, Any]], int],
+) -> list[dict[str, Any]]:
+    sliced_blocks: list[dict[str, Any]] = []
+    row_offset = 0
+    for block in blocks:
+        source_row_count = source_row_count_for_block(block)
+        source_start, source_stop = _block_row_range(block, row_count=source_row_count)
+        row_count = source_stop - source_start
+        block_start = row_offset
+        block_stop = block_start + row_count
+        row_offset = block_stop
+
+        overlap_start = max(row_start, block_start)
+        overlap_stop = min(row_stop, block_stop)
+        if overlap_start >= overlap_stop:
+            continue
+
+        sliced_blocks.append(
+            _copy_block_with_row_range(
+                block,
+                row_start=source_start + (overlap_start - block_start),
+                row_stop=source_start + (overlap_stop - block_start),
+                row_count=source_row_count,
+            )
+        )
+    return sliced_blocks
+
+
+def _slice_blocks_for_rank(
+    state: PreparedSplitState,
+    blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     world_size = get_world_size()
     if world_size <= 1:
         return list(blocks)
+
+    total_rows = _count_rows_from_state(state, blocks)
+    rows_per_rank = total_rows // world_size
+    if rows_per_rank <= 0:
+        raise RuntimeError(
+            f"split {state.split!r} has {total_rows} rows, which is too small for "
+            f"world_size={world_size}"
+        )
+
     rank = get_rank()
-    return [block for i, block in enumerate(blocks) if i % world_size == rank]
+    rank_start = rank * rows_per_rank
+    rank_stop = rank_start + rows_per_rank
+    return _slice_blocks_by_row_offsets(
+        blocks,
+        row_start=rank_start,
+        row_stop=rank_stop,
+        source_row_count_for_block=lambda block: int(state.row_counts_by_key[str(block["cache_key"])]),
+    )
+
+
+def _slice_blocks_for_worker(
+    blocks: list[dict[str, Any]],
+    *,
+    worker_id: int,
+    worker_count: int,
+) -> list[dict[str, Any]]:
+    if worker_count <= 1:
+        return list(blocks)
+
+    total_rows = 0
+    for block in blocks:
+        row_count = _block_row_count_from_metadata(block)
+        if row_count is None:
+            return [block for index, block in enumerate(blocks) if index % worker_count == worker_id]
+        total_rows += row_count
+
+    rows_per_worker, remainder = divmod(total_rows, worker_count)
+    worker_start = worker_id * rows_per_worker + min(worker_id, remainder)
+    worker_rows = rows_per_worker + (1 if worker_id < remainder else 0)
+    return _slice_blocks_by_row_offsets(
+        blocks,
+        row_start=worker_start,
+        row_stop=worker_start + worker_rows,
+        source_row_count_for_block=lambda block: int(block["row_count"]),
+    )
 
 
 def _count_rows_from_state(state: PreparedSplitState, blocks: list[dict[str, Any]]) -> int:
     total = 0
     for block in blocks:
-        total += int(state.row_counts_by_key[str(block["cache_key"])])
+        total += _block_row_count_from_state(state, block)
     return total
 
 
@@ -353,7 +477,8 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
     ) -> _ActiveBlockCursor:
         cache_key = str(block["cache_key"])
         rows = self.block_reader.load_block(cache_key)
-        indices = list(range(len(rows)))
+        row_start, row_stop = _block_row_range(block, row_count=len(rows))
+        indices = list(range(row_start, row_stop))
         if shuffle_rows and len(indices) > 1:
             row_rng = random.Random(
                 _derive_block_seed(
@@ -371,7 +496,11 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
 
     def _load_block_rows(self, *, block: dict[str, Any]):
         cache_key = str(block["cache_key"])
-        return self.block_reader.load_block(cache_key)
+        rows = self.block_reader.load_block(cache_key)
+        row_start, row_stop = _block_row_range(block, row_count=len(rows))
+        if row_start == 0 and row_stop == len(rows):
+            return rows
+        return rows[row_start:row_stop]
 
     def _prefetch_blocks(self) -> bool:
         return bool(getattr(self.block_reader, "prefetch_blocks", False))
@@ -558,7 +687,11 @@ class BlockIterableDataset(TorchIterableDataset[dict[str, Any]]):
             self._prepared_for_dataloader = True
         worker_id = worker_info.id if worker_info is not None else 0
         worker_count = worker_info.num_workers if worker_info is not None else 1
-        blocks = [block for index, block in enumerate(self.blocks) if index % worker_count == worker_id]
+        blocks = _slice_blocks_for_worker(
+            list(self.blocks),
+            worker_id=worker_id,
+            worker_count=worker_count,
+        )
 
         if self.training:
             yield from self._iter_training_rows(blocks=blocks, worker_id=worker_id)
@@ -745,7 +878,7 @@ def prepare_split_from_state(
     """Build a PreparedSplit from a pre-resolved split state."""
     selected_blocks = list(state.selected_blocks)
     ordered_blocks = _shuffle_blocks(selected_blocks, seed=state.seed, split=state.split, epoch=epoch) if training else selected_blocks
-    rank_blocks = _slice_blocks_for_rank(ordered_blocks)
+    rank_blocks = _slice_blocks_for_rank(state, ordered_blocks)
     num_examples = _count_rows_from_state(state, rank_blocks)
     dataset = run_startup_stage(
         startup_callback,

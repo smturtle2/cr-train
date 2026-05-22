@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import re
+import sys
 from collections import defaultdict
 from collections.abc import Mapping
 from pathlib import Path
@@ -455,6 +456,7 @@ class FakeTqdm:
         self.total = kwargs.get("total")
         self.desc = kwargs.get("desc")
         self.disable = kwargs.get("disable", False)
+        self.file = kwargs.get("file")
         self.ncols = kwargs.get("ncols")
         self.updates: list[int] = []
         self.postfixes: list[str] = []
@@ -462,7 +464,8 @@ class FakeTqdm:
         FakeTqdm.instances.append(self)
 
     @staticmethod
-    def write(message: str) -> None:
+    def write(message: str, *args, **kwargs) -> None:
+        del args, kwargs
         FakeTqdm.writes.append(message)
 
     def update(self, value: int) -> None:
@@ -787,6 +790,7 @@ def test_trainer_step_and_test_with_local_dataset_warmup(monkeypatch, tmp_path: 
     assert "mae" in test_summary["metrics"]
     assert epoch_summary["train"]["num_batches"] == (2 * BLOCK_SIZE) // 8
     assert "batches_per_sec" in epoch_summary["train"]
+    assert all(instance.file is sys.stderr for instance in batch_bars)
     assert all(record["kind"] != "checkpoint" for record in metrics_records)
     assert "old-record" not in metrics_path.read_text(encoding="utf-8")
     assert train_record["lr"] == [1e-3]
@@ -1320,6 +1324,27 @@ def test_trainer_uses_actual_batch_stream_for_optimizer_steps(
     assert summary["num_batches"] == 4
     assert trainer.global_step == 4
     assert optimizer.step_calls == 4
+
+
+def test_trainer_infers_iterable_worker_batches(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 2)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        batch_size=4,
+        output_dir=tmp_path / "run",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
+    )
+
+    assert trainer._infer_total_batches(
+        num_examples=75,
+        batch_size=4,
+        training=True,
+    ) == 20
 
 
 def test_trainer_accumulated_updates_match_equivalent_larger_batches(
@@ -1877,6 +1902,56 @@ def test_trainer_save_and_load_checkpoint_round_trip(monkeypatch, tmp_path: Path
         "checkpoint_save",
         "checkpoint_load",
     ]
+
+
+def test_trainer_load_checkpoint_appends_metrics_without_resetting_jsonl(
+    monkeypatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "run"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "metrics.jsonl"
+    metrics_path.write_text('{"kind": "previous"}\n', encoding="utf-8")
+    FakeTqdm.instances.clear()
+    FakeTqdm.writes.clear()
+    monkeypatch.setattr("cr_train.trainer.tqdm", FakeTqdm)
+    monkeypatch.setattr("cr_train.trainer.resolve_num_workers", lambda _value: 0)
+
+    checkpoint_model = TinyModel()
+    checkpoint_optimizer = torch.optim.AdamW(checkpoint_model.parameters(), lr=1e-3)
+    checkpoint_path = output_dir / "epoch-0001.pt"
+    torch.save(
+        {
+            "epoch": 1,
+            "global_step": 7,
+            "model": checkpoint_model.state_dict(),
+            "optimizer": checkpoint_optimizer.state_dict(),
+        },
+        checkpoint_path,
+    )
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=output_dir,
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
+    )
+
+    trainer.load_checkpoint(checkpoint_path)
+    metrics_text = metrics_path.read_text(encoding="utf-8")
+    metrics_records = [json.loads(line) for line in metrics_text.splitlines()]
+
+    assert metrics_records[0] == {"kind": "previous"}
+    assert [record["kind"] for record in metrics_records[1:]] == [
+        "config",
+        "checkpoint_load",
+    ]
+    assert trainer.current_epoch == 1
+    assert trainer.global_step == 7
+    assert "\r" not in metrics_text
+    assert "\x1b[" not in metrics_text
 
 
 def test_trainer_load_checkpoint_keeps_scheduler_state_when_legacy_checkpoint_has_no_scheduler(
