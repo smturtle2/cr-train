@@ -28,7 +28,12 @@ from .data.dataset import (
     resolve_prepared_split_state,
     seed_everything,
 )
-from .data.runtime import is_distributed, is_primary, run_startup_stage
+from .data.runtime import (
+    install_shutdown_signal_handlers,
+    is_distributed,
+    is_primary,
+    run_startup_stage,
+)
 from .progress import resolve_progress_bar_ncols
 from .trainer_reporting import (
     format_config_banner,
@@ -119,6 +124,7 @@ class Trainer:
         grad_clip_norm: float | None = 1.0,
         mixed_precision: MixedPrecision = "off",
     ) -> None:
+        install_shutdown_signal_handlers()
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
         if not isinstance(optimizer, torch.optim.Optimizer):

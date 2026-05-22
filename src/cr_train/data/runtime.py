@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import signal
+import threading
 import time
 from typing import Any
 
@@ -69,6 +71,22 @@ def _has_distributed_env() -> bool:
     return _env_int("RANK") is not None and _env_int("WORLD_SIZE") is not None
 
 
+def _shutdown_from_signal(signum: int, _frame: Any) -> None:
+    signal.signal(signum, signal.SIG_DFL)
+    raise SystemExit(128 + signum)
+
+
+def install_shutdown_signal_handlers() -> None:
+    if threading.current_thread() is not threading.main_thread():
+        return
+    current = signal.getsignal(signal.SIGTERM)
+    if current in (signal.SIG_IGN, _shutdown_from_signal):
+        return
+    if current != signal.SIG_DFL:
+        return
+    signal.signal(signal.SIGTERM, _shutdown_from_signal)
+
+
 def _resolve_local_cuda_device() -> torch.device:
     if not torch.cuda.is_available():
         return torch.device("cpu")
@@ -90,6 +108,7 @@ def _resolve_local_cuda_device() -> torch.device:
 
 def setup_distributed_from_env() -> torch.device:
     """Initialize torch.distributed from torchrun env vars and return the local device."""
+    install_shutdown_signal_handlers()
     device = _resolve_local_cuda_device()
     if not _has_distributed_env():
         return device
@@ -133,6 +152,7 @@ __all__ = [
     "emit_startup_event",
     "get_rank",
     "get_world_size",
+    "install_shutdown_signal_handlers",
     "is_distributed",
     "is_primary",
     "run_startup_stage",

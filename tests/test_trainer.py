@@ -495,17 +495,24 @@ def _elapsed_column_start(text: str) -> int:
 def test_top_level_package_exports_trainer_as_primary_entry_point() -> None:
     package = importlib.import_module("cr_train")
     namespace: dict[str, object] = {}
-    exec("from cr_train import Trainer, cleanup_distributed, is_primary, setup_distributed_from_env\n", namespace)
+    exec(
+        "from cr_train import ("
+        "Trainer, cleanup_distributed, install_shutdown_signal_handlers, "
+        "is_primary, setup_distributed_from_env)\n",
+        namespace,
+    )
 
     assert package.__all__ == [
         "Trainer",
         "cleanup_distributed",
+        "install_shutdown_signal_handlers",
         "is_primary",
         "setup_distributed_from_env",
     ]
     assert package.Trainer is Trainer
     assert namespace["Trainer"] is Trainer
     assert callable(namespace["cleanup_distributed"])
+    assert callable(namespace["install_shutdown_signal_handlers"])
     assert callable(namespace["is_primary"])
     assert callable(namespace["setup_distributed_from_env"])
 

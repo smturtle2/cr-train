@@ -1079,6 +1079,55 @@ def test_worker_staging_runtime_keeps_shared_block_until_all_workers_release(
     assert cleared == ["shared"]
 
 
+def test_parent_death_signal_terminates_staging_child_if_parent_changed(
+    monkeypatch,
+) -> None:
+    import cr_train.data.hf_v2 as hf_v2_mod
+
+    calls: list[tuple[int, int, int, int, int]] = []
+    killed: list[tuple[int, int]] = []
+
+    class FakeLibc:
+        def prctl(self, *args) -> int:
+            calls.append(args)
+            return 0
+
+    monkeypatch.setattr(hf_v2_mod.os, "name", "posix")
+    monkeypatch.setattr(hf_v2_mod.os, "getppid", lambda: 123)
+    monkeypatch.setattr(hf_v2_mod.os, "getpid", lambda: 456)
+    monkeypatch.setattr(hf_v2_mod.os, "kill", lambda pid, signum: killed.append((pid, signum)))
+
+    hf_v2_mod._arm_parent_death_signal(999, libc=FakeLibc())
+
+    assert calls == [(1, hf_v2_mod.signal.SIGTERM, 0, 0, 0)]
+    assert killed == [(456, hf_v2_mod.signal.SIGTERM)]
+
+
+def test_staging_downloader_arms_parent_death_signal(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.hf_v2 as hf_v2_mod
+
+    armed_parent_pids: list[int | None] = []
+    monkeypatch.setattr(
+        hf_v2_mod,
+        "_arm_parent_death_signal",
+        lambda parent_pid: armed_parent_pids.append(parent_pid),
+    )
+
+    hf_v2_mod._run_hf_v2_staging_downloader(
+        split="train",
+        staging_source_root=str(tmp_path),
+        block_paths_by_key={},
+        worker_queues=(),
+        worker_quotas=(),
+        release_queue=queue.Queue(),
+        max_staged_blocks=1,
+        download_workers=1,
+        parent_pid=123,
+    )
+
+    assert armed_parent_pids == [123]
+
+
 def test_worker_owned_downloader_refills_released_worker_slot(monkeypatch, tmp_path: Path) -> None:
     import cr_train.data.hf_v2 as hf_v2_mod
 

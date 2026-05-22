@@ -4,6 +4,7 @@ import json
 import multiprocessing as mp
 import os
 import queue as queue_mod
+import signal
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -608,6 +609,23 @@ def _raise_if_staging_error(staging_source_root: Path, split: str) -> None:
         raise RuntimeError(f"HF v2 streaming downloader failed: {message}")
 
 
+def _arm_parent_death_signal(parent_pid: int | None, *, libc: Any | None = None) -> None:
+    if parent_pid is None or os.name != "posix":
+        return
+    try:
+        if libc is None:
+            import ctypes
+
+            libc = ctypes.CDLL(None)
+        prctl = getattr(libc, "prctl", None)
+        if prctl is None or prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+            return
+    except Exception:
+        return
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
 @dataclass(slots=True)
 class _WorkerStagingRuntime:
     split: str
@@ -773,7 +791,9 @@ def _run_hf_v2_staging_downloader(
     release_queue: Any,
     max_staged_blocks: int,
     download_workers: int,
+    parent_pid: int | None = None,
 ) -> None:
+    _arm_parent_death_signal(parent_pid)
     staging_root_path = Path(staging_source_root)
     try:
         runtime = _WorkerStagingRuntime(
@@ -894,6 +914,7 @@ class HFV2StagedBlockReader:
                 "release_queue": self._release_queue,
                 "max_staged_blocks": staging_plan.effective_max_staged_blocks,
                 "download_workers": self.download_workers,
+                "parent_pid": os.getpid(),
             },
             daemon=True,
         )

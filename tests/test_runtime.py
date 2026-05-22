@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from cr_train.data import runtime
 
@@ -80,3 +81,24 @@ def test_cleanup_distributed_destroys_initialized_group(monkeypatch) -> None:
     runtime.cleanup_distributed()
 
     assert destroyed == [True]
+
+
+def test_install_shutdown_signal_handlers_converts_sigterm_to_system_exit(monkeypatch) -> None:
+    main_thread = object()
+    handlers: dict[int, object] = {}
+    monkeypatch.setattr(runtime.threading, "current_thread", lambda: main_thread)
+    monkeypatch.setattr(runtime.threading, "main_thread", lambda: main_thread)
+    monkeypatch.setattr(runtime.signal, "getsignal", lambda _signum: runtime.signal.SIG_DFL)
+    monkeypatch.setattr(
+        runtime.signal,
+        "signal",
+        lambda signum, handler: handlers.setdefault(int(signum), handler),
+    )
+
+    runtime.install_shutdown_signal_handlers()
+
+    handler = handlers[int(runtime.signal.SIGTERM)]
+    with pytest.raises(SystemExit) as exc_info:
+        handler(runtime.signal.SIGTERM, None)
+
+    assert exc_info.value.code == 128 + int(runtime.signal.SIGTERM)
