@@ -263,6 +263,7 @@ def format_config_banner(
     seed: int,
     device: torch.device,
     num_workers: int,
+    worker_world_size: int,
     multiprocessing_context: str | None,
     scheduler_name: str | None,
     scheduler_timing: str,
@@ -278,12 +279,15 @@ def format_config_banner(
         f"val {_BOLD}{_samples_label(max_val_samples)}{_RESET}  "
         f"test {_BOLD}{_samples_label(max_test_samples)}{_RESET}"
     )
+    worker_label = f"dataloader workers {num_workers}"
+    if worker_world_size > 1:
+        worker_label = f"{worker_label}/rank x {worker_world_size}"
     config_parts = [
         f"batch {batch_size}",
         f"accum {accum_steps}",
         f"epochs {epochs}",
         f"seed {seed}",
-        f"dataloader workers {num_workers}",
+        worker_label,
     ]
     if multiprocessing_context is not None:
         config_parts.append(f"mp {multiprocessing_context}")

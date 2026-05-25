@@ -134,6 +134,15 @@ def parse_positive_int(value: str) -> int:
     return parsed
 
 
+def parse_num_workers(value: str) -> int | str:
+    if value == "auto":
+        return value
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("num_workers must be zero or greater, or 'auto'")
+    return parsed
+
+
 def parse_positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
@@ -178,6 +187,12 @@ def parse_args() -> argparse.Namespace:
         help="Seed controlling block selection and epoch-wise block/row shuffle order.",
     )
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--num-workers",
+        type=parse_num_workers,
+        default="auto",
+        help="Job-level PyTorch DataLoader worker budget.",
+    )
     parser.add_argument(
         "--accum-steps",
         type=parse_positive_int,
@@ -331,6 +346,7 @@ def main() -> None:
             output_dir=args.output_dir,
             streaming=args.streaming,
             dataset_dir=args.dataset_dir,
+            num_workers=args.num_workers,
             train_crop_size=args.train_crop_size,
             train_random_flip=args.train_random_flip,
             train_random_rot90=args.train_random_rot90,

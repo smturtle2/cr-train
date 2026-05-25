@@ -28,6 +28,7 @@ from .data.dataset import (
     seed_everything,
 )
 from .data.runtime import (
+    get_world_size,
     install_shutdown_signal_handlers,
     is_distributed,
     is_primary,
@@ -181,6 +182,8 @@ class Trainer:
         self.grad_clip_norm = grad_clip_norm
         self.streaming = bool(streaming)
 
+        self.requested_num_workers = num_workers
+        self.worker_world_size = get_world_size()
         self.num_workers = resolve_num_workers(num_workers)
         self.output_dir = Path(output_dir)
         self.metrics_path = self.output_dir / "metrics.jsonl"
@@ -676,8 +679,11 @@ class Trainer:
                 "batch_size": self.batch_size,
                 "accum_steps": self.accum_steps,
                 "epochs": self.epochs,
+                "requested_num_workers": self.requested_num_workers,
                 "num_workers": self.num_workers,
                 "dataloader_workers": self.num_workers,
+                "effective_num_workers_per_rank": self.num_workers,
+                "worker_world_size": self.worker_world_size,
                 "multiprocessing_context": self.multiprocessing_context,
                 "scheduler": self._scheduler_name(),
                 "scheduler_timing": self.scheduler_timing,
@@ -703,6 +709,7 @@ class Trainer:
                 seed=self.seed,
                 device=self.device,
                 num_workers=self.num_workers,
+                worker_world_size=self.worker_world_size,
                 multiprocessing_context=self.multiprocessing_context,
                 scheduler_name=self._scheduler_name(),
                 scheduler_timing=self.scheduler_timing,

@@ -210,7 +210,7 @@ raw draw order, 최종 선택 블록 인덱스, 그리고 선택(`■`) vs. 건�
 | `cache_src` | `"local" \| "B2"` | `"local"` | 캐시 소스. `"local"`은 로컬 캐시를 사용하고, `"B2"`는 설정된 B2 prefix에서 기존 B2 캐시 객체를 on-demand로 읽습니다. |
 | `b2_staging_dir` | `str \| Path \| None` | `None` | B2 모드에서 DataLoader worker가 읽기 전에 block을 받아둘 로컬 staging 디렉토리(`None` = `~/.cache/cr-train/b2-staging`). |
 | `b2_staging_max_blocks` | `int` | `20` | B2 staging buffer 크기(block 수). worker 수가 아니며, `Trainer`는 DataLoader worker가 막히지 않도록 최소 `num_workers + 1`까지 올립니다. |
-| `num_workers` | `int \| "auto"` | `"auto"` | PyTorch DataLoader worker process 수. `"auto"`는 `min(4, max(1, os.cpu_count() // 4))`로 해석되며, 고정 16개인 B2 download worker와 별개입니다. |
+| `num_workers` | `int \| "auto"` | `"auto"` | 전체 job 기준 PyTorch DataLoader worker 예산. `"auto"`는 `min(16, max(1, os.cpu_count() // 3))`로 해석되며, DDP에서는 이 예산을 rank별로 나누고 0이 아닌 예산은 rank당 최소 1개 worker를 둡니다. |
 | `multiprocessing_context` | `str \| None` | `None` | worker 시작 방식을 명시합니다. CUDA에서 `num_workers > 0`이면 `Trainer`가 더 안전한 `"spawn"`을 기본값으로 사용합니다. |
 | `train_crop_size` | `int \| None` | `128` | collate 직전 train batch에 이 크기의 random square crop을 적용. |
 | `train_random_flip` | `bool` | `True` | train batch에 vertical/horizontal flip을 독립적으로 무작위 적용. |

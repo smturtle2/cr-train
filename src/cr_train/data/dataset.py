@@ -262,14 +262,20 @@ class _BatchCollateFn:
         return batch
 
 
-def resolve_num_workers(num_workers: int | str) -> int:
-    """Resolve DataLoader worker count from an int or ``'auto'``."""
+def resolve_num_workers(num_workers: int | str, *, world_size: int | None = None) -> int:
+    """Resolve rank-local DataLoader worker count from a job-level budget."""
     if isinstance(num_workers, int):
-        return max(0, num_workers)
-    if num_workers != "auto":
+        worker_budget = max(0, num_workers)
+    elif num_workers == "auto":
+        cpu_count = os.cpu_count() or 1
+        worker_budget = min(16, max(1, cpu_count // 3))
+    else:
         raise ValueError("num_workers must be an integer or 'auto'")
-    cpu_count = os.cpu_count() or 1
-    return min(16, max(1, cpu_count // 3))
+
+    resolved_world_size = max(1, int(world_size if world_size is not None else get_world_size()))
+    if worker_budget == 0 or resolved_world_size <= 1:
+        return worker_budget
+    return max(1, worker_budget // resolved_world_size)
 
 
 def seed_everything(seed: int) -> None:

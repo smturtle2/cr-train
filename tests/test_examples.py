@@ -20,6 +20,8 @@ def test_training_example_loads_without_running_main() -> None:
     assert namespace["parse_max_samples"]("128") == 128
     assert namespace["parse_non_negative_int"]("0") == 0
     assert namespace["parse_positive_int"]("4") == 4
+    assert namespace["parse_num_workers"]("auto") == "auto"
+    assert namespace["parse_num_workers"]("4") == 4
     assert namespace["parse_positive_float"]("0.5") == 0.5
 
 
@@ -50,6 +52,8 @@ def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -
             "0.75",
             "--mixed-precision",
             "bf16",
+            "--num-workers",
+            "6",
         ],
     )
     args = namespace["parse_args"]()
@@ -64,6 +68,7 @@ def test_training_example_parser_accepts_train_augmentation_flags(monkeypatch) -
     assert args.min_lr_scale == 0.2
     assert args.grad_clip_norm == 0.75
     assert args.mixed_precision == "bf16"
+    assert args.num_workers == 6
 
 
 def test_training_example_builds_custom_scheduler() -> None:
@@ -142,6 +147,8 @@ def test_training_example_main_forwards_scheduler_timing(monkeypatch, tmp_path: 
             "1.25",
             "--mixed-precision",
             "bf16",
+            "--num-workers",
+            "6",
         ],
     )
     main = namespace["main"]
@@ -153,6 +160,7 @@ def test_training_example_main_forwards_scheduler_timing(monkeypatch, tmp_path: 
     assert trainer_kwargs["scheduler_timing"] == "after_optimizer_step"
     assert trainer_kwargs["grad_clip_norm"] == 1.25
     assert trainer_kwargs["mixed_precision"] == "bf16"
+    assert trainer_kwargs["num_workers"] == 6
     assert events == ["step", "test", "close", "cleanup"]
 
 

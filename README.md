@@ -208,7 +208,7 @@ Persistence and inference are explicit: call `save_checkpoint()`, `load_checkpoi
 | `output_dir` | `str \| Path` | `"runs/default"` | Directory for `metrics.jsonl` and the default `save_checkpoint()` / `save_weights()` output files. |
 | `streaming` | `bool` | `True` | Stream compressed HF v2 blocks through a shared staging pipeline. Consumed staged blocks are deleted automatically. |
 | `dataset_dir` | `str \| Path \| None` | `None` | Persistent local HF v2 dataset directory used when `streaming=False` (`None` = `~/.cache/cr-train/sen12mscr-v2`). Complete full splits are trusted without revalidation; partial/incomplete local splits verify selected block headers and refill missing or bad blocks. |
-| `num_workers` | `int \| "auto"` | `"auto"` | PyTorch DataLoader worker process count. `"auto"` resolves to `min(16, max(1, os.cpu_count() // 3))`. |
+| `num_workers` | `int \| "auto"` | `"auto"` | Job-level PyTorch DataLoader worker budget. `"auto"` resolves to `min(16, max(1, os.cpu_count() // 3))`; under DDP this budget is divided across ranks with at least one worker per rank when the budget is nonzero. |
 | `multiprocessing_context` | `str \| None` | `None` | Explicit worker start method. When `num_workers > 0` on CUDA, `Trainer` defaults this to `"spawn"` for safer worker startup. |
 | `train_crop_size` | `int \| None` | `128` | Apply random square crops of this size to train batches before they leave the collate step. |
 | `train_random_flip` | `bool` | `True` | Apply independent random vertical/horizontal flips to train batches. |

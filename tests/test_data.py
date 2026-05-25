@@ -26,6 +26,7 @@ from cr_train.data import (
     build_dataloader,
     decode_row,
     plan_sample,
+    resolve_num_workers,
     trace_plan_sample,
 )
 from cr_train.data.dataset import (
@@ -322,6 +323,21 @@ def test_data_package_public_surface_is_minimal_and_explicit() -> None:
         "trace_plan_sample",
     }
     assert all(hasattr(data_mod, name) for name in data_mod.__all__)
+
+
+def test_resolve_num_workers_divides_job_budget_across_ddp_ranks() -> None:
+    assert resolve_num_workers(16, world_size=4) == 4
+    assert resolve_num_workers(2, world_size=4) == 1
+    assert resolve_num_workers(0, world_size=4) == 0
+    assert resolve_num_workers(3, world_size=1) == 3
+
+
+def test_resolve_auto_num_workers_uses_job_budget_before_ddp_split(monkeypatch) -> None:
+    import cr_train.data.dataset as dataset_mod
+
+    monkeypatch.setattr(dataset_mod.os, "cpu_count", lambda: 48)
+
+    assert resolve_num_workers("auto", world_size=4) == 4
 
 
 def test_decode_row_converts_to_chw_and_normalizes() -> None:

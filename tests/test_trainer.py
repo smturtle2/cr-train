@@ -2611,6 +2611,29 @@ def test_trainer_resolves_spawn_context_on_cuda_workers(monkeypatch, tmp_path: P
     assert trainer.multiprocessing_context == "spawn"
 
 
+def test_trainer_treats_num_workers_as_job_level_ddp_budget(monkeypatch, tmp_path: Path) -> None:
+    import cr_train.data.dataset as dataset_mod
+    import cr_train.trainer as trainer_mod
+
+    monkeypatch.setattr(dataset_mod, "get_world_size", lambda: 4)
+    monkeypatch.setattr(trainer_mod, "get_world_size", lambda: 4)
+
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=1e-3),
+        loss_fn,
+        output_dir=tmp_path / "run",
+        dataset_dir=tmp_path / "cache",
+        streaming=False,
+        num_workers=16,
+    )
+
+    assert trainer.requested_num_workers == 16
+    assert trainer.worker_world_size == 4
+    assert trainer.num_workers == 4
+
+
 def test_trainer_respects_explicit_multiprocessing_context(monkeypatch, tmp_path: Path) -> None:
     import cr_train.trainer as trainer_mod
 
