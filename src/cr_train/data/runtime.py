@@ -134,6 +134,33 @@ def is_distributed() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
+def _scalar_reduce_device(device: torch.device | None) -> torch.device:
+    backend = str(dist.get_backend()).lower()
+    if "nccl" not in backend:
+        return torch.device("cpu")
+    if device is not None and device.type == "cuda":
+        return device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    raise RuntimeError("NCCL scalar reductions require a CUDA device")
+
+
+def sum_float_across_processes(value: float, *, device: torch.device | None = None) -> float:
+    if not is_distributed():
+        return value
+    tensor = torch.tensor(float(value), dtype=torch.float64, device=_scalar_reduce_device(device))
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item())
+
+
+def sum_int_across_processes(value: int, *, device: torch.device | None = None) -> int:
+    if not is_distributed():
+        return value
+    tensor = torch.tensor(int(value), dtype=torch.long, device=_scalar_reduce_device(device))
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return int(tensor.item())
+
+
 def get_rank() -> int:
     return dist.get_rank() if is_distributed() else 0
 
@@ -157,4 +184,6 @@ __all__ = [
     "is_primary",
     "run_startup_stage",
     "setup_distributed_from_env",
+    "sum_float_across_processes",
+    "sum_int_across_processes",
 ]

@@ -33,6 +33,8 @@ from .data.runtime import (
     is_distributed,
     is_primary,
     run_startup_stage,
+    sum_float_across_processes,
+    sum_int_across_processes,
 )
 from .progress import resolve_progress_bar_ncols
 from .trainer_reporting import (
@@ -1127,7 +1129,7 @@ class Trainer:
                         start_time=start_time,
                         reduce_int=self._reduce_int,
                         reduce_sum=self._reduce_sum,
-                        distributed=False,
+                        distributed=is_distributed(),
                         learning_rates=self._get_learning_rates(),
                     )
         finally:
@@ -1140,7 +1142,7 @@ class Trainer:
             include_speed=True,
             reduce_int=self._reduce_int,
             reduce_sum=self._reduce_sum,
-            distributed=False,
+            distributed=is_distributed(),
         )
         if summary["num_samples"] == 0:
             raise RuntimeError("training epoch produced no batches")
@@ -1186,7 +1188,7 @@ class Trainer:
                         start_time=start_time,
                         reduce_int=self._reduce_int,
                         reduce_sum=self._reduce_sum,
-                        distributed=False,
+                        distributed=is_distributed(),
                     )
         finally:
             self._close_batch_iterator(batch_iterator)
@@ -1198,7 +1200,7 @@ class Trainer:
             include_speed=False,
             reduce_int=self._reduce_int,
             reduce_sum=self._reduce_sum,
-            distributed=False,
+            distributed=is_distributed(),
         )
         if summary["num_samples"] == 0:
             raise RuntimeError(f"{split} evaluation produced no batches")
@@ -1224,10 +1226,10 @@ class Trainer:
             sampler.set_epoch(epoch_index)
 
     def _reduce_sum(self, value: float) -> float:
-        return value
+        return sum_float_across_processes(value, device=self.device)
 
     def _reduce_int(self, value: int) -> int:
-        return value
+        return sum_int_across_processes(value, device=self.device)
 
     def _write_record(self, record: Mapping[str, Any]) -> None:
         self._ensure_output_dir()

@@ -11,7 +11,7 @@ import pytest
 import torch.distributed as dist
 
 
-def test_trainer_runs_real_two_process_ddp_without_trainer_collectives(tmp_path: Path) -> None:
+def test_trainer_runs_real_two_process_ddp_with_global_metric_reductions(tmp_path: Path) -> None:
     if not dist.is_available():
         pytest.skip("torch.distributed is not available")
 
@@ -35,6 +35,32 @@ def test_trainer_runs_real_two_process_ddp_without_trainer_collectives(tmp_path:
             import cr_train.trainer as trainer_mod
 
             torch.cuda.is_available = lambda: False
+
+
+            class FakeTqdm:
+                instances = []
+                writes = []
+
+                def __init__(self, *args, **kwargs) -> None:
+                    self.desc = kwargs.get("desc")
+                    self.disable = kwargs.get("disable", False)
+                    self.postfixes = []
+                    self.updates = []
+                    FakeTqdm.instances.append(self)
+
+                @staticmethod
+                def write(message, *args, **kwargs) -> None:
+                    del args, kwargs
+                    FakeTqdm.writes.append(str(message))
+
+                def update(self, value: int) -> None:
+                    self.updates.append(value)
+
+                def set_postfix_str(self, text: str) -> None:
+                    self.postfixes.append(text)
+
+                def close(self) -> None:
+                    return None
 
 
             class ToyDataset(Dataset):
@@ -80,9 +106,11 @@ def test_trainer_runs_real_two_process_ddp_without_trainer_collectives(tmp_path:
 
             trainer_mod.Trainer._ensure_training_startup_data = lambda self: None
             trainer_mod.Trainer._build_loader = fake_build_loader
+            trainer_mod.tqdm = FakeTqdm
 
             rank = int(os.environ["RANK"])
             out_dir = Path(os.environ["CR_TRAIN_TEST_OUT"])
+            out_dir.mkdir(parents=True, exist_ok=True)
             trainer = None
             try:
                 device = setup_distributed_from_env()
@@ -104,10 +132,26 @@ def test_trainer_runs_real_two_process_ddp_without_trainer_collectives(tmp_path:
                     "rank": rank,
                     "train_samples": step_result["train"]["num_samples"],
                     "train_batches": step_result["train"]["num_batches"],
+                    "train_loss": step_result["train"]["loss"],
+                    "train_mae": step_result["train"]["metrics"]["mae"],
                     "val_samples": step_result["val"]["num_samples"],
                     "val_batches": step_result["val"]["num_batches"],
+                    "val_loss": step_result["val"]["loss"],
+                    "val_mae": step_result["val"]["metrics"]["mae"],
                     "test_samples": test_result["num_samples"],
                     "test_batches": test_result["num_batches"],
+                    "test_loss": test_result["loss"],
+                    "test_mae": test_result["metrics"]["mae"],
+                    "progress": [
+                        {
+                            "desc": str(instance.desc),
+                            "disable": instance.disable,
+                            "postfixes": instance.postfixes,
+                            "updates": instance.updates,
+                        }
+                        for instance in FakeTqdm.instances
+                        if str(instance.desc).startswith(("train", "val", "test"))
+                    ],
                 }
                 (out_dir / f"rank{rank}.json").write_text(json.dumps(payload), encoding="utf-8")
             finally:
@@ -146,23 +190,47 @@ def test_trainer_runs_real_two_process_ddp_without_trainer_collectives(tmp_path:
         json.loads((output_dir / f"rank{rank}.json").read_text(encoding="utf-8"))
         for rank in range(2)
     ]
-    assert records == [
-        {
-            "rank": 0,
-            "train_samples": 4,
-            "train_batches": 2,
-            "val_samples": 4,
-            "val_batches": 2,
-            "test_samples": 4,
-            "test_batches": 2,
-        },
-        {
-            "rank": 1,
-            "train_samples": 4,
-            "train_batches": 2,
-            "val_samples": 4,
-            "val_batches": 2,
-            "test_samples": 4,
-            "test_batches": 2,
-        },
+    records_by_rank = {record["rank"]: record for record in records}
+    for record in records:
+        assert record["train_samples"] == 8
+        assert record["train_batches"] == 4
+        assert record["train_loss"] == pytest.approx(6.375)
+        assert record["train_mae"] == pytest.approx(2.25)
+        assert record["val_samples"] == 8
+        assert record["val_batches"] == 4
+        assert record["val_loss"] == pytest.approx(53.875)
+        assert record["val_mae"] == pytest.approx(7.25)
+        assert record["test_samples"] == 8
+        assert record["test_batches"] == 4
+        assert record["test_loss"] == pytest.approx(151.375)
+        assert record["test_mae"] == pytest.approx(12.25)
+
+    rank0_progress = {entry["desc"]: entry for entry in records_by_rank[0]["progress"]}
+    assert rank0_progress["train 1/1"]["updates"] == [1, 1]
+    assert "loss: 4.1250" in rank0_progress["train 1/1"]["postfixes"][0]
+    assert "mae: 1.7500" in rank0_progress["train 1/1"]["postfixes"][0]
+    assert "loss: 6.3750" in rank0_progress["train 1/1"]["postfixes"][-1]
+    assert rank0_progress["test"]["updates"] == [1, 1]
+    assert "loss: 139.1250" in rank0_progress["test"]["postfixes"][0]
+    assert "mae: 11.7500" in rank0_progress["test"]["postfixes"][0]
+    assert "loss: 151.3750" in rank0_progress["test"]["postfixes"][-1]
+    assert all(entry["disable"] for entry in records_by_rank[1]["progress"])
+
+    metric_records = [
+        json.loads(line)
+        for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
     ]
+    train_record = next(record for record in metric_records if record["kind"] == "train_epoch")
+    val_record = next(record for record in metric_records if record["kind"] == "validation")
+    test_record = next(record for record in metric_records if record["kind"] == "test")
+
+    assert train_record["num_samples"] == 8
+    assert train_record["num_batches"] == 4
+    assert train_record["loss"] == pytest.approx(6.375)
+    assert train_record["metrics"]["mae"] == pytest.approx(2.25)
+    assert val_record["num_samples"] == 8
+    assert val_record["loss"] == pytest.approx(53.875)
+    assert test_record["num_samples"] == 8
+    assert test_record["num_batches"] == 4
+    assert test_record["loss"] == pytest.approx(151.375)
+    assert test_record["metrics"]["mae"] == pytest.approx(12.25)

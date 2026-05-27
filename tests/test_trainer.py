@@ -28,6 +28,7 @@ from cr_train.trainer_reporting import (
     format_val_epoch_row,
     should_print_startup,
 )
+from cr_train.trainer_runtime import MetricAccumulator, finalize_summary, update_progress_bar
 
 
 def _make_row(index: int) -> dict[str, object]:
@@ -569,6 +570,90 @@ def test_trainer_does_not_run_non_ddp_distributed_collectives() -> None:
         "new_group",
     )
     assert not any(token in trainer_source for token in forbidden)
+
+
+def test_finalize_summary_reduces_distributed_weighted_accumulator() -> None:
+    accumulator = MetricAccumulator()
+    accumulator.update({"loss": 2.0, "mae": 1.0}, batch_size=2)
+
+    def reduce_int(value: int) -> int:
+        return {2: 5, 1: 3}[value]
+
+    def reduce_sum(value: float) -> float:
+        return {4.0: 15.0, 2.0: 7.5}[value]
+
+    summary = finalize_summary(
+        accumulator=accumulator,
+        start_time=None,
+        include_speed=False,
+        reduce_int=reduce_int,
+        reduce_sum=reduce_sum,
+        distributed=True,
+    )
+
+    assert summary["loss"] == pytest.approx(3.0)
+    assert summary["metrics"] == {"mae": pytest.approx(1.5)}
+    assert summary["num_samples"] == 5
+    assert summary["num_batches"] == 3
+
+
+def test_update_progress_bar_reduces_before_disabled_rank_returns() -> None:
+    class DisabledProgress:
+        disable = True
+
+        def update(self, value: int) -> None:
+            raise AssertionError(f"disabled progress should not update: {value}")
+
+        def set_postfix_str(self, text: str) -> None:
+            raise AssertionError(f"disabled progress should not set postfix: {text}")
+
+    accumulator = MetricAccumulator()
+    accumulator.update({"loss": 1.25}, batch_size=2)
+    calls: list[tuple[str, int | float]] = []
+
+    def reduce_int(value: int) -> int:
+        calls.append(("int", value))
+        return value
+
+    def reduce_sum(value: float) -> float:
+        calls.append(("sum", value))
+        return value
+
+    update_progress_bar(
+        DisabledProgress(),
+        accumulator=accumulator,
+        start_time=None,
+        reduce_int=reduce_int,
+        reduce_sum=reduce_sum,
+        distributed=True,
+    )
+
+    assert calls == [("int", 2), ("int", 1), ("sum", 2.5)]
+
+
+def test_update_progress_bar_displays_reduced_running_average() -> None:
+    FakeTqdm.instances.clear()
+    progress = FakeTqdm(desc="test", disable=False)
+    accumulator = MetricAccumulator()
+    accumulator.update({"loss": 2.0, "mae": 1.0}, batch_size=2)
+
+    def reduce_int(value: int) -> int:
+        return {2: 4, 1: 2}[value]
+
+    def reduce_sum(value: float) -> float:
+        return {4.0: 10.0, 2.0: 6.0}[value]
+
+    update_progress_bar(
+        progress,
+        accumulator=accumulator,
+        start_time=None,
+        reduce_int=reduce_int,
+        reduce_sum=reduce_sum,
+        distributed=True,
+    )
+
+    assert progress.updates == [1]
+    assert progress.postfixes == ["loss: 2.5000, mae: 1.5000"]
 
 
 def test_format_data_summary_compacts_square_timeline_on_one_line() -> None:
